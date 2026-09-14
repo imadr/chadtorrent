@@ -14,6 +14,10 @@ pub struct LibraryItem {
     pub file_path: Option<String>,
     pub size_bytes: Option<i64>,
     pub rqbit_id: Option<i64>,
+    pub poster_path: Option<String>,
+    pub year: Option<i32>,
+    pub tmdb_id: Option<i64>,
+    pub media_type: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,9 +54,22 @@ impl Database {
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 file_path TEXT,
                 size_bytes INTEGER,
-                rqbit_id INTEGER
+                rqbit_id INTEGER,
+                poster_path TEXT,
+                year INTEGER,
+                tmdb_id INTEGER,
+                media_type TEXT
             );",
         )?;
+        // Migrate: add columns if missing (idempotent)
+        for stmt in [
+            "ALTER TABLE library ADD COLUMN poster_path TEXT",
+            "ALTER TABLE library ADD COLUMN year INTEGER",
+            "ALTER TABLE library ADD COLUMN tmdb_id INTEGER",
+            "ALTER TABLE library ADD COLUMN media_type TEXT",
+        ] {
+            let _ = conn.execute_batch(stmt);
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -67,10 +84,28 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn insert_movie(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        poster_path: Option<&str>,
+        tmdb_id: i64,
+        media_type: &str,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO library (magnet, keep, state, title, year, poster_path, tmdb_id, media_type)
+             VALUES ('', 0, 'ready', ?1, ?2, ?3, ?4, ?5)",
+            params![title, year, poster_path, tmdb_id, media_type],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     pub fn get_item(&self, id: i64) -> Result<Option<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id
+            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id,
+                    poster_path, year, tmdb_id, media_type
              FROM library WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -84,6 +119,10 @@ impl Database {
                 file_path: row.get(6)?,
                 size_bytes: row.get(7)?,
                 rqbit_id: row.get(8)?,
+                poster_path: row.get(9)?,
+                year: row.get(10)?,
+                tmdb_id: row.get(11)?,
+                media_type: row.get(12)?,
             })
         })?;
         match rows.next() {
@@ -95,7 +134,8 @@ impl Database {
     pub fn list_items(&self) -> Result<Vec<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id
+            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id,
+                    poster_path, year, tmdb_id, media_type
              FROM library ORDER BY added_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -109,6 +149,10 @@ impl Database {
                 file_path: row.get(6)?,
                 size_bytes: row.get(7)?,
                 rqbit_id: row.get(8)?,
+                poster_path: row.get(9)?,
+                year: row.get(10)?,
+                tmdb_id: row.get(11)?,
+                media_type: row.get(12)?,
             })
         })?;
         let mut items = Vec::new();
@@ -180,11 +224,25 @@ impl Database {
         Ok(item)
     }
 
+    /// Convert an item into an empty movie placeholder (keeps the movie in the
+    /// library after its file/torrent has been removed).
+    pub fn reset_to_placeholder(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE library SET magnet = '', state = 'ready', file_path = NULL,
+                    size_bytes = NULL, rqbit_id = NULL
+             WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn find_by_rqbit_id(&self, rqbit_id: i64) -> Result<Option<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id
+            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id,
+                    poster_path, year, tmdb_id, media_type
              FROM library WHERE rqbit_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rqbit_id], |row| {
@@ -198,12 +256,38 @@ impl Database {
                 file_path: row.get(6)?,
                 size_bytes: row.get(7)?,
                 rqbit_id: row.get(8)?,
+                poster_path: row.get(9)?,
+                year: row.get(10)?,
+                tmdb_id: row.get(11)?,
+                media_type: row.get(12)?,
             })
         })?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    pub fn update_metadata(
+        &self,
+        id: i64,
+        title: Option<&str>,
+        year: Option<i32>,
+        poster_path: Option<&str>,
+        tmdb_id: Option<i64>,
+        media_type: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE library SET title = COALESCE(?2, title),
+                    year = COALESCE(?3, year),
+                    poster_path = COALESCE(?4, poster_path),
+                    tmdb_id = COALESCE(?5, tmdb_id),
+                    media_type = COALESCE(?6, media_type)
+             WHERE id = ?1",
+            params![id, title, year, poster_path, tmdb_id, media_type],
+        )?;
+        Ok(())
     }
 }
 

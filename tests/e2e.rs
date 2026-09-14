@@ -104,6 +104,7 @@ async fn setup_app(tmp: &Path) -> Arc<LibraryManager> {
         library_dir: tmp.join("library"),
         temp_dir: tmp.join("temp"),
         db_path: tmp.join("test.db"),
+        tmdb_api_key: None,
     };
     Arc::new(LibraryManager::new(config).await.unwrap())
 }
@@ -112,7 +113,7 @@ async fn start_http(
     library: Arc<LibraryManager>,
 ) -> (String, String, tokio::task::AbortHandle) {
     let index_html = include_str!("../static/index.html").to_string();
-    let router = build_router(AppState { library, index_html });
+    let router = build_router(AppState { library, index_html, tmdb: None });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -276,9 +277,9 @@ async fn keep_false_full_flow_streaming_ws_delete() {
     socket.close(None).await.ok();
     drop(srv);
 
-    // ---- Delete ----
+    // ---- Delete (hard: full movie delete via ?hard=1) ----
     let resp = client
-        .delete(format!("{http}/api/library/{id}"))
+        .delete(format!("{http}/api/library/{id}?hard=1"))
         .send()
         .await
         .unwrap();
@@ -343,9 +344,10 @@ async fn keep_true_persists_locally_and_survives_delete() {
     assert_eq!(resp.bytes().await.unwrap().as_ref(), &contents[..500]);
     drop(srv);
 
-    // Deleting a kept item removes it from the library but keeps the files.
+    // Deleting a kept item (hard: full movie delete) removes it from the
+    // library but keeps the files on disk.
     let resp = client
-        .delete(format!("{http}/api/library/{id}"))
+        .delete(format!("{http}/api/library/{id}?hard=1"))
         .send()
         .await
         .unwrap();
@@ -598,6 +600,7 @@ async fn completed_temp_item_survives_restart() {
         library_dir: tmp.path().join("library"),
         temp_dir: tmp.path().join("temp"),
         db_path: tmp.path().join("test.db"),
+        tmdb_api_key: None,
     };
 
     // First instance downloads the temp item to completion.
@@ -665,9 +668,10 @@ async fn reconcile_marks_preexisting_completed_download_ready() {
 
     let config = Config {
         port: 0,
-        library_dir,
-        temp_dir,
+        library_dir: tmp.path().join("library"),
+        temp_dir: tmp.path().join("temp"),
         db_path: tmp.path().join("test.db"),
+        tmdb_api_key: None,
     };
     let library = Arc::new(LibraryManager::new(config).await.unwrap());
 
@@ -679,10 +683,94 @@ async fn reconcile_marks_preexisting_completed_download_ready() {
     assert!(status.is_local);
     assert_eq!(status.total_bytes, contents.len() as u64);
 
-    // Deleting a reconciled temp item still cleans up its files.
-    library.remove_item(id).await.unwrap();
+    // Deleting a reconciled temp item hard (movie delete) still cleans up its
+    // files and removes the row.
+    library.remove_movie(id).await.unwrap();
     assert!(!out.exists(), "reconciled temp files should be removed on delete");
     assert!(library.db.get_item(id).unwrap().is_none());
+
+    library.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn per_file_remove_keeps_movie_as_placeholder() {
+    let _permit = E2E_LOCK.acquire().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let config = Config {
+        port: 0,
+        library_dir: tmp.path().join("library"),
+        temp_dir: tmp.path().join("temp"),
+        db_path: tmp.path().join("test.db"),
+        tmdb_api_key: None,
+    };
+    let library = Arc::new(LibraryManager::new(config).await.unwrap());
+
+    let id = library
+        .db
+        .insert_item("magnet:?xt=urn:btih:abc123", true)
+        .unwrap();
+    library.db.update_title(id, "Legacy Movie").unwrap();
+
+    // Per-file delete must NOT remove the movie: it converts the row into an
+    // empty movie placeholder so the movie stays in the library.
+    library.remove_item(id).await.unwrap();
+
+    let item = library.db.get_item(id).unwrap().unwrap();
+    assert_eq!(item.title.as_deref(), Some("Legacy Movie"), "title must survive per-file delete");
+    assert_eq!(item.magnet, "");
+    assert_eq!(item.state, "ready");
+    assert!(item.file_path.is_none());
+    assert!(item.keep);
+
+    library.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_resume_keeps_progress_visible() {
+    let _permit = E2E_LOCK.acquire().await.unwrap();
+    let tmp = TempDir::new().unwrap();
+    let contents = make_pattern(250_000_000);
+    let (_seeder, magnet, peer) = start_seeder(tmp.path(), "movie.mp4", &contents).await;
+    let library = setup_app(&tmp.path().join("app")).await;
+
+    let id = library
+        .add_item_with_initial_peers(&magnet, false, vec![peer])
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let st = library.get_status(id).await.unwrap();
+        if st.state == "downloading" && st.contiguous_bytes > 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "torrent never started downloading: {st:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    library.pause_item(id).await.unwrap();
+    let p1 = library.get_status(id).await.unwrap();
+    assert_eq!(p1.state, "paused");
+    assert!(
+        p1.progress_pct > 0.0,
+        "progress must survive pause, got {}",
+        p1.progress_pct
+    );
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let p2 = library.get_status(id).await.unwrap();
+    assert_eq!(p2.state, "paused");
+    assert_eq!(p1.progress_pct, p2.progress_pct, "paused progress must not advance");
+
+    library.resume_item(id).await.unwrap();
+    let r1 = library.get_status(id).await.unwrap();
+    assert_eq!(r1.state, "downloading");
+    assert!(r1.progress_pct >= p1.progress_pct);
+
+    wait_complete(&library, id).await;
 
     library.stop().await;
 }

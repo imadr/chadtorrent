@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::library::{find_largest_video_in, LibraryManager};
+use crate::metadata::TmdbClient;
 use crate::remux::Remuxer;
 
 #[allow(dead_code)]
@@ -25,6 +26,20 @@ pub struct AddItemRequest {
     magnet: String,
     #[serde(default)]
     keep: bool,
+    title: Option<String>,
+    year: Option<i32>,
+    poster_path: Option<String>,
+    tmdb_id: Option<i64>,
+    media_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AddMovieRequest {
+    title: String,
+    year: Option<i32>,
+    poster_path: Option<String>,
+    tmdb_id: i64,
+    media_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +52,7 @@ pub struct UpdateItemRequest {
 pub struct AppState {
     pub library: Arc<LibraryManager>,
     pub index_html: String,
+    pub tmdb: Option<Arc<TmdbClient>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -50,11 +66,16 @@ pub fn build_router(state: AppState) -> Router {
             )
         }))
         .route("/api/library", post(add_item).get(list_items))
+        .route("/api/movies", post(add_movie))
+        .route("/api/search", get(search_tmdb))
+        .route("/api/torrents", get(torrent_search))
         .route(
             "/api/library/{id}",
             patch(update_item).delete(delete_item),
         )
         .route("/api/library/{id}/status", get(get_status))
+        .route("/api/library/{id}/pause", post(pause_item))
+        .route("/api/library/{id}/resume", post(resume_item))
         .route("/stream/{id}", get(stream_handler))
         .route("/ws/torrent/{id}", get(ws_handler))
         .with_state(state)
@@ -68,7 +89,150 @@ async fn add_item(
         return Err(Error::BadRequest("invalid magnet link".into()));
     }
     let id = state.library.add_item(&req.magnet, req.keep).await?;
+    if req.title.is_some()
+        || req.year.is_some()
+        || req.poster_path.is_some()
+        || req.tmdb_id.is_some()
+    {
+        state
+            .library
+            .db
+            .update_metadata(
+                id,
+                req.title.as_deref(),
+                req.year,
+                req.poster_path.as_deref(),
+                req.tmdb_id,
+                req.media_type.as_deref(),
+            )
+            .map_err(|e| Error::Internal(e.to_string()))?;
+    }
     Ok(Json(json!({ "id": id })))
+}
+
+async fn search_tmdb(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
+    let query = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    let Some(tmdb) = state.tmdb.as_ref() else {
+        return Err(Error::BadRequest(
+            "Movie search is not configured on this server".into(),
+        ));
+    };
+    let results = tmdb
+        .search(&query)
+        .await
+        .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
+    Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!([]))))
+}
+
+async fn add_movie(
+    State(state): State<AppState>,
+    Json(req): Json<AddMovieRequest>,
+) -> Result<impl IntoResponse> {
+    if req.title.trim().is_empty() {
+        return Err(Error::BadRequest("missing title".into()));
+    }
+    let id = state
+        .library
+        .add_movie(
+            &req.title,
+            req.year,
+            req.poster_path.as_deref(),
+            req.tmdb_id,
+            req.media_type.as_deref().unwrap_or("movie"),
+        )
+        .await?;
+    Ok(Json(json!({ "id": id })))
+}
+
+#[derive(Deserialize)]
+struct ApibayItem {
+    name: String,
+    #[serde(rename = "info_hash")]
+    info_hash: String,
+    size: String,
+    seeders: String,
+    leechers: String,
+}
+
+async fn torrent_search(
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
+    let query = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Err(Error::BadRequest("missing query param q (movie title)".into()));
+    }
+    let url = format!("https://apibay.org/q.php?q={}&cat=0", urlencoding(&query));
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| Error::BadRequest(format!("torrent search failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| Error::BadRequest(format!("torrent search failed: {e}")))?;
+    let items: Vec<ApibayItem> = resp
+        .json()
+        .await
+        .map_err(|e| Error::BadRequest(format!("torrent search failed: {e}")))?;
+
+    let mut results: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter_map(|it| {
+            let info_hash = it.info_hash.trim().to_string();
+            if info_hash.len() != 40 {
+                return None;
+            }
+            let magnet = format!(
+                "magnet:?xt=urn:btih:{info_hash}&dn={}",
+                urlencoding(&it.name)
+            );
+            Some(json!({
+                "name": it.name,
+                "size_bytes": it.size.parse::<u64>().ok(),
+                "seeders": it.seeders.parse::<u64>().ok().unwrap_or(0),
+                "leechers": it.leechers.parse::<u64>().ok().unwrap_or(0),
+                "magnet": magnet,
+            }))
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        b["seeders"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["seeders"].as_u64().unwrap_or(0))
+    });
+    Ok(Json(results))
+}
+
+fn urlencoding(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for &b in bytes {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 async fn list_items(
@@ -90,8 +254,18 @@ async fn update_item(
 async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
 ) -> Result<impl IntoResponse> {
-    state.library.remove_item(id).await?;
+    let hard = params
+        .get("hard")
+        .and_then(|v| v.as_str())
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if hard {
+        state.library.remove_movie(id).await?;
+    } else {
+        state.library.remove_item(id).await?;
+    }
     Ok(Json(json!({ "success": true })))
 }
 
@@ -101,6 +275,22 @@ async fn get_status(
 ) -> Result<impl IntoResponse> {
     let status = state.library.get_status(id).await?;
     Ok(Json(status))
+}
+
+async fn pause_item(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    state.library.pause_item(id).await?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn resume_item(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    state.library.resume_item(id).await?;
+    Ok(Json(json!({ "success": true })))
 }
 
 fn parse_range(range: Option<&str>, file_size: u64) -> (u64, u64) {

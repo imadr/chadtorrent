@@ -3,6 +3,7 @@ mod db;
 mod error;
 mod http;
 mod library;
+mod metadata;
 mod remux;
 mod torrent;
 
@@ -66,11 +67,17 @@ async fn main() {
         }
     };
 
+    let tmdb = config
+        .tmdb_api_key
+        .clone()
+        .map(|k| Arc::new(metadata::TmdbClient::new(k)));
+
     let index_html = include_str!("../static/index.html").to_string();
 
     let state = AppState {
         library: library.clone(),
         index_html,
+        tmdb,
     };
 
     let router = http::build_router(state);

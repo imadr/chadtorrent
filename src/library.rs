@@ -149,6 +149,20 @@ impl LibraryManager {
         self.add_item_inner(magnet, keep, None).await
     }
 
+    /// Add a movie placeholder entry (no torrent yet) so it appears in the
+    /// library and can get torrents attached later.
+    pub async fn add_movie(
+        &self,
+        title: &str,
+        year: Option<i32>,
+        poster_path: Option<&str>,
+        tmdb_id: i64,
+        media_type: &str,
+    ) -> Result<i64> {
+        self.db
+            .insert_movie(title, year, poster_path, tmdb_id, media_type)
+    }
+
     /// Same as [`add_item`], but lets tests inject a local seeder peer so the
     /// download works without any internet/network dependency.
     #[allow(dead_code)]
@@ -282,6 +296,18 @@ impl LibraryManager {
         }
 
         info!("Item {} keep set to {}", id, keep);
+        Ok(())
+    }
+
+    pub async fn pause_item(&self, id: i64) -> Result<()> {
+        self.engine.pause_torrent(id).await?;
+        self.db.update_state(id, "paused")?;
+        Ok(())
+    }
+
+    pub async fn resume_item(&self, id: i64) -> Result<()> {
+        self.engine.resume_torrent(id).await?;
+        self.db.update_state(id, "downloading")?;
         Ok(())
     }
 
@@ -449,7 +475,20 @@ impl LibraryManager {
         })
     }
 
+    /// Remove a single torrent/file from the library. For a legacy item that
+    /// doubles as the movie itself (no TMDB metadata), the row is kept as an
+    /// empty movie placeholder so the movie is not lost from the library.
     pub async fn remove_item(&self, id: i64) -> Result<()> {
+        self.remove_item_inner(id, false).await
+    }
+
+    /// Remove every row of a movie unconditionally (torrents, files and the
+    /// placeholder movie itself). Used by "delete movie".
+    pub async fn remove_movie(&self, id: i64) -> Result<()> {
+        self.remove_item_inner(id, true).await
+    }
+
+    async fn remove_item_inner(&self, id: i64, hard: bool) -> Result<()> {
         let item = self
             .db
             .get_item(id)?
@@ -469,7 +508,12 @@ impl LibraryManager {
             }
         }
 
-        self.db.delete_item(id)?;
+        if item.tmdb_id.is_none() && !hard {
+            self.db.reset_to_placeholder(id)?;
+            info!("Library item {} kept as movie placeholder", id);
+        } else {
+            self.db.delete_item(id)?;
+        }
         info!("Library item {} removed", id);
         Ok(())
     }

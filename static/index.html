@@ -2,92 +2,571 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ChadTorrent</title>
 </head>
 <body>
 <style>
+  :root {
+    --bg: #0b0e14; --panel: #131824; --panel2: #1a2230; --line: #232c42;
+    --text: #dfe6f0; --muted: #8aa0bd; --accent: #5b8cff; --danger: #ff5f6d;
+    --ok: #3ddc84;
+  }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; font-family: sans-serif; }
-  .wrap { position: relative; max-width: 800px; }
-  #player { display: block; width: 100%; background: #000; pointer-events: none; }
-  .ctrl { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 12px 10px 12px; display: none; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+               font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .floats { position: fixed; top: 14px; right: 18px; z-index: 40; display: flex; gap: 10px; }
+  button { font: inherit; color: var(--text); cursor: pointer; }
+  .btn { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+         padding: 8px 14px; }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; font-weight: 600; }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; }
+  main[hidden] { display: none; }
+  .toolbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 18px; }
+  .toolbar h2 { margin: 0; font-size: 20px; }
+  .toolbar span { color: var(--muted); font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px; }
+  .card { position: relative; background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s; }
+  .card:hover { transform: translateY(-3px); border-color: var(--accent); }
+  .poster { width: 100%; aspect-ratio: 2/3; background: var(--panel2); display: flex;
+            align-items: center; justify-content: center; overflow: hidden; }
+  .card .poster img, .bigposter img { width: 100%; height: 100%; object-fit: cover; }
+  .poster .ph { font-size: 34px; opacity: .45; }
+  .card .meta { padding: 9px 11px; }
+  .card .meta .t { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .meta .y { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .badge { position: absolute; top: 8px; right: 8px; background: var(--accent); color: #0b0e14;
+           font-size: 11px; font-weight: 700; border-radius: 10px; padding: 2px 8px; }
+  .empty { color: var(--muted); text-align: center; padding: 60px 0; }
+
+  .back { background: none; border: none; color: var(--muted); padding: 0 0 14px; font-size: 14px; }
+  .back:hover { color: var(--text); }
+  .movie-head { display: flex; gap: 26px; margin-bottom: 30px; flex-wrap: wrap; }
+  .bigposter { width: 210px; aspect-ratio: 2/3; border-radius: 12px; overflow: hidden;
+               background: var(--panel2); border: 1px solid var(--line); flex-shrink: 0;
+               display: flex; align-items: center; justify-content: center; }
+  .bigposter .ph { font-size: 56px; opacity: .4; }
+  .mv-info h1 { margin: 0 0 6px; font-size: 28px; }
+  .mv-info .sub { color: var(--muted); margin-bottom: 18px; }
+  .mv-info label { display: inline-flex; align-items: center; gap: 8px; margin-right: 14px; cursor: pointer; }
+  section { margin: 26px 0; }
+  section h3 { font-size: 14px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 12px; }
+  .rows { display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 12px; background: var(--panel);
+         border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
+  .row .nm { flex: 1; min-width: 0; }
+  .row .nm .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .nm .s { color: var(--muted); font-size: 12px; }
+  .row .nm .s .se { color: var(--ok); font-weight: 600; }
+  .row .nm .s .le { color: var(--danger); font-weight: 600; }
+  .dl { display: block; margin-top: 8px; }
+  .dl[hidden] { display: none; }
+  .dl .bar { height: 4px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .dl .bar-in { height: 100%; width: 0%; background: var(--accent); }
+  .dl .txt { font-size: 12px; color: var(--muted); margin-top: 5px; }
+  .chip { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+  .chip.ready { color: var(--ok); border-color: var(--ok); }
+  .chip.wait { color: #f0b429; border-color: #f0b429; }
+  .row .btn { padding: 6px 12px; font-size: 13px; }
+  .formline { display: flex; gap: 8px; margin-top: 12px; }
+  input[type=text], input[type=url] { flex: 1; background: var(--panel); color: var(--text);
+         border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font: inherit; outline: none; }
+  input:focus { border-color: var(--accent); }
+  #am-search { width: 100%; display: block; }
+  label.k { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .panel.confirm { max-width: 380px; }
+  .cf-msg { color: var(--text); margin: 0 0 20px; line-height: 1.5; white-space: pre-line; }
+  .cf-actions { display: flex; gap: 10px; justify-content: flex-end; }
+
+  .modal { position: fixed; inset: 0; z-index: 50; background: rgba(5,7,10,.8);
+           display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .modal[hidden] { display: none; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+           width: 620px; max-width: 100%; max-height: 86vh; overflow: auto; padding: 18px; }
+  .phead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .phead span { font-weight: 700; font-size: 16px; }
+  .x { background: none; border: none; color: var(--muted); font-size: 18px; }
+  .x:hover { color: var(--text); }
+  .srow { display: flex; gap: 12px; padding: 10px; border-radius: 10px; align-items: center; }
+  .srow:hover { background: var(--panel2); }
+  .srow .poster { width: 46px; height: 69px; aspect-ratio: 2/3; border-radius: 6px; flex-shrink: 0; }
+  .srow .poster img, .srow .poster .ph { width: 100%; height: 100%; object-fit: cover; }
+  .srow .poster .ph { display: flex; align-items: center; justify-content: center; font-size: 16px; }
+  .srow .info { flex: 1; min-width: 0; }
+  .srow .info .t { font-weight: 600; font-size: 14px; }
+  .srow .info .s { color: var(--muted); font-size: 12px; }
+  .divider { border-top: 1px solid var(--line); margin: 16px 0; }
+
+  #player-modal { padding: 0; background: #000; }
+  #player-modal[hidden] { display: none; }
+  .pwrap { position: relative; width: 100vw; height: 100vh; background: #000; }
+  #player { display: block; width: 100vw; height: 100vh; background: #000; pointer-events: none; object-fit: contain; }
+  .pback { position: absolute; top: 10px; left: 10px; z-index: 6; background: rgba(0,0,0,.6);
+           border: 1px solid rgba(255,255,255,.25); color: #fff; border-radius: 8px; padding: 6px 14px; font-size: 14px;
+           opacity: 0; pointer-events: none; transition: opacity .15s ease; }
+  .pback.on { opacity: 1; pointer-events: auto; }
+  .pback.on:hover { border-color: #fff; }
+  .ctrl { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 14px 10px; display: none; }
   .strip { display: flex; align-items: center; gap: 10px; }
-  .pb { cursor: pointer; padding: 0; width: 32px; height: 32px;
-        background: none; border: none; flex-shrink: 0;
-        display: inline-flex; align-items: center; justify-content: center; }
+  .pb { cursor: pointer; padding: 0; width: 32px; height: 32px; background: none; border: none;
+        flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
   .pb svg { width: 16px; height: 16px; fill: #fff; }
   .seek { flex: 1; height: 5px; min-width: 0; appearance: none; -webkit-appearance: none;
-          background: linear-gradient(to right, #fff var(--val, 0%), #555 0);
-          cursor: pointer; border: none; outline: none; }
+          background: linear-gradient(to right, #fff var(--val, 0%), #555 0); cursor: pointer;
+          border: none; outline: none; }
   .seek::-webkit-slider-thumb, .seek::-moz-range-thumb {
           appearance: none; -webkit-appearance: none; height: 0; width: 0;
           background: transparent; border: none; cursor: pointer; }
   .sv { display: flex; align-items: center; gap: 8px; margin-left: auto; }
   .sv svg { width: 16px; height: 16px; fill: #fff; }
-  .vl { width: 80px; height: 5px; appearance: none; -webkit-appearance: none;
-        background: linear-gradient(to right, #fff var(--val, 0%), #555 0);
-        cursor: pointer; border: none; outline: none; }
+  .vl { width: 70px; height: 5px; appearance: none; -webkit-appearance: none;
+        background: linear-gradient(to right, #fff var(--val, 0%), #555 0); cursor: pointer;
+        border: none; outline: none; }
   .vl::-webkit-slider-thumb, .vl::-moz-range-thumb {
         appearance: none; -webkit-appearance: none; height: 0; width: 0;
         background: transparent; border: none; cursor: pointer; }
-  .wrap:fullscreen, .wrap:-webkit-full-screen { position: fixed; inset: 0; margin: 0; width: 100vw; height: 100vh; max-width: none; background: #000; }
-  .wrap:fullscreen #player, .wrap:-webkit-full-screen #player { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-  #log { width: 100%; height: 200px; font-family: monospace; resize: vertical; }
+
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 80;
+           background: var(--panel2); border: 1px solid var(--accent); color: var(--text);
+           padding: 9px 16px; border-radius: 8px; font-size: 13px; transition: opacity .25s; opacity: 0; pointer-events: none; }
+  .toast.on { opacity: 1; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 
-<input id="magnet" type="text" size="80" placeholder="magnet:?xt=...">
-<label><input id="keep" type="checkbox"> keep</label>
-<button id="start">Add</button>
-<button id="refresh">Refresh</button>
-<hr>
-<ul id="library"></ul>
-<hr>
+<div class="floats">
+  <button class="btn primary" id="btn-add">+ Add</button>
+</div>
 
-<div class="wrap" id="videowrap">
-  <video id="player"></video>
-  <div class="ctrl" id="ctrl">
-    <div class="strip">
-      <button class="pb" id="ppbtn" title="Play / Pause">
-        <svg id="ppicon" viewBox="0 0 16 16"><polygon id="ppshape" points="3,1 13,8 3,15"/></svg>
-      </button>
-      <input class="seek" id="seekbar" type="range" min="0" max="1000" value="0">
-      <div class="sv">
-        <svg id="vicon" viewBox="0 0 16 16"><polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/></svg>
-        <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
-        <button class="pb" id="fsbtn" title="Fullscreen">
-          <svg id="fsicon" viewBox="0 0 16 16"><polygon points="2,2 7,2 7,3.5 3.5,3.5 3.5,7 2,7"/><polygon points="14,2 9,2 9,3.5 12.5,3.5 12.5,7 14,7"/><polygon points="2,14 7,14 7,12.5 3.5,12.5 3.5,9 2,9"/><polygon points="14,14 9,14 9,12.5 12.5,12.5 12.5,9 14,9"/></svg>
+<main id="view-library">
+  <div class="toolbar"><h2>Library</h2><span id="lib-count"></span></div>
+  <div id="grid" class="grid"></div>
+</main>
+
+<main id="view-movie" hidden>
+  <button class="back" id="btn-back">← Library</button>
+  <div class="movie-head">
+    <div class="bigposter" id="mv-poster"></div>
+    <div class="mv-info">
+      <h1 id="mv-title"></h1>
+      <div class="sub" id="mv-sub"></div>
+      <label><input type="checkbox" id="mv-keep"> Keep files</label>
+      <button class="btn danger" id="mv-del">Delete movie</button>
+    </div>
+  </div>
+  <section>
+    <h3>Downloaded contents</h3>
+    <div class="rows" id="mv-torrents"></div>
+  </section>
+  <section id="mv-searchsec" hidden>
+    <h3>Find torrents</h3>
+    <div class="rows" id="mv-results" style="margin-top:12px"></div>
+  </section>
+</main>
+
+<div class="modal" id="player-modal" hidden>
+  <div class="pwrap" id="videowrap">
+    <video id="player"></video>
+    <button class="pback" id="pback" title="Back">← Back</button>
+    <div class="ctrl" id="ctrl">
+      <div class="strip">
+        <button class="pb" id="ppbtn" title="Play / Pause">
+          <svg id="ppicon" viewBox="0 0 16 16"><polygon id="ppshape" points="3,1 13,8 3,15"/></svg>
         </button>
+        <input class="seek" id="seekbar" type="range" min="0" max="1000" value="0">
+        <div class="sv">
+          <svg id="vicon" viewBox="0 0 16 16"><polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/></svg>
+          <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
+          <button class="pb" id="fsbtn" title="Fullscreen">
+            <svg id="fsicon" viewBox="0 0 16 16"><polygon points="2,2 7,2 7,3.5 3.5,3.5 3.5,7 2,7"/><polygon points="14,2 9,2 9,3.5 12.5,3.5 12.5,7 14,7"/><polygon points="2,14 7,14 7,12.5 3.5,12.5 3.5,9 2,9"/><polygon points="14,14 9,14 9,12.5 12.5,12.5 12.5,9 14,9"/></svg>
+          </button>
+        </div>
       </div>
     </div>
   </div>
 </div>
 
-<div id="stats"></div>
-<div>
-  <label><input id="autoscroll" type="checkbox" checked> auto scroll to bottom</label>
+<div class="modal" id="add-modal" hidden>
+  <div class="panel">
+    <div class="phead"><span>Add to library</span><button class="x" id="am-close">✕</button></div>
+    <input type="text" id="am-search" placeholder="Search movies &amp; shows…">
+    <div id="am-results" style="margin-top:10px"></div>
+  </div>
 </div>
-<textarea id="log" readonly></textarea>
+
+<div class="modal" id="confirm-modal" hidden>
+  <div class="panel confirm">
+    <div class="phead"><span>Confirm</span><button class="x" id="cf-cancel">✕</button></div>
+    <p id="cf-msg" class="cf-msg"></p>
+    <div class="cf-actions">
+      <button class="btn" id="cf-no">Cancel</button>
+      <button class="btn danger" id="cf-yes">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 const v = $('player');
 const wrap = $('videowrap');
-let ws = null, currentId = null, seeking = false;
+let items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
 
+const TMDB_IMG = 'https://image.tmdb.org/t/p';
+const POSTER_IDX = 'w342';
+const POSTER_MD = 'w500';
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+}
+
+/* ---------- api ---------- */
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   if (!r.ok) { const t = await r.text(); throw new Error(t); }
   return r.json();
 }
 
-function addLog(line) {
-  const ta = $('log');
-  ta.value = (ta.value ? ta.value + '\n' : '') + line;
-  if ($('autoscroll').checked) ta.scrollTop = ta.scrollHeight;
+function confirmBox(msg, yesLabel) {
+  return new Promise((resolve) => {
+    $('cf-msg').textContent = msg;
+    $('cf-yes').textContent = yesLabel || 'Delete';
+    $('confirm-modal').hidden = false;
+    function done(v) {
+      $('confirm-modal').hidden = true;
+      $('cf-yes').onclick = null;
+      $('cf-no').onclick = null;
+      $('cf-cancel').onclick = null;
+      document.removeEventListener('keydown', onKey);
+      resolve(v);
+    }
+    const onKey = (e) => { if (e.key === 'Escape') done(false); };
+    $('cf-yes').onclick = () => done(true);
+    $('cf-no').onclick = () => done(false);
+    $('cf-cancel').onclick = () => done(false);
+    document.addEventListener('keydown', onKey);
+  });
 }
 
-/* ---- player ---- */
+/* ---------- library grouping & grid ---------- */
+function groupKey(it) {
+  return it.tmdb_id ? (it.media_type || 'movie') + ':' + it.tmdb_id : 'r' + it.id;
+}
+function groupItems(list) {
+  const g = new Map();
+  for (const it of list) {
+    const k = groupKey(it);
+    if (!g.has(k)) g.set(k, []);
+    g.get(k).push(it);
+  }
+  return g;
+}
+function posterURL(p, size) { return TMDB_IMG + '/' + size + p; }
+function placeholder(phText) { return '<div class="ph">' + phText + '</div>'; }
+function posterTag(src) { return '<img loading="lazy" src="' + src + '" alt="" onerror="this.onerror=null;this.outerHTML=placeholder(\'▷\')">'; }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function movieName(it) {
+  if (it.title) return it.title;
+  if (it.magnet) return it.magnet.slice(0, 40);
+  return 'Movie';
+}
+function movieYear(it) {
+  if (it.year) return String(it.year);
+  if (it.magnet) { const m = it.magnet.match(/20\d{2}/); return m ? m[0] : ''; }
+  return '';
+}
+function kindLabel(it) { return it.tmdb_id ? (it.media_type === 'tv' ? 'TV' : 'Movie') : ''; }
 
+function renderGrid() {
+  const grid = $('grid');
+  grid.innerHTML = '';
+  const g = groupItems(items);
+  $('lib-count').textContent = g.size + (g.size === 1 ? ' title' : ' titles');
+  for (const [k, rows] of g) {
+    const rep = rows.find(r => r.tmdb_id) || rows[0];
+    const card = document.createElement('div');
+    card.className = 'card';
+    const count = rows.filter(r => r.magnet).length;
+    const posterHtml = rep.poster_path
+      ? posterTag(posterURL(rep.poster_path, POSTER_IDX))
+      : placeholder('▷');
+    card.innerHTML =
+      '<div class="poster">' + posterHtml + '</div>' +
+      (count ? '<span class="badge">' + count + '</span>' : '') +
+      '<div class="meta"><div class="t">' + esc(movieName(rep)) + '</div>' +
+      '<div class="y">' + esc(movieYear(rep)) + (kindLabel(rep) ? ' · ' + kindLabel(rep) : '') + '</div></div>';
+    card.onclick = () => openMovie(k);
+    grid.appendChild(card);
+  }
+}
+
+async function refreshLibrary() {
+  try {
+    items = await api('/api/library');
+    renderGrid();
+    if (currentMovie) {
+      currentMovie.rows = groupItems(items).get(currentMovie.key) || [];
+      if (!currentMovie.rows.length) {
+        currentMovie = null;
+        $('view-movie').hidden = true;
+        $('view-library').hidden = false;
+      } else {
+        renderMovie();
+      }
+    }
+  }
+  catch (e) { toast('Refresh failed'); }
+}
+
+/* ---------- movie detail page ---------- */
+function openMovie(k) {
+  const rows = groupItems(items).get(k) || [];
+  if (!rows.length) return;
+  currentMovie = { key: k, rows };
+  dlState = {};
+  $('view-library').hidden = true;
+  $('view-movie').hidden = false;
+  $('mv-results').innerHTML = '';
+  window.scrollTo(0, 0);
+  renderMovie();
+  const rep = rows.find(r => r.tmdb_id) || rows[0];
+  if (rep.tmdb_id) findTorrents(rep);
+}
+
+function renderMovie() {
+  const rows = currentMovie.rows;
+  const rep = rows.find(r => r.tmdb_id) || rows[0];
+  const poster = $('mv-poster');
+  poster.innerHTML = rep.poster_path
+    ? posterTag(posterURL(rep.poster_path, POSTER_MD))
+    : placeholder('▷');
+  $('mv-title').textContent = movieName(rep);
+  $('mv-sub').textContent = [movieYear(rep), kindLabel(rep)].filter(Boolean).join(' · ') || ' ';
+  $('mv-keep').checked = rows.some(r => r.magnet && r.keep);
+
+  const list = $('mv-torrents');
+  list.innerHTML = '';
+  const torrentRs = rows.filter(r => r.magnet);
+  if (!torrentRs.length) {
+    list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
+  }
+  for (const t of torrentRs) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.dataset.id = t.id;
+    row.dataset.state = t.state || '';
+    row.innerHTML =
+      '<div class="nm"><div class="t">' + esc(t.title || t.magnet) + '</div>' +
+      '<div class="dl" hidden><div class="bar"><div class="bar-in"></div></div>' +
+      '<div class="txt"></div></div></div>';
+    const isActive = t.state === 'downloading' || t.state === 'paused';
+    if (isActive && dlState[t.id]) {
+      const prev = dlState[t.id];
+      const dlE = row.querySelector('.dl');
+      dlE.hidden = false;
+      dlE.querySelector('.bar-in').style.width = prev.pct + '%';
+      dlE.querySelector('.txt').textContent = prev.text;
+    }
+    const pb = document.createElement('button');
+    pb.className = 'btn primary'; pb.textContent = 'Play';
+    pb.onclick = () => playTorrent(t);
+    const pr = document.createElement('button');
+    if (t.state === 'downloading') {
+      pr.className = 'btn'; pr.textContent = 'Pause';
+      pr.onclick = async () => {
+        pr.disabled = true;
+        try { await api('/api/library/' + t.id + '/pause', { method: 'POST' }); toast('Paused'); }
+        catch (e) { toast('Failed'); pr.disabled = false; }
+        refreshLibrary();
+      };
+      row.appendChild(pr);
+    } else if (t.state === 'paused') {
+      pr.className = 'btn primary'; pr.textContent = 'Resume';
+      pr.onclick = async () => {
+        pr.disabled = true;
+        try { await api('/api/library/' + t.id + '/resume', { method: 'POST' }); toast('Resuming'); }
+        catch (e) { toast('Failed'); pr.disabled = false; }
+        refreshLibrary();
+      };
+      row.appendChild(pr);
+    }
+    const del = document.createElement('button');
+    del.className = 'btn danger'; del.textContent = 'Delete';
+    del.onclick = () => delItem(t);
+    row.appendChild(pb); row.appendChild(del);
+    list.appendChild(row);
+  }
+
+  const sec = $('mv-searchsec');
+  sec.hidden = !rep.tmdb_id;
+}
+
+async function delItem(t) {
+  if (!(await confirmBox('Remove this file from the library?\nThe movie will stay.'))) return;
+  try { await api('/api/library/' + t.id, { method: 'DELETE' }); toast('Removed'); }
+  catch (e) { toast('Delete failed'); }
+  refreshLibrary();
+}
+
+$('mv-keep').addEventListener('change', async () => {
+  const val = $('mv-keep').checked;
+  for (const t of currentMovie.rows) {
+    if (t.magnet) {
+      try { await api('/api/library/' + t.id, { method: 'PATCH', body: JSON.stringify({ keep: val }) }); t.keep = val; }
+      catch (e) { toast('Failed'); }
+    }
+  }
+  toast(val ? 'Keeping files' : 'Files are temporary');
+  refreshLibrary();
+});
+
+$('mv-del').addEventListener('click', async () => {
+  if (!(await confirmBox('Delete this movie and all of its files from the library?'))) return;
+  for (const t of currentMovie.rows) {
+    try { await api('/api/library/' + t.id + '?hard=1', { method: 'DELETE' }); }
+    catch (e) { toast('Delete failed'); }
+  }
+  if (currentId !== null) stopPlayback();
+  currentMovie = null;
+  $('view-movie').hidden = true;
+  $('view-library').hidden = false;
+  refreshLibrary();
+});
+
+$('btn-back').addEventListener('click', () => {
+  currentMovie = null;
+  $('view-movie').hidden = true;
+  $('view-library').hidden = false;
+});
+
+async function findTorrents(rep) {
+  const box = $('mv-results');
+  box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
+  try {
+    const res = await api('/api/torrents?q=' + encodeURIComponent(rep.title || ''));
+    box.innerHTML = '';
+    if (!res.length) { box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>'; return; }
+    for (const t of res) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const sz = t.size_bytes ? fmtBytes(t.size_bytes) : '';
+      const se = '<span class="se">' + (t.seeders || 0) + '</span> seeders / <span class="le">' + (t.leechers || 0) + '</span> leechers';
+      row.innerHTML = '<div class="nm"><div class="t">' + esc(t.name) + '</div>' +
+        '<div class="s">' + sz + (sz ? ' · ' : '') + se + '</div></div>';
+      const add = document.createElement('button');
+      add.className = 'btn primary'; add.textContent = 'Add';
+      add.onclick = async () => {
+        add.disabled = true;
+        try {
+          await api('/api/library', { method: 'POST', body: JSON.stringify({
+            magnet: t.magnet, keep: false, title: rep.title || null, year: rep.year || null,
+            poster_path: rep.poster_path || null, tmdb_id: rep.tmdb_id || null,
+            media_type: rep.media_type || null
+          })});
+          add.textContent = '✓ Added';
+          toast('Torrent added');
+          refreshLibrary();
+        } catch (e) { toast('Failed'); add.disabled = false; }
+      };
+      row.appendChild(add);
+      box.appendChild(row);
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
+  }
+}
+
+/* ---------- add modal (TMDB search) ---------- */
+let searchTimer = null;
+function openAdd() { $('add-modal').hidden = false; $('am-search').focus(); }
+function closeAdd() { $('add-modal').hidden = true; $('am-results').innerHTML = ''; $('am-search').value = ''; }
+$('btn-add').addEventListener('click', openAdd);
+$('am-close').addEventListener('click', closeAdd);
+$('add-modal').addEventListener('click', (e) => { if (e.target === $('add-modal')) closeAdd(); });
+
+$('am-search').addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const q = $('am-search').value.trim();
+  if (!q) { $('am-results').innerHTML = ''; return; }
+  searchTimer = setTimeout(() => doSearch(q), 300);
+});
+
+async function doSearch(q) {
+  const box = $('am-results');
+  box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
+  try {
+    const res = await api('/api/search?q=' + encodeURIComponent(q));
+    box.innerHTML = '';
+    if (!res.length) { box.innerHTML = '<div class="empty" style="padding:10px 0">No results.</div>'; return; }
+    for (const r of res) {
+      const row = document.createElement('div');
+      row.className = 'srow';
+      const p = r.poster_path
+        ? posterTag(posterURL(r.poster_path, POSTER_IDX))
+        : placeholder('▷');
+      row.innerHTML =
+        '<div class="poster">' + p + '</div>' +
+        '<div class="info"><div class="t">' + esc(r.title) + '</div>' +
+        '<div class="s">' + (r.year || '') + (r.year ? ' · ' : '') + (r.media_type === 'tv' ? 'TV' : 'Movie') + '</div></div>';
+      const add = document.createElement('button');
+      add.className = 'btn'; add.textContent = 'Add';
+      add.onclick = async () => {
+        add.disabled = true;
+        try {
+          await api('/api/movies', { method: 'POST', body: JSON.stringify({
+            title: r.title, year: r.year, poster_path: r.poster_path,
+            tmdb_id: r.id, media_type: r.media_type
+          })});
+          add.textContent = '✓ Added';
+          toast('Added to library');
+          closeAdd();
+          refreshLibrary();
+        } catch (e) { toast('Failed'); add.disabled = false; }
+      };
+      row.appendChild(add);
+      box.appendChild(row);
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
+  }
+}
+
+/* ---------- player ---------- */
+function playTorrent(item) {
+  stopPlayback();
+  currentId = item.id;
+  $('player-modal').hidden = false;
+  $('ctrl').style.display = 'block';
+  v.src = '/stream/' + item.id;
+  v.load();
+  v.play().catch(() => {});
+}
+
+function stopPlayback() {
+  currentId = null;
+  v.pause();
+  v.removeAttribute('src');
+  v.load();
+  $('ctrl').style.display = 'none';
+}
+$('pback').addEventListener('click', () => {
+  stopPlayback();
+  $('player-modal').hidden = true;
+});
+
+/* ---------- player controls ---------- */
 const ppic = () => $('ppicon');
 v.addEventListener('play',  () => { ppic().innerHTML = '<rect x="4" y="2" width="2.5" height="12"/><rect x="9.5" y="2" width="2.5" height="12"/>'; });
 v.addEventListener('pause', () => { ppic().innerHTML = '<polygon points="3,1 13,8 3,15"/>'; });
@@ -153,112 +632,27 @@ $('fsbtn').addEventListener('click', () => {
   else if (v.webkitEnterFullscreen) { v.webkitEnterFullscreen(); }
 });
 
-/* no spacebar pause, no click on the video element */
-document.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) e.preventDefault();
-});
-
-/* show controls only when the cursor is in the bottom 10% of the video */
+/* show controls only when cursor in bottom 10% of video; back button only near top-left corner */
 document.addEventListener('mousemove', (e) => {
+  if ($('player-modal').hidden) return;
   const r = v.getBoundingClientRect();
   const show = r.width > 0 && e.clientY >= r.top + r.height * 0.9;
   $('ctrl').style.display = show ? 'block' : 'none';
+  const br = $('pback').getBoundingClientRect();
+  const pad = 30;
+  const near = e.clientX >= br.left - pad && e.clientX <= br.right + pad &&
+               e.clientY >= br.top - pad && e.clientY <= br.bottom + pad;
+  $('pback').classList.toggle('on', near);
 });
 
-/* ---- library / API / WS (unchanged) ---- */
+/* no spacebar pause except in inputs; escape closes player */
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) e.preventDefault();
+  if (e.key === 'Escape' && !$('player-modal').hidden && !fsIsOn()) { $('pback').click(); }
+  if (e.key === 'Escape' && !$('add-modal').hidden) $('am-close').click();
+});
 
-async function refreshLibrary() {
-  try { renderLibrary(await api('/api/library')); } catch (e) { addLog('Error refreshing library: ' + e.message); }
-}
-
-function renderLibrary(items) {
-  const ul = $('library');
-  ul.innerHTML = '';
-  for (const item of items) {
-    const li = document.createElement('li');
-    li.id = 'item-' + item.id;
-    const title = document.createElement('span');
-    title.textContent = (item.title || item.magnet.slice(0, 40)) + ' — ' + item.state;
-    const pct = document.createElement('span');
-    pct.textContent = ' ';
-    const keepInput = document.createElement('input');
-    keepInput.type = 'checkbox';
-    keepInput.checked = item.keep;
-    keepInput.addEventListener('change', async () => {
-      try {
-        await api('/api/library/' + item.id, { method: 'PATCH', body: JSON.stringify({ keep: keepInput.checked }) });
-        addLog('Toggled keep=' + keepInput.checked + ' for ' + item.title);
-        refreshLibrary();
-      } catch (e) { addLog('Error toggling keep: ' + e.message); keepInput.checked = !keepInput.checked; }
-    });
-    const keepLabel = document.createElement('label');
-    keepLabel.appendChild(keepInput);
-    keepLabel.appendChild(document.createTextNode(' keep'));
-    const playBtn = document.createElement('button');
-    playBtn.textContent = 'Play';
-    playBtn.addEventListener('click', () => play(item));
-    const delBtn = document.createElement('button');
-    delBtn.textContent = 'Delete';
-    delBtn.addEventListener('click', async () => {
-      try {
-        await api('/api/library/' + item.id, { method: 'DELETE' });
-        if (currentId === item.id) stopPlayback();
-        refreshLibrary();
-      } catch (e) { addLog('Error deleting: ' + e.message); }
-    });
-    li.appendChild(title); li.appendChild(pct); li.appendChild(keepLabel); li.appendChild(playBtn); li.appendChild(delBtn);
-    ul.appendChild(li);
-  }
-}
-
-async function play(item) {
-  if (currentId === item.id && v.src) { v.play(); return; }
-  stopPlayback();
-  currentId = item.id;
-  addLog('Playing: ' + (item.title || item.id));
-  openTunnel(item.id);
-  v.src = '/stream/' + item.id;
-  $('ctrl').style.display = 'block';
-  v.load();
-  v.play().catch(e => addLog('Play error: ' + e.message));
-}
-
-function stopPlayback() {
-  if (ws) { ws.close(); ws = null; }
-  if (currentId !== null) addLog('Stopped playback of item ' + currentId);
-  currentId = null;
-  v.pause();
-  v.removeAttribute('src');
-  v.load();
-  $('ctrl').style.display = 'none';
-}
-
-function openTunnel(id) {
-  if (ws) ws.close();
-  ws = new WebSocket('ws://' + location.host + '/ws/torrent/' + id);
-  ws.onopen = () => addLog('WS connected for item ' + id);
-  ws.onmessage = (ev) => { try { updateStats(JSON.parse(ev.data)); } catch (e) { addLog('WS msg: ' + ev.data); } };
-  ws.onclose = () => addLog('WS closed for item ' + id);
-  ws.onerror = () => addLog('WS error for item ' + id);
-}
-
-function updateStats(s) {
-  $('stats').textContent =
-    'item ' + s.id + ' | state: ' + s.state + ' | progress: ' + s.progress_pct.toFixed(1) + '%' +
-    ' | speed: ' + fmtSpeed(s.download_speed_bps) + ' | peers: ' + s.peers +
-    ' | contiguous: ' + fmtBytes(s.contiguous_bytes) + ' | total: ' + fmtBytes(s.total_bytes) +
-    '\n' + 'player time: ' + (v.currentTime || 0).toFixed(1) + 's' +
-    ' | player buffer: ' + (v.buffered.length ? (v.buffered.end(v.buffered.length-1) - v.buffered.start(0)).toFixed(1) : '0') + 's' +
-    ' | local file: ' + (s.is_local ? 'yes' : 'no');
-}
-
-function fmtSpeed(bps) {
-  if (bps >= 1e9) return (bps / 1e9).toFixed(2) + ' GB/s';
-  if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' MB/s';
-  if (bps >= 1e3) return (bps / 1e3).toFixed(1) + ' KB/s';
-  return bps + ' B/s';
-}
-
+/* ---------- misc ---------- */
 function fmtBytes(b) {
   if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
   if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
@@ -266,22 +660,55 @@ function fmtBytes(b) {
   return b + ' B';
 }
 
-$('start').addEventListener('click', async () => {
-  const magnet = $('magnet').value.trim();
-  if (!magnet) return;
-  try {
-    const res = await api('/api/library', { method: 'POST', body: JSON.stringify({ magnet, keep: $('keep').checked }) });
-    addLog('Added item with id ' + res.id);
-    $('magnet').value = '';
-    $('keep').checked = false;
-    refreshLibrary();
-  } catch (e) { addLog('Error adding: ' + e.message); }
-});
+function fmtSpeed(bps) {
+  if (bps >= 1e6) return (bps / 1e6).toFixed(1) + ' MB/s';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(0) + ' KB/s';
+  return bps + ' B/s';
+}
 
-$('refresh').addEventListener('click', refreshLibrary);
-setInterval(refreshLibrary, 3000);
+function fmtEta(sec) {
+  if (!isFinite(sec) || sec < 0) return '—';
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + 'm ' + (sec % 60) + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
+
+async function pollDownloads() {
+  if (pollBusy) return;
+  if (!currentMovie) return;
+  pollBusy = 1;
+  try {
+    for (const row of document.querySelectorAll('#mv-torrents .row[data-id]')) {
+      if (row.dataset.state !== 'downloading') continue;
+      try {
+        const s = await api('/api/library/' + row.dataset.id + '/status');
+        if (s.state && s.state !== 'downloading') {
+          row.dataset.state = s.state;
+          refreshLibrary();
+          continue;
+        }
+        const pct = Math.max(0, Math.min(100, s.progress_pct || 0));
+        const speed = s.download_speed_bps || 0;
+        const remain = (s.total_bytes || 0) - (s.contiguous_bytes || 0);
+        const eta = speed > 0 ? remain / speed : null;
+        const text = Math.round(pct) + '% · ' + fmtSpeed(speed) + (eta !== null ? ' · ETA ' + fmtEta(eta) : '');
+        dlState[row.dataset.id] = { pct, text };
+        const dl = row.querySelector('.dl');
+        dl.hidden = false;
+        dl.querySelector('.bar-in').style.width = pct + '%';
+        dl.querySelector('.txt').textContent = text;
+      } catch (e) { /* torrent may be gone; keep row as-is */ }
+    }
+  } finally { pollBusy = 0; }
+}
+
 updVol();
 refreshLibrary();
+setInterval(pollDownloads, 1000);
+setInterval(refreshLibrary, 3000);
 </script>
 </body>
 </html>

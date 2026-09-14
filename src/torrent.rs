@@ -132,6 +132,33 @@ impl TorrentEngine {
         handle.with_metadata(|m| m.clone()).ok()
     }
 
+    pub async fn pause_torrent(&self, library_id: i64) -> Result<()> {
+        let handle = self
+            .get_torrent(library_id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("torrent {library_id} is not active")))?;
+        self.session
+            .pause(&handle)
+            .await
+            .map_err(|e| Error::Torrent(e.to_string()))?;
+        info!("Torrent {library_id} paused");
+        Ok(())
+    }
+
+    pub async fn resume_torrent(&self, library_id: i64) -> Result<()> {
+        let handle = self
+            .get_torrent(library_id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("torrent {library_id} is not active")))?;
+        self.session
+            .clone()
+            .unpause(&handle)
+            .await
+            .map_err(|e| Error::Torrent(e.to_string()))?;
+        info!("Torrent {library_id} resumed");
+        Ok(())
+    }
+
     pub async fn find_largest_video_file(
         &self,
         library_id: i64,
