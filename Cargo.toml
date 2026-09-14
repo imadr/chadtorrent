@@ -1,0 +1,24 @@
+[package]
+name = "chadtorrent"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted torrent streaming service with library management"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = { version = "0.8", features = ["ws", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+librqbit = "9"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio-tungstenite = "0.24"

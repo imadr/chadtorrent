@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ChadTorrent</title>
+</head>
+<body>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; font-family: sans-serif; }
+  .wrap { position: relative; max-width: 800px; }
+  #player { display: block; width: 100%; background: #000; pointer-events: none; }
+  .ctrl { position: absolute; left: 0; right: 0; bottom: 0; padding: 0 12px 10px 12px; display: none; }
+  .strip { display: flex; align-items: center; gap: 10px; }
+  .pb { cursor: pointer; padding: 0; width: 32px; height: 32px;
+        background: none; border: none; flex-shrink: 0;
+        display: inline-flex; align-items: center; justify-content: center; }
+  .pb svg { width: 16px; height: 16px; fill: #fff; }
+  .seek { flex: 1; height: 5px; min-width: 0; appearance: none; -webkit-appearance: none;
+          background: linear-gradient(to right, #fff var(--val, 0%), #555 0);
+          cursor: pointer; border: none; outline: none; }
+  .seek::-webkit-slider-thumb, .seek::-moz-range-thumb {
+          appearance: none; -webkit-appearance: none; height: 0; width: 0;
+          background: transparent; border: none; cursor: pointer; }
+  .sv { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .sv svg { width: 16px; height: 16px; fill: #fff; }
+  .vl { width: 80px; height: 5px; appearance: none; -webkit-appearance: none;
+        background: linear-gradient(to right, #fff var(--val, 0%), #555 0);
+        cursor: pointer; border: none; outline: none; }
+  .vl::-webkit-slider-thumb, .vl::-moz-range-thumb {
+        appearance: none; -webkit-appearance: none; height: 0; width: 0;
+        background: transparent; border: none; cursor: pointer; }
+  .wrap:fullscreen, .wrap:-webkit-full-screen { position: fixed; inset: 0; margin: 0; width: 100vw; height: 100vh; max-width: none; background: #000; }
+  .wrap:fullscreen #player, .wrap:-webkit-full-screen #player { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #log { width: 100%; height: 200px; font-family: monospace; resize: vertical; }
+</style>
+
+<input id="magnet" type="text" size="80" placeholder="magnet:?xt=...">
+<label><input id="keep" type="checkbox"> keep</label>
+<button id="start">Add</button>
+<button id="refresh">Refresh</button>
+<hr>
+<ul id="library"></ul>
+<hr>
+
+<div class="wrap" id="videowrap">
+  <video id="player"></video>
+  <div class="ctrl" id="ctrl">
+    <div class="strip">
+      <button class="pb" id="ppbtn" title="Play / Pause">
+        <svg id="ppicon" viewBox="0 0 16 16"><polygon id="ppshape" points="3,1 13,8 3,15"/></svg>
+      </button>
+      <input class="seek" id="seekbar" type="range" min="0" max="1000" value="0">
+      <div class="sv">
+        <svg id="vicon" viewBox="0 0 16 16"><polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/></svg>
+        <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
+        <button class="pb" id="fsbtn" title="Fullscreen">
+          <svg id="fsicon" viewBox="0 0 16 16"><polygon points="2,2 7,2 7,3.5 3.5,3.5 3.5,7 2,7"/><polygon points="14,2 9,2 9,3.5 12.5,3.5 12.5,7 14,7"/><polygon points="2,14 7,14 7,12.5 3.5,12.5 3.5,9 2,9"/><polygon points="14,14 9,14 9,12.5 12.5,12.5 12.5,9 14,9"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="stats"></div>
+<div>
+  <label><input id="autoscroll" type="checkbox" checked> auto scroll to bottom</label>
+</div>
+<textarea id="log" readonly></textarea>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const v = $('player');
+const wrap = $('videowrap');
+let ws = null, currentId = null, seeking = false;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  if (!r.ok) { const t = await r.text(); throw new Error(t); }
+  return r.json();
+}
+
+function addLog(line) {
+  const ta = $('log');
+  ta.value = (ta.value ? ta.value + '\n' : '') + line;
+  if ($('autoscroll').checked) ta.scrollTop = ta.scrollHeight;
+}
+
+/* ---- player ---- */
+
+const ppic = () => $('ppicon');
+v.addEventListener('play',  () => { ppic().innerHTML = '<rect x="4" y="2" width="2.5" height="12"/><rect x="9.5" y="2" width="2.5" height="12"/>'; });
+v.addEventListener('pause', () => { ppic().innerHTML = '<polygon points="3,1 13,8 3,15"/>'; });
+$('ppbtn').addEventListener('click', () => { v.paused ? v.play().catch(()=>{}) : v.pause(); });
+
+function updSeek() {
+  const el = $('seekbar');
+  if (seeking || !v.duration) return;
+  const pct = (v.currentTime / v.duration) * 100;
+  el.value = Math.round(pct * 10);
+  el.style.setProperty('--val', pct.toFixed(2) + '%');
+}
+v.addEventListener('timeupdate', updSeek);
+v.addEventListener('loadedmetadata', updSeek);
+
+$('seekbar').addEventListener('mousedown',   () => { seeking = true; });
+$('seekbar').addEventListener('mouseup',     () => { seeking = false; });
+$('seekbar').addEventListener('touchstart',  () => { seeking = true; }, { passive: true });
+$('seekbar').addEventListener('touchend',    () => { seeking = false; });
+$('seekbar').addEventListener('input', () => {
+  const pct = $('seekbar').value / 10;
+  $('seekbar').style.setProperty('--val', pct + '%');
+  if (v.duration) v.currentTime = (pct / 100) * v.duration;
+});
+
+function updVol() {
+  const vol = Math.round((v.volume || 0) * 100);
+  $('volbar').value = vol;
+  $('volbar').style.setProperty('--val', vol + '%');
+  const tri = '<polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/>';
+  const wave1 = '<path d="M8 5.5c1.5 1.5 1.5 3.5 0 5" stroke="#fff" stroke-width="1.5" fill="none"/>';
+  const wave2 = '<path d="M10.5 3.5c2.5 2.5 2.5 6.5 0 9" stroke="#fff" stroke-width="1.5" fill="none"/>';
+  const mute = tri + '<line x1="7" y1="6" x2="13" y2="12" stroke="#fff" stroke-width="2"/><line x1="13" y1="6" x2="7" y2="12" stroke="#fff" stroke-width="2"/>';
+  const pct = v.volume === 0 ? 0 : v.volume * 100;
+  let icon = tri;
+  if (v.muted) icon = mute;
+  else if (pct >= 50) icon = tri + wave1 + wave2;
+  else if (pct >= 10) icon = tri + wave1;
+  $('vicon').innerHTML = icon;
+}
+v.addEventListener('volumechange', updVol);
+$('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
+$('vicon').addEventListener('click', () => { v.muted = !v.muted; updVol(); });
+
+function fsIsOn() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+function applyFs() {
+  const on = fsIsOn();
+  wrap.style.cssText = on ? 'position: fixed; inset: 0; width: 100vw; height: 100vh; max-width: none; margin: 0; background: rgb(0,0,0);' : '';
+  v.style.cssText = on ? 'position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;' : '';
+}
+function fsIcon() {
+  $('fsicon').innerHTML = fsIsOn()
+    ? '<polygon points="4,4 7,4 7,5.5 5.5,5.5 5.5,7 4,7"/><polygon points="12,4 9,4 9,5.5 10.5,5.5 10.5,7 12,7"/><polygon points="4,12 7,12 7,10.5 5.5,10.5 5.5,9 4,9"/><polygon points="12,12 9,12 9,10.5 10.5,10.5 10.5,9 12,9"/>'
+    : '<polygon points="2,2 7,2 7,3.5 3.5,3.5 3.5,7 2,7"/><polygon points="14,2 9,2 9,3.5 12.5,3.5 12.5,7 14,7"/><polygon points="2,14 7,14 7,12.5 3.5,12.5 3.5,9 2,9"/><polygon points="14,14 9,14 9,12.5 12.5,12.5 12.5,9 14,9"/>';
+}
+document.addEventListener('fullscreenchange', () => { fsIcon(); applyFs(); });
+document.addEventListener('webkitfullscreenchange', () => { fsIcon(); applyFs(); });
+fsIcon();
+applyFs();
+$('fsbtn').addEventListener('click', () => {
+  if (fsIsOn()) { document.exitFullscreen().catch(() => {}); }
+  else if (wrap.requestFullscreen) { wrap.requestFullscreen().catch(() => {}); }
+  else if (v.webkitEnterFullscreen) { v.webkitEnterFullscreen(); }
+});
+
+/* no spacebar pause, no click on the video element */
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) e.preventDefault();
+});
+
+/* show controls only when the cursor is in the bottom 10% of the video */
+document.addEventListener('mousemove', (e) => {
+  const r = v.getBoundingClientRect();
+  const show = r.width > 0 && e.clientY >= r.top + r.height * 0.9;
+  $('ctrl').style.display = show ? 'block' : 'none';
+});
+
+/* ---- library / API / WS (unchanged) ---- */
+
+async function refreshLibrary() {
+  try { renderLibrary(await api('/api/library')); } catch (e) { addLog('Error refreshing library: ' + e.message); }
+}
+
+function renderLibrary(items) {
+  const ul = $('library');
+  ul.innerHTML = '';
+  for (const item of items) {
+    const li = document.createElement('li');
+    li.id = 'item-' + item.id;
+    const title = document.createElement('span');
+    title.textContent = (item.title || item.magnet.slice(0, 40)) + ' — ' + item.state;
+    const pct = document.createElement('span');
+    pct.textContent = ' ';
+    const keepInput = document.createElement('input');
+    keepInput.type = 'checkbox';
+    keepInput.checked = item.keep;
+    keepInput.addEventListener('change', async () => {
+      try {
+        await api('/api/library/' + item.id, { method: 'PATCH', body: JSON.stringify({ keep: keepInput.checked }) });
+        addLog('Toggled keep=' + keepInput.checked + ' for ' + item.title);
+        refreshLibrary();
+      } catch (e) { addLog('Error toggling keep: ' + e.message); keepInput.checked = !keepInput.checked; }
+    });
+    const keepLabel = document.createElement('label');
+    keepLabel.appendChild(keepInput);
+    keepLabel.appendChild(document.createTextNode(' keep'));
+    const playBtn = document.createElement('button');
+    playBtn.textContent = 'Play';
+    playBtn.addEventListener('click', () => play(item));
+    const delBtn = document.createElement('button');
+    delBtn.textContent = 'Delete';
+    delBtn.addEventListener('click', async () => {
+      try {
+        await api('/api/library/' + item.id, { method: 'DELETE' });
+        if (currentId === item.id) stopPlayback();
+        refreshLibrary();
+      } catch (e) { addLog('Error deleting: ' + e.message); }
+    });
+    li.appendChild(title); li.appendChild(pct); li.appendChild(keepLabel); li.appendChild(playBtn); li.appendChild(delBtn);
+    ul.appendChild(li);
+  }
+}
+
+async function play(item) {
+  if (currentId === item.id && v.src) { v.play(); return; }
+  stopPlayback();
+  currentId = item.id;
+  addLog('Playing: ' + (item.title || item.id));
+  openTunnel(item.id);
+  v.src = '/stream/' + item.id;
+  $('ctrl').style.display = 'block';
+  v.load();
+  v.play().catch(e => addLog('Play error: ' + e.message));
+}
+
+function stopPlayback() {
+  if (ws) { ws.close(); ws = null; }
+  if (currentId !== null) addLog('Stopped playback of item ' + currentId);
+  currentId = null;
+  v.pause();
+  v.removeAttribute('src');
+  v.load();
+  $('ctrl').style.display = 'none';
+}
+
+function openTunnel(id) {
+  if (ws) ws.close();
+  ws = new WebSocket('ws://' + location.host + '/ws/torrent/' + id);
+  ws.onopen = () => addLog('WS connected for item ' + id);
+  ws.onmessage = (ev) => { try { updateStats(JSON.parse(ev.data)); } catch (e) { addLog('WS msg: ' + ev.data); } };
+  ws.onclose = () => addLog('WS closed for item ' + id);
+  ws.onerror = () => addLog('WS error for item ' + id);
+}
+
+function updateStats(s) {
+  $('stats').textContent =
+    'item ' + s.id + ' | state: ' + s.state + ' | progress: ' + s.progress_pct.toFixed(1) + '%' +
+    ' | speed: ' + fmtSpeed(s.download_speed_bps) + ' | peers: ' + s.peers +
+    ' | contiguous: ' + fmtBytes(s.contiguous_bytes) + ' | total: ' + fmtBytes(s.total_bytes) +
+    '\n' + 'player time: ' + (v.currentTime || 0).toFixed(1) + 's' +
+    ' | player buffer: ' + (v.buffered.length ? (v.buffered.end(v.buffered.length-1) - v.buffered.start(0)).toFixed(1) : '0') + 's' +
+    ' | local file: ' + (s.is_local ? 'yes' : 'no');
+}
+
+function fmtSpeed(bps) {
+  if (bps >= 1e9) return (bps / 1e9).toFixed(2) + ' GB/s';
+  if (bps >= 1e6) return (bps / 1e6).toFixed(2) + ' MB/s';
+  if (bps >= 1e3) return (bps / 1e3).toFixed(1) + ' KB/s';
+  return bps + ' B/s';
+}
+
+function fmtBytes(b) {
+  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+  if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
+  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+$('start').addEventListener('click', async () => {
+  const magnet = $('magnet').value.trim();
+  if (!magnet) return;
+  try {
+    const res = await api('/api/library', { method: 'POST', body: JSON.stringify({ magnet, keep: $('keep').checked }) });
+    addLog('Added item with id ' + res.id);
+    $('magnet').value = '';
+    $('keep').checked = false;
+    refreshLibrary();
+  } catch (e) { addLog('Error adding: ' + e.message); }
+});
+
+$('refresh').addEventListener('click', refreshLibrary);
+setInterval(refreshLibrary, 3000);
+updVol();
+refreshLibrary();
+</script>
+</body>
+</html>
