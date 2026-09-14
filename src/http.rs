@@ -7,7 +7,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -24,13 +24,22 @@ const RANGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Deserialize)]
 pub struct AddItemRequest {
     magnet: String,
-    #[serde(default)]
-    keep: bool,
     title: Option<String>,
     year: Option<i32>,
     poster_path: Option<String>,
     tmdb_id: Option<i64>,
     media_type: Option<String>,
+    #[serde(default = "default_true")]
+    sequential: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SetSequentialRequest {
+    sequential: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
@@ -40,12 +49,6 @@ pub struct AddMovieRequest {
     poster_path: Option<String>,
     tmdb_id: i64,
     media_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateItemRequest {
-    #[serde(default)]
-    keep: bool,
 }
 
 #[derive(Clone)]
@@ -69,13 +72,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/movies", post(add_movie))
         .route("/api/search", get(search_tmdb))
         .route("/api/torrents", get(torrent_search))
-        .route(
-            "/api/library/{id}",
-            patch(update_item).delete(delete_item),
-        )
+        .route("/api/library/{id}", delete(delete_item))
         .route("/api/library/{id}/status", get(get_status))
+        .route("/api/library/{id}/pieces", get(get_pieces))
         .route("/api/library/{id}/pause", post(pause_item))
         .route("/api/library/{id}/resume", post(resume_item))
+        .route("/api/library/{id}/sequential", post(set_sequential))
         .route("/stream/{id}", get(stream_handler))
         .route("/ws/torrent/{id}", get(ws_handler))
         .with_state(state)
@@ -88,7 +90,10 @@ async fn add_item(
     if !req.magnet.starts_with("magnet:?") {
         return Err(Error::BadRequest("invalid magnet link".into()));
     }
-    let id = state.library.add_item(&req.magnet, req.keep).await?;
+    let id = state
+        .library
+        .add_item_with_sequential(&req.magnet, req.sequential)
+        .await?;
     if req.title.is_some()
         || req.year.is_some()
         || req.poster_path.is_some()
@@ -242,15 +247,6 @@ async fn list_items(
     Ok(Json(items))
 }
 
-async fn update_item(
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-    Json(req): Json<UpdateItemRequest>,
-) -> Result<impl IntoResponse> {
-    state.library.set_keep(id, req.keep).await?;
-    Ok(Json(json!({ "success": true })))
-}
-
 async fn delete_item(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -285,11 +281,30 @@ async fn pause_item(
     Ok(Json(json!({ "success": true })))
 }
 
+async fn get_pieces(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    match state.library.get_pieces(id).await? {
+        Some((have, total)) => Ok(Json(json!({ "total": total, "have": have }))),
+        None => Ok(Json(json!({ "total": 0, "have": [] }))),
+    }
+}
+
 async fn resume_item(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse> {
     state.library.resume_item(id).await?;
+    Ok(Json(json!({ "success": true })))
+}
+
+async fn set_sequential(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetSequentialRequest>,
+) -> Result<impl IntoResponse> {
+    state.library.set_sequential(id, req.sequential).await?;
     Ok(Json(json!({ "success": true })))
 }
 

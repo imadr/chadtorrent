@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use librqbit::{
-    AddTorrent, AddTorrentOptions, DhtSessionConfig, ManagedTorrent, Session,
+    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ManagedTorrent, Session,
     SessionOptions, TorrentMetadata, TorrentStats,
 };
 use tokio::sync::RwLock;
@@ -42,23 +42,9 @@ impl TorrentEngine {
         })
     }
 
-    pub async fn add_torrent(
-        &self,
-        library_id: i64,
-        magnet: &str,
-        output_dir: &Path,
-    ) -> Result<Arc<ManagedTorrent>> {
-        self.add_torrent_with_opts(
-            library_id,
-            magnet,
-            output_dir,
-            AddTorrentOptions::default(),
-        )
-        .await
-    }
-
     /// Add a torrent with custom options (used by tests to inject a local
-    /// seeder peer, avoiding any internet dependency).
+    /// seeder peer, avoiding any internet dependency), and by the library
+    /// manager to apply per-torrent options like sequential download.
     pub async fn add_torrent_with_opts(
         &self,
         library_id: i64,
@@ -105,6 +91,17 @@ impl TorrentEngine {
 
     pub async fn get_torrent(&self, library_id: i64) -> Option<Arc<ManagedTorrent>> {
         self.torrents.read().await.get(&library_id).cloned()
+    }
+
+    /// Toggle sequential piece downloading for an active torrent. Ignores
+    /// failures when the torrent is still initializing — the add-time option
+    /// already covered that case.
+    pub async fn set_sequential(&self, library_id: i64, sequential: bool) {
+        if let Some(handle) = self.get_torrent(library_id).await {
+            if let Err(e) = handle.set_sequential(sequential) {
+                info!("set_sequential({library_id}, {sequential}) skipped: {e}");
+            }
+        }
     }
 
     pub async fn remove_torrent(&self, library_id: i64, delete_files: bool) -> Result<()> {
@@ -157,6 +154,23 @@ impl TorrentEngine {
             .map_err(|e| Error::Torrent(e.to_string()))?;
         info!("Torrent {library_id} resumed");
         Ok(())
+    }
+
+    pub async fn piece_map(&self, library_id: i64) -> Result<Option<(Vec<bool>, u32)>> {
+        let handle = match self.get_torrent(library_id).await {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+        let api = Api::new(self.session.clone(), None);
+        let (bf, total) = api
+            .api_dump_haves(handle.id().into())
+            .map_err(|e| Error::Torrent(e.to_string()))?;
+        let raw = bf.as_raw_slice();
+        let mut bits = vec![false; total as usize];
+        for (i, slot) in bits.iter_mut().enumerate() {
+            *slot = raw[i / 8] & (1 << (7 - (i % 8))) != 0;
+        }
+        Ok(Some((bits, total)))
     }
 
     pub async fn find_largest_video_file(

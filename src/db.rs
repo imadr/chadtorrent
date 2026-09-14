@@ -8,7 +8,6 @@ pub struct LibraryItem {
     pub id: i64,
     pub magnet: String,
     pub title: Option<String>,
-    pub keep: bool,
     pub state: String,
     pub added_at: String,
     pub file_path: Option<String>,
@@ -18,6 +17,7 @@ pub struct LibraryItem {
     pub year: Option<i32>,
     pub tmdb_id: Option<i64>,
     pub media_type: Option<String>,
+    pub sequential: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -29,7 +29,6 @@ pub struct TorrentStatus {
     pub peers: u32,
     pub contiguous_bytes: u64,
     pub total_bytes: u64,
-    pub keep: bool,
     pub is_local: bool,
 }
 
@@ -49,7 +48,6 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 magnet TEXT NOT NULL,
                 title TEXT,
-                keep BOOLEAN DEFAULT 0,
                 state TEXT DEFAULT 'connecting',
                 added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 file_path TEXT,
@@ -58,15 +56,27 @@ impl Database {
                 poster_path TEXT,
                 year INTEGER,
                 tmdb_id INTEGER,
-                media_type TEXT
+                media_type TEXT,
+                sequential INTEGER NOT NULL DEFAULT 1
             );",
         )?;
+        // Migrate: drop the obsolete "keep" column if a pre-removal database
+        // still has it.
+        let has_keep: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('library') WHERE name = 'keep')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_keep {
+            conn.execute_batch("ALTER TABLE library DROP COLUMN keep")?;
+        }
         // Migrate: add columns if missing (idempotent)
         for stmt in [
             "ALTER TABLE library ADD COLUMN poster_path TEXT",
             "ALTER TABLE library ADD COLUMN year INTEGER",
             "ALTER TABLE library ADD COLUMN tmdb_id INTEGER",
             "ALTER TABLE library ADD COLUMN media_type TEXT",
+            "ALTER TABLE library ADD COLUMN sequential INTEGER NOT NULL DEFAULT 1",
         ] {
             let _ = conn.execute_batch(stmt);
         }
@@ -75,11 +85,11 @@ impl Database {
         })
     }
 
-    pub fn insert_item(&self, magnet: &str, keep: bool) -> Result<i64> {
+    pub fn insert_item(&self, magnet: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO library (magnet, keep, state) VALUES (?1, ?2, 'connecting')",
-            params![magnet, keep],
+            "INSERT INTO library (magnet, state) VALUES (?1, 'connecting')",
+            params![magnet],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -94,8 +104,8 @@ impl Database {
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO library (magnet, keep, state, title, year, poster_path, tmdb_id, media_type)
-             VALUES ('', 0, 'ready', ?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO library (magnet, state, title, year, poster_path, tmdb_id, media_type)
+             VALUES ('', 'ready', ?1, ?2, ?3, ?4, ?5)",
             params![title, year, poster_path, tmdb_id, media_type],
         )?;
         Ok(conn.last_insert_rowid())
@@ -104,8 +114,8 @@ impl Database {
     pub fn get_item(&self, id: i64) -> Result<Option<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type
+            "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
+                    poster_path, year, tmdb_id, media_type, sequential
              FROM library WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -113,16 +123,16 @@ impl Database {
                 id: row.get(0)?,
                 magnet: row.get(1)?,
                 title: row.get(2)?,
-                keep: row.get(3)?,
-                state: row.get(4)?,
-                added_at: row.get(5)?,
-                file_path: row.get(6)?,
-                size_bytes: row.get(7)?,
-                rqbit_id: row.get(8)?,
-                poster_path: row.get(9)?,
-                year: row.get(10)?,
-                tmdb_id: row.get(11)?,
-                media_type: row.get(12)?,
+                state: row.get(3)?,
+                added_at: row.get(4)?,
+                file_path: row.get(5)?,
+                size_bytes: row.get(6)?,
+                rqbit_id: row.get(7)?,
+                poster_path: row.get(8)?,
+                year: row.get(9)?,
+                tmdb_id: row.get(10)?,
+                media_type: row.get(11)?,
+                sequential: row.get(12)?,
             })
         })?;
         match rows.next() {
@@ -134,8 +144,8 @@ impl Database {
     pub fn list_items(&self) -> Result<Vec<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type
+            "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
+                    poster_path, year, tmdb_id, media_type, sequential
              FROM library ORDER BY added_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -143,16 +153,16 @@ impl Database {
                 id: row.get(0)?,
                 magnet: row.get(1)?,
                 title: row.get(2)?,
-                keep: row.get(3)?,
-                state: row.get(4)?,
-                added_at: row.get(5)?,
-                file_path: row.get(6)?,
-                size_bytes: row.get(7)?,
-                rqbit_id: row.get(8)?,
-                poster_path: row.get(9)?,
-                year: row.get(10)?,
-                tmdb_id: row.get(11)?,
-                media_type: row.get(12)?,
+                state: row.get(3)?,
+                added_at: row.get(4)?,
+                file_path: row.get(5)?,
+                size_bytes: row.get(6)?,
+                rqbit_id: row.get(7)?,
+                poster_path: row.get(8)?,
+                year: row.get(9)?,
+                tmdb_id: row.get(10)?,
+                media_type: row.get(11)?,
+                sequential: row.get(12)?,
             })
         })?;
         let mut items = Vec::new();
@@ -208,15 +218,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn set_keep(&self, id: i64, keep: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE library SET keep = ?2 WHERE id = ?1",
-            params![id, keep],
-        )?;
-        Ok(())
-    }
-
     pub fn delete_item(&self, id: i64) -> Result<Option<LibraryItem>> {
         let item = self.get_item(id)?;
         let conn = self.conn.lock().unwrap();
@@ -224,25 +225,12 @@ impl Database {
         Ok(item)
     }
 
-    /// Convert an item into an empty movie placeholder (keeps the movie in the
-    /// library after its file/torrent has been removed).
-    pub fn reset_to_placeholder(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE library SET magnet = '', state = 'ready', file_path = NULL,
-                    size_bytes = NULL, rqbit_id = NULL
-             WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
     #[allow(dead_code)]
     pub fn find_by_rqbit_id(&self, rqbit_id: i64) -> Result<Option<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, magnet, title, keep, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type
+            "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
+                    poster_path, year, tmdb_id, media_type, sequential
              FROM library WHERE rqbit_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rqbit_id], |row| {
@@ -250,16 +238,16 @@ impl Database {
                 id: row.get(0)?,
                 magnet: row.get(1)?,
                 title: row.get(2)?,
-                keep: row.get(3)?,
-                state: row.get(4)?,
-                added_at: row.get(5)?,
-                file_path: row.get(6)?,
-                size_bytes: row.get(7)?,
-                rqbit_id: row.get(8)?,
-                poster_path: row.get(9)?,
-                year: row.get(10)?,
-                tmdb_id: row.get(11)?,
-                media_type: row.get(12)?,
+                state: row.get(3)?,
+                added_at: row.get(4)?,
+                file_path: row.get(5)?,
+                size_bytes: row.get(6)?,
+                rqbit_id: row.get(7)?,
+                poster_path: row.get(8)?,
+                year: row.get(9)?,
+                tmdb_id: row.get(10)?,
+                media_type: row.get(11)?,
+                sequential: row.get(12)?,
             })
         })?;
         match rows.next() {
@@ -286,6 +274,15 @@ impl Database {
                     media_type = COALESCE(?6, media_type)
              WHERE id = ?1",
             params![id, title, year, poster_path, tmdb_id, media_type],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_sequential(&self, id: i64, sequential: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE library SET sequential = ?2 WHERE id = ?1",
+            params![id, sequential],
         )?;
         Ok(())
     }
@@ -318,28 +315,18 @@ mod tests {
     #[test]
     fn test_insert_and_get() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc123", false).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc123").unwrap();
         assert!(id > 0);
         let item = db.get_item(id).unwrap().unwrap();
         assert_eq!(item.magnet, "magnet:?xt=urn:btih:abc123");
-        assert!(!item.keep);
         assert_eq!(item.state, "connecting");
-        cleanup(&dir);
-    }
-
-    #[test]
-    fn test_insert_with_keep() {
-        let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:xyz", true).unwrap();
-        let item = db.get_item(id).unwrap().unwrap();
-        assert!(item.keep);
         cleanup(&dir);
     }
 
     #[test]
     fn test_update_state() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", false).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc").unwrap();
         db.update_state(id, "downloading").unwrap();
         let item = db.get_item(id).unwrap().unwrap();
         assert_eq!(item.state, "downloading");
@@ -349,7 +336,7 @@ mod tests {
     #[test]
     fn test_update_title() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", false).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc").unwrap();
         db.update_title(id, "My Torrent").unwrap();
         let item = db.get_item(id).unwrap().unwrap();
         assert_eq!(item.title.unwrap(), "My Torrent");
@@ -357,20 +344,10 @@ mod tests {
     }
 
     #[test]
-    fn test_set_keep() {
-        let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", false).unwrap();
-        db.set_keep(id, true).unwrap();
-        let item = db.get_item(id).unwrap().unwrap();
-        assert!(item.keep);
-        cleanup(&dir);
-    }
-
-    #[test]
     fn test_list_items() {
         let (db, dir) = temp_db();
-        db.insert_item("magnet:?xt=urn:btih:abc1", false).unwrap();
-        db.insert_item("magnet:?xt=urn:btih:abc2", true).unwrap();
+        db.insert_item("magnet:?xt=urn:btih:abc1").unwrap();
+        db.insert_item("magnet:?xt=urn:btih:abc2").unwrap();
         let items = db.list_items().unwrap();
         assert_eq!(items.len(), 2);
         cleanup(&dir);
@@ -379,7 +356,7 @@ mod tests {
     #[test]
     fn test_delete_item() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", false).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc").unwrap();
         let deleted = db.delete_item(id).unwrap().unwrap();
         assert_eq!(deleted.id, id);
         assert!(db.get_item(id).unwrap().is_none());
@@ -396,7 +373,7 @@ mod tests {
     #[test]
     fn test_update_rqbit_id() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", false).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc").unwrap();
         db.update_rqbit_id(id, 42).unwrap();
         let item = db.get_item(id).unwrap().unwrap();
         assert_eq!(item.rqbit_id, Some(42));
@@ -406,7 +383,7 @@ mod tests {
     #[test]
     fn test_update_file_path() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", true).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc").unwrap();
         db.update_file_path(id, "/some/path/file.mp4").unwrap();
         let item = db.get_item(id).unwrap().unwrap();
         assert_eq!(item.file_path, Some("/some/path/file.mp4".into()));
@@ -416,10 +393,40 @@ mod tests {
     #[test]
     fn test_find_by_rqbit_id() {
         let (db, dir) = temp_db();
-        let id = db.insert_item("magnet:?xt=urn:btih:abc", false).unwrap();
+        let id = db.insert_item("magnet:?xt=urn:btih:abc").unwrap();
         db.update_rqbit_id(id, 10).unwrap();
         let found = db.find_by_rqbit_id(10).unwrap().unwrap();
         assert_eq!(found.id, id);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_set_sequential() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:seq").unwrap();
+        assert!(db.get_item(id).unwrap().unwrap().sequential);
+        db.set_sequential(id, false).unwrap();
+        assert!(!db.get_item(id).unwrap().unwrap().sequential);
+        db.set_sequential(id, true).unwrap();
+        assert!(db.get_item(id).unwrap().unwrap().sequential);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_migration_drops_keep_column() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:migration").unwrap();
+        let item = db.get_item(id).unwrap().unwrap();
+        assert_eq!(item.state, "connecting");
+        let conn = db.conn.lock().unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('library')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .unwrap();
+        assert!(!cols.contains(&"keep".to_string()));
         cleanup(&dir);
     }
 }

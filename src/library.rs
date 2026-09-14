@@ -99,12 +99,12 @@ impl LibraryManager {
             let dir = match item.file_path.as_ref() {
                 Some(p) => PathBuf::from(p),
                 None => {
-                    let base = if item.keep {
-                        &self.config.library_dir
+                    let lib = self.config.library_dir.join(item.id.to_string());
+                    if lib.exists() {
+                        lib
                     } else {
-                        &self.config.temp_dir
-                    };
-                    base.join(item.id.to_string())
+                        self.config.temp_dir.join(item.id.to_string())
+                    }
                 }
             };
             if !dir.exists() {
@@ -145,8 +145,14 @@ impl LibraryManager {
         Ok(())
     }
 
-    pub async fn add_item(&self, magnet: &str, keep: bool) -> Result<i64> {
-        self.add_item_inner(magnet, keep, None).await
+    /// Add a torrent and set its sequential-download flag for both the DB row
+    /// and the registrered engine torrent.
+    pub async fn add_item_with_sequential(
+        self: &Arc<Self>,
+        magnet: &str,
+        sequential: bool,
+    ) -> Result<i64> {
+        self.add_item_inner(magnet, None, sequential).await
     }
 
     /// Add a movie placeholder entry (no torrent yet) so it appears in the
@@ -163,62 +169,79 @@ impl LibraryManager {
             .insert_movie(title, year, poster_path, tmdb_id, media_type)
     }
 
-    /// Same as [`add_item`], but lets tests inject a local seeder peer so the
-    /// download works without any internet/network dependency.
     #[allow(dead_code)]
     pub async fn add_item_with_initial_peers(
-        &self,
+        self: &Arc<Self>,
         magnet: &str,
-        keep: bool,
         initial_peers: Vec<SocketAddr>,
     ) -> Result<i64> {
-        self.add_item_inner(magnet, keep, Some(initial_peers)).await
+        self.add_item_inner(magnet, Some(initial_peers), true).await
     }
 
+    /// Create the library row immediately and hand torrent registration off
+    /// to a background task, so the caller never blocks on metadata lookup.
+    /// The UI shows an "adding…" row right away and the state becomes
+    /// "downloading" once the engine resolves the torrent.
     async fn add_item_inner(
-        &self,
+        self: &Arc<Self>,
         magnet: &str,
-        keep: bool,
         initial_peers: Option<Vec<SocketAddr>>,
+        sequential: bool,
     ) -> Result<i64> {
-        let library_id = self.db.insert_item(magnet, keep)?;
-        let output_dir = if keep {
-            self.config.library_dir.join(library_id.to_string())
-        } else {
-            self.config.temp_dir.join(library_id.to_string())
-        };
+        let library_id = self.db.insert_item(magnet)?;
+        let output_dir = self.config.library_dir.join(library_id.to_string());
         std::fs::create_dir_all(&output_dir)?;
+        self.db.update_state(library_id, "connecting")?;
+        if !sequential {
+            self.db.set_sequential(library_id, false)?;
+        }
 
-        let handle = if let Some(peers) = initial_peers {
-            let opts = librqbit::AddTorrentOptions {
-                initial_peers: Some(peers),
-                ..Default::default()
-            };
-            self.engine
-                .add_torrent_with_opts(library_id, magnet, &output_dir, opts)
-                .await
-        } else {
-            self.engine
-                .add_torrent(library_id, magnet, &output_dir)
-                .await
+        let me = self.clone();
+        let magnet = magnet.to_string();
+        tokio::spawn(async move {
+            me.register_torrent(library_id, magnet, output_dir, initial_peers)
+                .await;
+        });
+
+        info!("Library item {} queued for registration", library_id);
+        Ok(library_id)
+    }
+
+    async fn register_torrent(
+        self: &Arc<Self>,
+        library_id: i64,
+        magnet: String,
+        output_dir: PathBuf,
+        initial_peers: Option<Vec<SocketAddr>>,
+    ) {
+        let mut opts = librqbit::AddTorrentOptions {
+            initial_peers: initial_peers.clone(),
+            ..Default::default()
         };
+        if let Ok(Some(item)) = self.db.get_item(library_id) {
+            opts.sequential = Some(item.sequential);
+        }
+        let handle = self
+            .engine
+            .add_torrent_with_opts(library_id, &magnet, &output_dir, opts)
+            .await;
 
         let handle = match handle {
             Ok(h) => h,
             Err(e) => {
-                self.db.update_state(library_id, "error")?;
-                return Err(e);
+                let _ = self.db.update_state(library_id, "error");
+                warn!("Failed to register torrent {}: {}", library_id, e);
+                return;
             }
         };
 
         let name = handle.name().unwrap_or_else(|| "Unknown".to_string());
-        self.db.update_title(library_id, &name)?;
-        self.db.update_state(library_id, "downloading")?;
-
-        info!(
-            "Library item added: id={}, title={}",
-            library_id, name
-        );
+        if let Err(e) = self.db.update_title(library_id, &name) {
+            warn!("Failed to set title for {}: {}", library_id, e);
+        }
+        if let Err(e) = self.db.update_state(library_id, "downloading") {
+            warn!("Failed to set state for {}: {}", library_id, e);
+        }
 
         if let Some((_file_id, file_name, size)) = self
             .engine
@@ -226,77 +249,19 @@ impl LibraryManager {
             .await
         {
             let title_with_ext = format!("{} / {}", name, file_name);
-            self.db.update_title(library_id, &title_with_ext)?;
-            self.db.update_size(library_id, size as i64)?;
+            if let Err(e) = self.db.update_title(library_id, &title_with_ext) {
+                warn!("Failed to set extended title for {}: {}", library_id, e);
+            }
+            if let Err(e) = self.db.update_size(library_id, size as i64) {
+                warn!("Failed to set size for {}: {}", library_id, e);
+            }
         }
 
-        if keep {
-            let resolved = output_dir.to_string_lossy().to_string();
-            self.db.update_file_path(library_id, &resolved)?;
+        let resolved = output_dir.to_string_lossy().to_string();
+        if let Err(e) = self.db.update_file_path(library_id, &resolved) {
+            warn!("Failed to set file path for {}: {}", library_id, e);
         }
-
-        Ok(library_id)
-    }
-
-    pub async fn set_keep(&self, id: i64, keep: bool) -> Result<()> {
-        let item = self
-            .db
-            .get_item(id)?
-            .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
-
-        if item.keep == keep {
-            return Ok(());
-        }
-        self.db.set_keep(id, keep)?;
-
-        if keep {
-            let permanent_dir = self.config.library_dir.join(id.to_string());
-            std::fs::create_dir_all(&permanent_dir)?;
-
-            // Current location: recorded file_path if it exists on disk,
-            // otherwise the engine's output folder (still downloading).
-            let mut current: Option<PathBuf> = None;
-            if let Some(fp) = item.file_path.as_ref() {
-                let p = PathBuf::from(fp);
-                if p.exists() {
-                    current = Some(p);
-                }
-            }
-            if current.is_none() {
-                if let Some(handle) = self.engine.get_torrent(id).await {
-                    current = Some(handle.output_folder().to_path_buf());
-                }
-            }
-
-            if let Some(current) = current {
-                if current != permanent_dir {
-                    info!(
-                        "Promoting item {} from {:?} to {:?}",
-                        id, current, permanent_dir
-                    );
-                    if let Err(e) = self.move_files(&current, &permanent_dir).await {
-                        warn!("Failed to move files, continuing: {}", e);
-                    }
-                }
-            }
-
-            let _ = self
-                .db
-                .update_file_path(id, &permanent_dir.to_string_lossy());
-
-            let complete = match self.engine.get_torrent(id).await {
-                Some(handle) => handle.stats().finished,
-                None => self.is_complete_on_disk(&permanent_dir, item.size_bytes),
-            };
-            if complete {
-                self.db.update_state(id, "ready")?;
-            }
-        } else {
-            info!("Item {} keep toggled off, leaving files as-is", id);
-        }
-
-        info!("Item {} keep set to {}", id, keep);
-        Ok(())
+        info!("Library item {} registered", library_id);
     }
 
     pub async fn pause_item(&self, id: i64) -> Result<()> {
@@ -311,23 +276,15 @@ impl LibraryManager {
         Ok(())
     }
 
-    fn is_complete_on_disk(&self, dir: &Path, size_bytes: Option<i64>) -> bool {
-        match size_bytes {
-            Some(expected) if expected > 0 => find_largest_video_in(dir)
-                .and_then(|p| p.metadata().ok().map(|m| m.len() as i64 == expected))
-                .unwrap_or(false),
-            _ => false,
-        }
+    pub async fn get_pieces(&self, id: i64) -> Result<Option<(Vec<bool>, u32)>> {
+        self.engine.piece_map(id).await
     }
 
-    async fn move_files(&self, from: &Path, to: &Path) -> Result<()> {
-        if from.exists() {
-            for entry in std::fs::read_dir(from)? {
-                let entry = entry?;
-                let dest = to.join(entry.file_name());
-                std::fs::rename(entry.path(), dest)?;
-            }
-        }
+    /// Toggle sequential piece downloading: persist the preference and apply
+    /// it to the active engine torrent if one exists.
+    pub async fn set_sequential(&self, id: i64, sequential: bool) -> Result<()> {
+        self.db.set_sequential(id, sequential)?;
+        self.engine.set_sequential(id, sequential).await;
         Ok(())
     }
 
@@ -354,7 +311,6 @@ impl LibraryManager {
                 peers: 0,
                 contiguous_bytes: item.size_bytes.unwrap_or(0) as u64,
                 total_bytes: item.size_bytes.unwrap_or(0) as u64,
-                keep: item.keep,
                 is_local: true,
             });
         }
@@ -423,7 +379,6 @@ impl LibraryManager {
                     peers: 0,
                     contiguous_bytes: total,
                     total_bytes: total,
-                    keep: item.keep,
                     is_local: true,
                 });
             }
@@ -457,7 +412,6 @@ impl LibraryManager {
                 peers: peer_count,
                 contiguous_bytes: contiguous,
                 total_bytes: total,
-                keep: item.keep,
                 is_local: false,
             });
         }
@@ -470,20 +424,18 @@ impl LibraryManager {
             peers: 0,
             contiguous_bytes: 0,
             total_bytes: item.size_bytes.unwrap_or(0) as u64,
-            keep: item.keep,
             is_local: false,
         })
     }
 
-    /// Remove a single torrent/file from the library. For a legacy item that
-    /// doubles as the movie itself (no TMDB metadata), the row is kept as an
-    /// empty movie placeholder so the movie is not lost from the library.
+    /// Remove a single torrent: deletes the library row and every file on
+    /// disk (engine output folder plus any legacy temp leftover).
     pub async fn remove_item(&self, id: i64) -> Result<()> {
         self.remove_item_inner(id, false).await
     }
 
-    /// Remove every row of a movie unconditionally (torrents, files and the
-    /// placeholder movie itself). Used by "delete movie".
+    /// Remove a movie from the library: deletes the movie's placeholder row,
+    /// every torrent attached to it (same tmdb_id) and all their files.
     pub async fn remove_movie(&self, id: i64) -> Result<()> {
         self.remove_item_inner(id, true).await
     }
@@ -494,28 +446,44 @@ impl LibraryManager {
             .get_item(id)?
             .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
 
-        let delete_files = !item.keep;
-        if let Err(e) = self.engine.remove_torrent(id, delete_files).await {
-            warn!("Failed to remove torrent {}: {}", id, e);
-        }
+        self.remove_files_of(id).await;
 
-        if !item.keep {
-            let temp_path = self.config.temp_dir.join(id.to_string());
-            if temp_path.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&temp_path) {
-                    warn!("Failed to remove temp dir {:?}: {}", temp_path, e);
+        if hard {
+            // Movie delete: cascade to every other row sharing the tmdb_id.
+            if let Some(tmdb_id) = item.tmdb_id {
+                let siblings: Vec<i64> = self
+                    .db
+                    .list_items()?
+                    .into_iter()
+                    .filter(|s| s.tmdb_id == Some(tmdb_id) && s.id != id)
+                    .map(|s| s.id)
+                    .collect();
+                for sibling in siblings {
+                    self.remove_files_of(sibling).await;
+                    self.db.delete_item(sibling)?;
                 }
             }
         }
 
-        if item.tmdb_id.is_none() && !hard {
-            self.db.reset_to_placeholder(id)?;
-            info!("Library item {} kept as movie placeholder", id);
-        } else {
-            self.db.delete_item(id)?;
-        }
+        self.db.delete_item(id)?;
         info!("Library item {} removed", id);
         Ok(())
+    }
+
+    /// Delete every file for an item on disk: whatever the torrent engine
+    /// has written plus any leftover in the library/temp dirs.
+    async fn remove_files_of(&self, id: i64) {
+        if let Err(e) = self.engine.remove_torrent(id, true).await {
+            warn!("Failed to remove torrent {}: {}", id, e);
+        }
+        for base in [&self.config.library_dir, &self.config.temp_dir] {
+            let dir = base.join(id.to_string());
+            if dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    warn!("Failed to remove dir {:?}: {}", dir, e);
+                }
+            }
+        }
     }
 
     pub async fn list_items(&self) -> Result<Vec<LibraryItem>> {

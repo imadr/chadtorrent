@@ -8,11 +8,12 @@ pub struct Config {
     #[arg(short, long, default_value_t = 3000)]
     pub port: u16,
 
-    /// Directory for permanent downloads (keep=true)
+    /// Directory for permanent downloads
     #[arg(short, long, default_value = "./library")]
     pub library_dir: PathBuf,
 
-    /// Directory for temporary downloads (keep=false)
+    /// Legacy location of old temporary downloads; only used to clean up
+    /// leftover files from before "keep files" was removed.
     #[arg(short, long, default_value = "./temp")]
     pub temp_dir: PathBuf,
 

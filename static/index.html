@@ -13,6 +13,7 @@
     --ok: #3ddc84;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   .floats { position: fixed; top: 14px; right: 18px; z-index: 40; display: flex; gap: 10px; }
@@ -58,6 +59,7 @@
   .rows { display: flex; flex-direction: column; gap: 8px; }
   .row { display: flex; align-items: center; gap: 12px; background: var(--panel);
          border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
+  #mv-torrents .row { min-height: 68px; }
   .row .nm { flex: 1; min-width: 0; }
   .row .nm .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .nm .s { color: var(--muted); font-size: 12px; }
@@ -65,13 +67,25 @@
   .row .nm .s .le { color: var(--danger); font-weight: 600; }
   .dl { display: block; margin-top: 8px; }
   .dl[hidden] { display: none; }
-  .dl .bar { height: 4px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
-  .dl .bar-in { height: 100%; width: 0%; background: var(--accent); }
+  .dl .bar { display: flex; height: 4px; background: var(--panel2); overflow: hidden; }
+  .dl .bar b { flex: 1; min-width: 1px; display: block; height: 100%; background: transparent; }
   .dl .txt { font-size: 12px; color: var(--muted); margin-top: 5px; }
   .chip { font-size: 11px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
   .chip.ready { color: var(--ok); border-color: var(--ok); }
   .chip.wait { color: #f0b429; border-color: #f0b429; }
   .row .btn { padding: 6px 12px; font-size: 13px; }
+  .row label.seq { display: inline-flex; align-items: center; gap: 5px; color: var(--muted);
+                   font-size: 12px; font-weight: 600; cursor: pointer; flex-shrink: 0;
+                   user-select: none; }
+  .row label.seq input { accent-color: var(--accent); cursor: pointer; }
+  .row .ibtn { width: 30px; height: 30px; padding: 0; flex-shrink: 0; display: inline-flex;
+              align-items: center; justify-content: center; background: var(--panel2);
+              border: 1px solid var(--line); border-radius: 8px; color: var(--text); }
+  .row .ibtn:hover { border-color: var(--accent); }
+  .row .ibtn.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; }
+  .row .ibtn.primary:hover { filter: brightness(1.1); }
+  .row .ibtn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  .row .ibtn svg { width: 15px; height: 15px; fill: currentColor; }
   .formline { display: flex; gap: 8px; margin-top: 12px; }
   input[type=text], input[type=url] { flex: 1; background: var(--panel); color: var(--text);
          border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font: inherit; outline: none; }
@@ -116,8 +130,9 @@
         flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
   .pb svg { width: 16px; height: 16px; fill: #fff; }
   .seek { flex: 1; height: 5px; min-width: 0; appearance: none; -webkit-appearance: none;
-          background: linear-gradient(to right, #fff var(--val, 0%), #555 0); cursor: pointer;
-          border: none; outline: none; }
+          background-color: rgba(255,255,255,.15); border-radius: 2px;
+          cursor: pointer; border: none; outline: none; }
+  .skwrap { flex: 1; display: flex; height: 5px; min-width: 0; }
   .seek::-webkit-slider-thumb, .seek::-moz-range-thumb {
           appearance: none; -webkit-appearance: none; height: 0; width: 0;
           background: transparent; border: none; cursor: pointer; }
@@ -130,10 +145,6 @@
         appearance: none; -webkit-appearance: none; height: 0; width: 0;
         background: transparent; border: none; cursor: pointer; }
 
-  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 80;
-           background: var(--panel2); border: 1px solid var(--accent); color: var(--text);
-           padding: 9px 16px; border-radius: 8px; font-size: 13px; transition: opacity .25s; opacity: 0; pointer-events: none; }
-  .toast.on { opacity: 1; }
   .spin { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 </style>
@@ -154,7 +165,6 @@
     <div class="mv-info">
       <h1 id="mv-title"></h1>
       <div class="sub" id="mv-sub"></div>
-      <label><input type="checkbox" id="mv-keep"> Keep files</label>
       <button class="btn danger" id="mv-del">Delete movie</button>
     </div>
   </div>
@@ -177,7 +187,7 @@
         <button class="pb" id="ppbtn" title="Play / Pause">
           <svg id="ppicon" viewBox="0 0 16 16"><polygon id="ppshape" points="3,1 13,8 3,15"/></svg>
         </button>
-        <input class="seek" id="seekbar" type="range" min="0" max="1000" value="0">
+        <div class="skwrap"><input class="seek" id="seekbar" type="range" min="0" max="1000" value="0"></div>
         <div class="sv">
           <svg id="vicon" viewBox="0 0 16 16"><polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/></svg>
           <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
@@ -209,26 +219,16 @@
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
-
 <script>
 const $ = (id) => document.getElementById(id);
 const v = $('player');
 const wrap = $('videowrap');
-let items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
+var items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
+var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
 
 const TMDB_IMG = 'https://image.tmdb.org/t/p';
 const POSTER_IDX = 'w342';
 const POSTER_MD = 'w500';
-
-let toastTimer = null;
-function toast(msg) {
-  const t = $('toast');
-  t.textContent = msg;
-  t.classList.add('on');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
-}
 
 /* ---------- api ---------- */
 async function api(path, opts = {}) {
@@ -289,13 +289,21 @@ function movieYear(it) {
 }
 function kindLabel(it) { return it.tmdb_id ? (it.media_type === 'tv' ? 'TV' : 'Movie') : ''; }
 
+function movieRep(rows) {
+  return rows.find(r => r.tmdb_id && !r.magnet) || rows.find(r => r.tmdb_id) || rows[0];
+}
+function infoHash(mag) {
+  const m = (mag || '').match(/btih:([0-9a-fA-F]{40})/);
+  return m ? m[1].toLowerCase() : null;
+}
+
 function renderGrid() {
   const grid = $('grid');
   grid.innerHTML = '';
   const g = groupItems(items);
   $('lib-count').textContent = g.size + (g.size === 1 ? ' title' : ' titles');
   for (const [k, rows] of g) {
-    const rep = rows.find(r => r.tmdb_id) || rows[0];
+    const rep = movieRep(rows);
     const card = document.createElement('div');
     card.className = 'card';
     const count = rows.filter(r => r.magnet).length;
@@ -312,22 +320,51 @@ function renderGrid() {
   }
 }
 
+function renderPieceBar(bar, have, total) {
+  if (!bar) return;
+  const n = Math.min(240, total || 1);
+  const per = Math.ceil((total || 1) / n) || 1;
+  let html = '';
+  for (let b = 0; b < n; b++) {
+    const start = b * per, end = Math.min(total, start + per);
+    let c = 0;
+    for (let i = start; i < end; i++) if (have[i]) c++;
+    const f = (end - start) ? c / (end - start) : 0;
+    html += '<b style="background:' + (f > 0 ? (f >= 1 ? '#3ddc84' : 'rgba(61,220,132,' + (0.15 + f * 0.8).toFixed(2) + ')') : 'transparent') + '"></b>';
+  }
+  bar.innerHTML = html;
+}
+
 async function refreshLibrary() {
   try {
-    items = await api('/api/library');
-    renderGrid();
-    if (currentMovie) {
-      currentMovie.rows = groupItems(items).get(currentMovie.key) || [];
-      if (!currentMovie.rows.length) {
-        currentMovie = null;
-        $('view-movie').hidden = true;
-        $('view-library').hidden = false;
-      } else {
-        renderMovie();
-      }
+    let srv = await api('/api/library');
+    for (const [pid, syn] of pendingRows) {
+      const isLive = srv.some(i => infoHash(i.magnet) === infoHash(syn.magnet));
+      if (!isLive) srv.push(syn);
     }
+    items = srv;
+    renderGrid();
+    syncMovie();
+    renderSearch();
   }
-  catch (e) { toast('Refresh failed'); }
+  catch (e) { console.error('refresh failed', e); }
+}
+
+function setView(isMovie) {
+  $('view-library').hidden = isMovie;
+  $('view-movie').hidden = !isMovie;
+  document.querySelector('.floats').hidden = isMovie;
+}
+
+function syncMovie() {
+  if (!currentMovie) return;
+  currentMovie.rows = groupItems(items).get(currentMovie.key) || [];
+  if (!currentMovie.rows.length) {
+    currentMovie = null;
+    setView(false);
+  } else {
+    renderMovie();
+  }
 }
 
 /* ---------- movie detail page ---------- */
@@ -336,119 +373,195 @@ function openMovie(k) {
   if (!rows.length) return;
   currentMovie = { key: k, rows };
   dlState = {};
-  $('view-library').hidden = true;
-  $('view-movie').hidden = false;
+  setView(true);
   $('mv-results').innerHTML = '';
   window.scrollTo(0, 0);
   renderMovie();
-  const rep = rows.find(r => r.tmdb_id) || rows[0];
+  const rep = movieRep(rows);
   if (rep.tmdb_id) findTorrents(rep);
+}
+
+const IC_PLAY = '<svg viewBox="0 0 16 16"><polygon points="3,1 13,8 3,15"/></svg>';
+const IC_PAUSE = '<svg viewBox="0 0 16 16"><rect x="3.2" y="1.5" width="3.8" height="13"/><rect x="9" y="1.5" width="3.8" height="13"/></svg>';
+const IC_BIN = '<svg viewBox="0 0 16 16"><path d="M6.4 1h3.2l.35 1.25h3.15v1.2h-12v-1.2h3.15L6.4 1Zm-3 5 1 9h7.2l1-9h-1.15l-.85 7.8H5.4L4.55 6H3.4Zm3.1.7v5.3h1.05V6.7H6.5Zm2.45 0v5.3H10V6.7H8.95Z"/></svg>';
+
+function icBtn(inner, cls, onclick) {
+  const b = document.createElement('button');
+  b.className = 'ibtn' + (cls ? ' ' + cls : '');
+  b.innerHTML = inner;
+  b.onclick = onclick;
+  b.title = cls || '';
+  return b;
 }
 
 function renderMovie() {
   const rows = currentMovie.rows;
-  const rep = rows.find(r => r.tmdb_id) || rows[0];
+  const rep = movieRep(rows);
   const poster = $('mv-poster');
   poster.innerHTML = rep.poster_path
     ? posterTag(posterURL(rep.poster_path, POSTER_MD))
     : placeholder('▷');
   $('mv-title').textContent = movieName(rep);
   $('mv-sub').textContent = [movieYear(rep), kindLabel(rep)].filter(Boolean).join(' · ') || ' ';
-  $('mv-keep').checked = rows.some(r => r.magnet && r.keep);
 
   const list = $('mv-torrents');
-  list.innerHTML = '';
   const torrentRs = rows.filter(r => r.magnet);
+  // Update rows in place so the same DOM node transitions between states
+  // (adding → downloading → ready) without a rebuild flash. Row boxes stay
+  // the same height; only the inside content changes.
+  const empty = list.querySelector('.empty');
   if (!torrentRs.length) {
-    list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
-  }
-  for (const t of torrentRs) {
-    const row = document.createElement('div');
-    row.className = 'row';
-    row.dataset.id = t.id;
-    row.dataset.state = t.state || '';
-    row.innerHTML =
-      '<div class="nm"><div class="t">' + esc(t.title || t.magnet) + '</div>' +
-      '<div class="dl" hidden><div class="bar"><div class="bar-in"></div></div>' +
-      '<div class="txt"></div></div></div>';
-    const isActive = t.state === 'downloading' || t.state === 'paused';
-    if (isActive && dlState[t.id]) {
-      const prev = dlState[t.id];
-      const dlE = row.querySelector('.dl');
-      dlE.hidden = false;
-      dlE.querySelector('.bar-in').style.width = prev.pct + '%';
-      dlE.querySelector('.txt').textContent = prev.text;
+    if (!empty) list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
+  } else {
+    if (empty) empty.remove();
+    const existing = {};
+    for (const el of list.querySelectorAll(':scope > .row')) existing[el.dataset.id] = el;
+    const keep = new Set();
+    for (const t of torrentRs) {
+      keep.add(String(t.id));
+      let el = existing[t.id];
+      if (!el) {
+        el = document.createElement('div');
+        el.dataset.id = t.id;
+        list.appendChild(el);
+      }
+      renderTorrentRow(el, t);
     }
-    const pb = document.createElement('button');
-    pb.className = 'btn primary'; pb.textContent = 'Play';
-    pb.onclick = () => playTorrent(t);
-    const pr = document.createElement('button');
-    if (t.state === 'downloading') {
-      pr.className = 'btn'; pr.textContent = 'Pause';
-      pr.onclick = async () => {
-        pr.disabled = true;
-        try { await api('/api/library/' + t.id + '/pause', { method: 'POST' }); toast('Paused'); }
-        catch (e) { toast('Failed'); pr.disabled = false; }
-        refreshLibrary();
-      };
-      row.appendChild(pr);
-    } else if (t.state === 'paused') {
-      pr.className = 'btn primary'; pr.textContent = 'Resume';
-      pr.onclick = async () => {
-        pr.disabled = true;
-        try { await api('/api/library/' + t.id + '/resume', { method: 'POST' }); toast('Resuming'); }
-        catch (e) { toast('Failed'); pr.disabled = false; }
-        refreshLibrary();
-      };
-      row.appendChild(pr);
-    }
-    const del = document.createElement('button');
-    del.className = 'btn danger'; del.textContent = 'Delete';
-    del.onclick = () => delItem(t);
-    row.appendChild(pb); row.appendChild(del);
-    list.appendChild(row);
+    for (const id in existing) if (!keep.has(id)) existing[id].remove();
   }
 
   const sec = $('mv-searchsec');
   sec.hidden = !rep.tmdb_id;
 }
 
+function renderTorrentRow(el, t) {
+  el.className = 'row';
+  el.dataset.state = t.state || '';
+  const isDown = t.state === 'downloading';
+  const isPaused = t.state === 'paused';
+  el.innerHTML =
+    '<div class="nm"><div class="t">' + esc(t.title || t.magnet) + '</div>' +
+    '<div class="dl"><div class="bar"></div><div class="txt"></div></div></div>';
+  const bar = el.querySelector('.bar');
+  const txt = el.querySelector('.txt');
+  const done = t.state === 'ready';
+  bar.style.display = done ? 'none' : '';
+  if (isDown && dlState[t.id]) {
+    renderPieceBar(bar, dlState[t.id].have, dlState[t.id].total);
+    txt.textContent = dlState[t.id].text;
+  } else if (isDown) {
+    txt.textContent = 'Starting…';
+  } else if (t.state === '_pending' || t.state === 'connecting') {
+    txt.textContent = 'Adding…';
+  } else if (done) {
+    txt.textContent = 'Ready';
+  } else if (isPaused) {
+    if (dlState[t.id]) {
+      renderPieceBar(bar, dlState[t.id].have, dlState[t.id].total);
+    }
+    txt.textContent = 'Paused';
+  } else if (t.state === 'error') {
+    txt.textContent = 'Failed';
+  } else {
+    txt.textContent = 'Stopped';
+  }
+  const pb = document.createElement('button');
+  pb.className = 'btn primary'; pb.textContent = 'Play';
+  pb.disabled = t.state === '_pending' || t.state === 'connecting' || t.state === 'error';
+  pb.onclick = () => playTorrent(t);
+  el.appendChild(pb);
+  if (isDown) {
+    const pr = document.createElement('button');
+    pr.className = 'ibtn'; pr.innerHTML = IC_PAUSE;
+    pr.onclick = async () => {
+      pr.disabled = true;
+      try { await api('/api/library/' + t.id + '/pause', { method: 'POST' }); }
+      catch (e) { console.error('pause failed', e); }
+      refreshLibrary();
+    };
+    el.appendChild(pr);
+  } else if (isPaused) {
+    const pr = document.createElement('button');
+    pr.className = 'ibtn primary'; pr.innerHTML = IC_PLAY;
+    pr.onclick = async () => {
+      pr.disabled = true;
+      try { await api('/api/library/' + t.id + '/resume', { method: 'POST' }); }
+      catch (e) { console.error('resume failed', e); }
+      refreshLibrary();
+    };
+    el.appendChild(pr);
+  }
+  const del = document.createElement('button');
+  del.className = 'ibtn danger'; del.innerHTML = IC_BIN;
+  del.onclick = () => delItem(t);
+  el.appendChild(del);
+  if (t.state !== '_pending' && t.state !== 'connecting') {
+    const seq = document.createElement('label');
+    seq.className = 'seq'; seq.title = 'Download pieces in order';
+    const box = document.createElement('input');
+    box.type = 'checkbox'; box.checked = t.sequential !== false;
+    seq.appendChild(box);
+    seq.appendChild(document.createTextNode('SEQ'));
+    box.onchange = async () => {
+      box.disabled = true;
+      try {
+        await api('/api/library/' + t.id + '/sequential', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sequential: box.checked }),
+        });
+      } catch (e) { console.error('set sequential failed', e); box.checked = !box.checked; }
+      box.disabled = false;
+    };
+    el.appendChild(seq);
+  }
+}
+
 async function delItem(t) {
-  if (!(await confirmBox('Remove this file from the library?\nThe movie will stay.'))) return;
-  try { await api('/api/library/' + t.id, { method: 'DELETE' }); toast('Removed'); }
-  catch (e) { toast('Delete failed'); }
+  if (t.state === '_pending') {
+    // Cancelling an optimistic add: drop it locally, no server call.
+    const syn = pendingRows.get(t.id);
+    if (syn && syn.abort) syn.abort();
+    pendingRows.delete(t.id);
+    items = items.filter(i => i.id !== t.id);
+    syncMovie();
+    renderSearch();
+    return;
+  }
+  if (!(await confirmBox('Remove this torrent and delete all of its files?'))) return;
+  try { await api('/api/library/' + t.id, { method: 'DELETE' }); }
+  catch (e) { console.error('delete failed', e); }
   refreshLibrary();
 }
 
-$('mv-keep').addEventListener('change', async () => {
-  const val = $('mv-keep').checked;
-  for (const t of currentMovie.rows) {
-    if (t.magnet) {
-      try { await api('/api/library/' + t.id, { method: 'PATCH', body: JSON.stringify({ keep: val }) }); t.keep = val; }
-      catch (e) { toast('Failed'); }
-    }
-  }
-  toast(val ? 'Keeping files' : 'Files are temporary');
-  refreshLibrary();
-});
-
 $('mv-del').addEventListener('click', async () => {
-  if (!(await confirmBox('Delete this movie and all of its files from the library?'))) return;
-  for (const t of currentMovie.rows) {
-    try { await api('/api/library/' + t.id + '?hard=1', { method: 'DELETE' }); }
-    catch (e) { toast('Delete failed'); }
+  if (!(await confirmBox('Delete this movie and all of its contents from the library?'))) return;
+  const rep = movieRep(currentMovie.rows);
+  if (rep) {
+    // Cancel any in-flight optimistic adds for this movie first.
+    const dropPids = [], dead = [];
+    for (const [pid, syn] of pendingRows) {
+      if (rep.tmdb_id && syn.tmdb_id && syn.tmdb_id === rep.tmdb_id) {
+        dropPids.push(pid);
+        if (syn.abort) syn.abort();
+        dead.push(pid);
+      }
+    }
+    for (const pid of dropPids) pendingRows.delete(pid);
+    items = items.filter(i => !dead.includes(i.id));
+    try { await api('/api/library/' + rep.id + '?hard=1', { method: 'DELETE' }); }
+    catch (e) { console.error('movie delete failed', e); }
+    renderSearch();
   }
   if (currentId !== null) stopPlayback();
   currentMovie = null;
-  $('view-movie').hidden = true;
-  $('view-library').hidden = false;
+  setView(false);
   refreshLibrary();
 });
 
 $('btn-back').addEventListener('click', () => {
   currentMovie = null;
-  $('view-movie').hidden = true;
-  $('view-library').hidden = false;
+  setView(false);
 });
 
 async function findTorrents(rep) {
@@ -456,36 +569,81 @@ async function findTorrents(rep) {
   box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
   try {
     const res = await api('/api/torrents?q=' + encodeURIComponent(rep.title || ''));
-    box.innerHTML = '';
-    if (!res.length) { box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>'; return; }
-    for (const t of res) {
-      const row = document.createElement('div');
-      row.className = 'row';
-      const sz = t.size_bytes ? fmtBytes(t.size_bytes) : '';
-      const se = '<span class="se">' + (t.seeders || 0) + '</span> seeders / <span class="le">' + (t.leechers || 0) + '</span> leechers';
-      row.innerHTML = '<div class="nm"><div class="t">' + esc(t.name) + '</div>' +
-        '<div class="s">' + sz + (sz ? ' · ' : '') + se + '</div></div>';
-      const add = document.createElement('button');
-      add.className = 'btn primary'; add.textContent = 'Add';
-      add.onclick = async () => {
-        add.disabled = true;
-        try {
-          await api('/api/library', { method: 'POST', body: JSON.stringify({
-            magnet: t.magnet, keep: false, title: rep.title || null, year: rep.year || null,
-            poster_path: rep.poster_path || null, tmdb_id: rep.tmdb_id || null,
-            media_type: rep.media_type || null
-          })});
-          add.textContent = '✓ Added';
-          toast('Torrent added');
-          refreshLibrary();
-        } catch (e) { toast('Failed'); add.disabled = false; }
-      };
-      row.appendChild(add);
-      box.appendChild(row);
-    }
+    searchResults = res;
+    curRep = rep;
+    renderSearch();
   } catch (e) {
+    searchResults = [];
     box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
   }
+}
+
+function renderSearch() {
+  const box = $('mv-results');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!searchResults.length) {
+    box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>';
+    return;
+  }
+  const addedHashes = new Set(items.filter(i => i.magnet).map(i => infoHash(i.magnet)).filter(Boolean));
+  for (const t of searchResults) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const sz = t.size_bytes ? fmtBytes(t.size_bytes) : '';
+    const se = '<span class="se">' + (t.seeders || 0) + '</span> seeders / <span class="le">' + (t.leechers || 0) + '</span> leechers';
+    row.innerHTML =
+      '<div class="nm"><div class="t">' + esc(t.name) + '</div>' +
+      '<div class="s">' + sz + (sz ? ' · ' : '') + se + '</div></div>';
+    const add = document.createElement('button');
+    const h = infoHash(t.magnet);
+    const isAdded = addedHashes.has(h);
+    const pending = searchPending.has(h);
+    add.className = 'btn' + (isAdded || pending ? '' : ' primary');
+    add.disabled = isAdded || pending;
+    add.textContent = isAdded ? '✓ Added' : (pending ? 'Adding…' : 'Add');
+    if (!isAdded && !pending) add.onclick = () => addTorrentFromSearch(t);
+    row.appendChild(add);
+    box.appendChild(row);
+  }
+}
+
+async function addTorrentFromSearch(t) {
+  const h = infoHash(t.magnet);
+  if (!h || searchPending.has(h)) return;
+  const pid = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const rep = curRep || {};
+  const ctl = new AbortController();
+  const syn = {
+    id: pid, magnet: t.magnet, title: t.name, state: '_pending',
+    tmdb_id: rep.tmdb_id || null, media_type: rep.media_type || null,
+    poster_path: rep.poster_path || null, year: rep.year || null,
+    size_bytes: t.size_bytes || 0, abort: ctl
+  };
+  searchPending.set(h, pid);
+  pendingRows.set(pid, syn);
+  items.push(syn);
+  renderSearch();
+  syncMovie();
+  try {
+    await api('/api/library', {
+      method: 'POST',
+      signal: ctl.signal,
+      body: JSON.stringify({
+        magnet: t.magnet,
+        year: rep.year || null, poster_path: rep.poster_path || null,
+        tmdb_id: rep.tmdb_id || null, media_type: rep.media_type || null
+      })
+    });
+  } catch (e) {
+    if (e.name !== 'AbortError') console.error('add failed', e);
+    pendingRows.delete(pid);
+    items = items.filter(i => i.id !== pid);
+  } finally {
+    searchPending.delete(h);
+    pendingRows.delete(pid);
+  }
+  refreshLibrary();
 }
 
 /* ---------- add modal (TMDB search) ---------- */
@@ -529,11 +687,9 @@ async function doSearch(q) {
             title: r.title, year: r.year, poster_path: r.poster_path,
             tmdb_id: r.id, media_type: r.media_type
           })});
-          add.textContent = '✓ Added';
-          toast('Added to library');
           closeAdd();
           refreshLibrary();
-        } catch (e) { toast('Failed'); add.disabled = false; }
+        } catch (e) { console.error('add movie failed', e); add.disabled = false; }
       };
       row.appendChild(add);
       box.appendChild(row);
@@ -551,11 +707,14 @@ function playTorrent(item) {
   $('ctrl').style.display = 'block';
   v.src = '/stream/' + item.id;
   v.load();
+  updSk();
   v.play().catch(() => {});
 }
 
 function stopPlayback() {
   currentId = null;
+  lastSkKey = null;
+  $('seekbar').style.backgroundImage = '';
   v.pause();
   v.removeAttribute('src');
   v.load();
@@ -578,6 +737,49 @@ function updSeek() {
   const pct = (v.currentTime / v.duration) * 100;
   el.value = Math.round(pct * 10);
   el.style.setProperty('--val', pct.toFixed(2) + '%');
+  updSk();
+}
+
+function seekSegGradient(have, total) {
+  const n = Math.min(240, total || 1);
+  const per = Math.ceil((total || 1) / n) || 1;
+  const stops = [];
+  for (let i = 0; i < n; i++) {
+    let c = 0;
+    for (let j = 0; j < per && i * per + j < total; j++) if (have[i * per + j]) c++;
+    const a = Math.max(0, ((i * per) / total) * 100);
+    const b = Math.min(100, ((i * per + Math.min(per, total - i * per)) / total) * 100);
+    if (c > 0) {
+      const f = c / per;
+      const col = 'rgba(255,255,255,' + (0.22 + 0.28 * f).toFixed(2) + ')';
+      stops.push(col + ' ' + a.toFixed(2) + '%', col + ' ' + b.toFixed(2) + '%');
+    } else {
+      stops.push('transparent ' + a.toFixed(2) + '%', 'transparent ' + b.toFixed(2) + '%');
+    }
+  }
+  return 'linear-gradient(to right, ' + stops.join(', ') + ')';
+}
+
+let lastSkKey = null;
+function updSk() {
+  const el = $('seekbar');
+  const it = currentId != null ? items.find(i => i.id === currentId) : null;
+  let have = null, total = 0, rdy = false;
+  if (it && it.state === 'ready') { rdy = true; }
+  else if (it && dlState[currentId] && dlState[currentId].total) {
+    have = dlState[currentId].have;
+    total = dlState[currentId].total;
+  }
+  const key = currentId + ':' + (rdy ? 'ready' : (have ? total + ':' + have.join('') : 'none'));
+  if (key === lastSkKey) return;
+  lastSkKey = key;
+  let avail;
+  if (rdy) avail = 'linear-gradient(to right, rgba(255,255,255,.35) 0%, rgba(255,255,255,.35) 100%)';
+  else if (have) avail = seekSegGradient(have, total);
+  else avail = null;
+  el.style.backgroundImage =
+    'linear-gradient(to right, rgba(255,255,255,.85) 0, rgba(255,255,255,.85) var(--val), transparent var(--val))' +
+    (avail ? ', ' + avail : '');
 }
 v.addEventListener('timeupdate', updSeek);
 v.addEventListener('loadedmetadata', updSeek);
@@ -589,6 +791,7 @@ $('seekbar').addEventListener('touchend',    () => { seeking = false; });
 $('seekbar').addEventListener('input', () => {
   const pct = $('seekbar').value / 10;
   $('seekbar').style.setProperty('--val', pct + '%');
+  updSk();
   if (v.duration) v.currentTime = (pct / 100) * v.duration;
 });
 
@@ -690,15 +893,23 @@ async function pollDownloads() {
           refreshLibrary();
           continue;
         }
-        const pct = Math.max(0, Math.min(100, s.progress_pct || 0));
+        const p = await api('/api/library/' + row.dataset.id + '/pieces');
+        let have = [], total = 0, overall = null;
+        if (p && p.total) {
+          have = p.have; total = p.total;
+          let got = 0;
+          for (const b of have) if (b) got++;
+          overall = (got / total) * 100;
+        }
+        const pct = overall !== null ? overall : Math.max(0, Math.min(100, s.progress_pct || 0));
         const speed = s.download_speed_bps || 0;
         const remain = (s.total_bytes || 0) - (s.contiguous_bytes || 0);
         const eta = speed > 0 ? remain / speed : null;
         const text = Math.round(pct) + '% · ' + fmtSpeed(speed) + (eta !== null ? ' · ETA ' + fmtEta(eta) : '');
-        dlState[row.dataset.id] = { pct, text };
+        dlState[row.dataset.id] = { pct, text, have, total };
         const dl = row.querySelector('.dl');
         dl.hidden = false;
-        dl.querySelector('.bar-in').style.width = pct + '%';
+        renderPieceBar(dl.querySelector('.bar'), have, total);
         dl.querySelector('.txt').textContent = text;
       } catch (e) { /* torrent may be gone; keep row as-is */ }
     }

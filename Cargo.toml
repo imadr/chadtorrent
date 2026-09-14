@@ -17,6 +17,10 @@ clap = { version = "4", features = ["derive", "env"] }
 librqbit = "9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Local fork of librqbit: piece download order is shuffled (non-sequential).
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
