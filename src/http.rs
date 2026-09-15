@@ -516,9 +516,10 @@ impl tokio::io::AsyncRead for RemuxTask {
     }
 }
 
-/// Stream from librqbit's FileStream, which blocks (returns Pending) until
-/// the piece at the read position is downloaded. librqbit handles the piece
-/// prioritization and waiting; the client handles disconnects if stalled.
+/// Stream from librqbit's FileStream. If the piece at the requested start
+/// offset is not yet downloaded, returns 503 immediately so the client can
+/// show a buffering indicator and retry — instead of blocking the connection
+/// forever (which freezes the browser).
 async fn serve_from_torrent_stream(
     handle: Arc<librqbit::ManagedTorrent>,
     file_id: usize,
@@ -526,6 +527,24 @@ async fn serve_from_torrent_stream(
     range_header: Option<&str>,
 ) -> Result<Response> {
     let (start, end) = parse_range(range_header, file_size);
+
+    // Quick check: is the first byte of the requested range available?
+    // If not, return 503 immediately so the client can show "buffering"
+    // and retry — never block the HTTP connection.
+    match handle.is_file_byte_ready(file_id, start) {
+        Ok(false) => {
+            return Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(header::RETRY_AFTER, "2")
+                .body(Body::from("buffering"))
+                .unwrap());
+        }
+        Err(e) => {
+            tracing::warn!("is_file_byte_ready check failed: {e}");
+        }
+        _ => {}
+    }
+
     let content_length = end - start + 1;
     let content_range = format!("bytes {start}-{end}/{file_size}");
 

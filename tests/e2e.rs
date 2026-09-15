@@ -31,7 +31,7 @@ fn config_for(tmp: &Path) -> Config {
 }
 
 async fn setup_app(tmp: &Path) -> Arc<LibraryManager> {
-    Arc::new(LibraryManager::new(config_for(&tmp.join("app"))).await.unwrap())
+    LibraryManager::new(config_for(&tmp.join("app"))).await.unwrap()
 }
 
 async fn start_http(
@@ -90,41 +90,42 @@ async fn http_error_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconcile_marks_preexisting_completed_download_ready() {
+async fn startup_does_not_heuristically_mark_download_ready() {
     let tmp = TempDir::new().unwrap();
 
-    // Simulate state from an older version: fully downloaded temp files on
-    // disk, but the DB never recorded file_path or ready.
+    // Pre-create a partial download on disk. The file is written to the
+    // correct library path and has the right size_bytes so an older version
+    // would have wrongly inferred completion.
     let db = chadtorrent::db::Database::new(tmp.path().join("test.db").to_str().unwrap()).unwrap();
-    let temp_dir = tmp.path().join("temp");
+    let library_dir = tmp.path().join("app").join("library");
+    let temp_dir = tmp.path().join("app").join("temp");
     let id = db
         .insert_item("magnet:?xt=urn:btih:abc123")
         .unwrap();
-    let contents = make_pattern(1_000_000);
-    let out = temp_dir.join(id.to_string());
+    let full_contents = make_pattern(2_000_000);
+    let partial_contents = make_pattern(200_000); // 10% of the file
+    // Place the file under library_dir/{id} (where register_torrent writes).
+    let out = library_dir.join(id.to_string());
     std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("movie.mp4"), &contents).unwrap();
-    db.update_title(id, "Old Download").unwrap();
-    db.update_size(id, contents.len() as i64).unwrap();
+    std::fs::write(out.join("movie.mp4"), &partial_contents).unwrap();
+    db.update_title(id, "Partial Download").unwrap();
+    db.update_size(id, full_contents.len() as i64).unwrap();
     db.update_state(id, "downloading").unwrap();
+    // Also stash a temp file so the old code path that checked temp_dir
+    // wouldn't accidentally mark it ready.
+    let temp_out = temp_dir.join(id.to_string());
+    std::fs::create_dir_all(&temp_out).unwrap();
+    std::fs::write(temp_out.join("movie.mp4"), &partial_contents).unwrap();
     drop(db);
 
     let config = config_for(tmp.path());
-    let library = Arc::new(LibraryManager::new(config).await.unwrap());
+    let library = LibraryManager::new(config).await.unwrap();
 
     let item = library.db.get_item(id).unwrap().unwrap();
-    assert_eq!(item.state, "ready", "startup reconciliation should mark it ready");
-    assert!(item.file_path.is_some());
-
-    let status = library.get_status(id).await.unwrap();
-    assert!(status.is_local);
-    assert_eq!(status.total_bytes, contents.len() as u64);
-
-    // Deleting a reconciled temp item hard (movie delete) still cleans up its
-    // files and removes the row.
-    library.remove_movie(id).await.unwrap();
-    assert!(!out.exists(), "reconciled temp files should be removed on delete");
-    assert!(library.db.get_item(id).unwrap().is_none());
+    // The new code never infers completion from on-disk sizes — only the
+    // torrent engine marks a download ready once every piece is verified.
+    assert_ne!(item.state, "ready", "startup must not infer completion from file sizes");
+    assert_eq!(item.state, "downloading");
 
     library.stop().await;
 }
@@ -133,7 +134,7 @@ async fn reconcile_marks_preexisting_completed_download_ready() {
 async fn standalone_torrent_delete_removes_row() {
     let tmp = TempDir::new().unwrap();
     let config = config_for(tmp.path());
-    let library = Arc::new(LibraryManager::new(config).await.unwrap());
+    let library = LibraryManager::new(config).await.unwrap();
 
     let id = library
         .db
@@ -151,7 +152,7 @@ async fn standalone_torrent_delete_removes_row() {
 async fn torrent_delete_removes_files_completely() {
     let tmp = TempDir::new().unwrap();
     let config = config_for(tmp.path());
-    let library = Arc::new(LibraryManager::new(config.clone()).await.unwrap());
+    let library = LibraryManager::new(config.clone()).await.unwrap();
 
     let id = library
         .db
@@ -182,7 +183,7 @@ async fn torrent_delete_removes_files_completely() {
 async fn movie_delete_cascades_to_attached_torrents() {
     let tmp = TempDir::new().unwrap();
     let config = config_for(tmp.path());
-    let library = Arc::new(LibraryManager::new(config.clone()).await.unwrap());
+    let library = LibraryManager::new(config.clone()).await.unwrap();
 
     let place = library
         .db

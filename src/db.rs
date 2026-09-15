@@ -18,6 +18,8 @@ pub struct LibraryItem {
     pub tmdb_id: Option<i64>,
     pub media_type: Option<String>,
     pub sequential: bool,
+    #[serde(skip)]
+    pub torrent_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -34,6 +36,25 @@ pub struct TorrentStatus {
 
 pub struct Database {
     conn: Mutex<Connection>,
+}
+
+fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
+    Ok(LibraryItem {
+        id: row.get(0)?,
+        magnet: row.get(1)?,
+        title: row.get(2)?,
+        state: row.get(3)?,
+        added_at: row.get(4)?,
+        file_path: row.get(5)?,
+        size_bytes: row.get(6)?,
+        rqbit_id: row.get(7)?,
+        poster_path: row.get(8)?,
+        year: row.get(9)?,
+        tmdb_id: row.get(10)?,
+        media_type: row.get(11)?,
+        sequential: row.get(12)?,
+        torrent_bytes: row.get(13)?,
+    })
 }
 
 impl Database {
@@ -57,7 +78,12 @@ impl Database {
                 year INTEGER,
                 tmdb_id INTEGER,
                 media_type TEXT,
-                sequential INTEGER NOT NULL DEFAULT 1
+                sequential INTEGER NOT NULL DEFAULT 1,
+                torrent_bytes BLOB
+            );
+            CREATE TABLE IF NOT EXISTS pieces (
+                info_hash TEXT PRIMARY KEY,
+                haves BLOB NOT NULL
             );",
         )?;
         // Migrate: drop the obsolete "keep" column if a pre-removal database
@@ -77,6 +103,7 @@ impl Database {
             "ALTER TABLE library ADD COLUMN tmdb_id INTEGER",
             "ALTER TABLE library ADD COLUMN media_type TEXT",
             "ALTER TABLE library ADD COLUMN sequential INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE library ADD COLUMN torrent_bytes BLOB",
         ] {
             let _ = conn.execute_batch(stmt);
         }
@@ -115,26 +142,10 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes
              FROM library WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(LibraryItem {
-                id: row.get(0)?,
-                magnet: row.get(1)?,
-                title: row.get(2)?,
-                state: row.get(3)?,
-                added_at: row.get(4)?,
-                file_path: row.get(5)?,
-                size_bytes: row.get(6)?,
-                rqbit_id: row.get(7)?,
-                poster_path: row.get(8)?,
-                year: row.get(9)?,
-                tmdb_id: row.get(10)?,
-                media_type: row.get(11)?,
-                sequential: row.get(12)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], item_from_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -145,26 +156,10 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes
              FROM library ORDER BY added_at DESC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(LibraryItem {
-                id: row.get(0)?,
-                magnet: row.get(1)?,
-                title: row.get(2)?,
-                state: row.get(3)?,
-                added_at: row.get(4)?,
-                file_path: row.get(5)?,
-                size_bytes: row.get(6)?,
-                rqbit_id: row.get(7)?,
-                poster_path: row.get(8)?,
-                year: row.get(9)?,
-                tmdb_id: row.get(10)?,
-                media_type: row.get(11)?,
-                sequential: row.get(12)?,
-            })
-        })?;
+        let rows = stmt.query_map([], item_from_row)?;
         let mut items = Vec::new();
         for row in rows {
             items.push(row?);
@@ -230,26 +225,10 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes
              FROM library WHERE rqbit_id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![rqbit_id], |row| {
-            Ok(LibraryItem {
-                id: row.get(0)?,
-                magnet: row.get(1)?,
-                title: row.get(2)?,
-                state: row.get(3)?,
-                added_at: row.get(4)?,
-                file_path: row.get(5)?,
-                size_bytes: row.get(6)?,
-                rqbit_id: row.get(7)?,
-                poster_path: row.get(8)?,
-                year: row.get(9)?,
-                tmdb_id: row.get(10)?,
-                media_type: row.get(11)?,
-                sequential: row.get(12)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![rqbit_id], item_from_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -284,6 +263,46 @@ impl Database {
             "UPDATE library SET sequential = ?2 WHERE id = ?1",
             params![id, sequential],
         )?;
+        Ok(())
+    }
+
+    /// Persist the resolved .torrent file bytes so a torrent can be re-added
+    /// without re-resolving its magnet over the network.
+    pub fn update_torrent_bytes(&self, id: i64, torrent_bytes: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE library SET torrent_bytes = ?2 WHERE id = ?1",
+            params![id, torrent_bytes],
+        )?;
+        Ok(())
+    }
+
+    /// Save the downloaded-pieces bitfield for an info hash.
+    pub fn save_pieces(&self, info_hash: &str, haves: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pieces (info_hash, haves) VALUES (?1, ?2)
+             ON CONFLICT(info_hash) DO UPDATE SET haves = excluded.haves",
+            params![info_hash, haves],
+        )?;
+        Ok(())
+    }
+
+    /// Load the saved downloaded-pieces bitfield for an info hash.
+    pub fn get_pieces(&self, info_hash: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT haves FROM pieces WHERE info_hash = ?1")?;
+        let mut rows = stmt.query_map(params![info_hash], |row| row.get(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop the saved bitfield for an info hash (torrent removed).
+    pub fn delete_pieces(&self, info_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM pieces WHERE info_hash = ?1", params![info_hash])?;
         Ok(())
     }
 }
@@ -409,6 +428,33 @@ mod tests {
         assert!(!db.get_item(id).unwrap().unwrap().sequential);
         db.set_sequential(id, true).unwrap();
         assert!(db.get_item(id).unwrap().unwrap().sequential);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_pieces_roundtrip() {
+        let (db, dir) = temp_db();
+        let hash = "abcd1234";
+        assert!(db.get_pieces(hash).unwrap().is_none());
+        db.save_pieces(hash, &[0x01, 0x02, 0x03]).unwrap();
+        assert_eq!(db.get_pieces(hash).unwrap().unwrap(), vec![0x01, 0x02, 0x03]);
+        db.save_pieces(hash, &[0x04]).unwrap();
+        assert_eq!(db.get_pieces(hash).unwrap().unwrap(), vec![0x04]);
+        db.delete_pieces(hash).unwrap();
+        assert!(db.get_pieces(hash).unwrap().is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_update_torrent_bytes() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:tb").unwrap();
+        assert!(db.get_item(id).unwrap().unwrap().torrent_bytes.is_none());
+        db.update_torrent_bytes(id, &[9, 8, 7]).unwrap();
+        assert_eq!(
+            db.get_item(id).unwrap().unwrap().torrent_bytes.unwrap(),
+            vec![9, 8, 7]
+        );
         cleanup(&dir);
     }
 

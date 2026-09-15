@@ -3,13 +3,67 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use librqbit::{
-    AddTorrent, AddTorrentOptions, Api, DhtSessionConfig, ManagedTorrent, Session,
-    SessionOptions, TorrentMetadata, TorrentStats,
+    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, BitV, BitVFactory,
+    DhtSessionConfig, ManagedTorrent, Session, SessionOptions, TorrentMetadata, TorrentStats, BF,
 };
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::db::Database;
 use crate::error::{Error, Result};
+
+/// librqbit piece-state store backed by SQLite. `load`/`store_initial_check`
+/// are called by the engine during torrent initialization; the haves bitfield
+/// survives restarts so downloads resume without re-checking every piece.
+pub struct SqliteBitVFactory {
+    db: Arc<Database>,
+}
+
+fn info_hash_of(id: TorrentIdOrHash) -> Option<String> {
+    match id {
+        TorrentIdOrHash::Hash(h) => Some(h.as_string()),
+        TorrentIdOrHash::Id(_) => None,
+    }
+}
+
+#[async_trait::async_trait]
+impl BitVFactory for SqliteBitVFactory {
+    async fn load(&self, id: TorrentIdOrHash) -> anyhow::Result<Option<Box<dyn BitV>>> {
+        let Some(hash) = info_hash_of(id) else {
+            return Ok(None);
+        };
+        match self.db.get_pieces(&hash) {
+            Ok(Some(bytes)) => {
+                let bf = BF::from_boxed_slice(bytes.into_boxed_slice());
+                Ok(Some(Box::new(bf)))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("sqlite error loading pieces: {e}")),
+        }
+    }
+
+    async fn clear(&self, id: TorrentIdOrHash) -> anyhow::Result<()> {
+        let Some(hash) = info_hash_of(id) else {
+            return Ok(());
+        };
+        self.db
+            .delete_pieces(&hash)
+            .map_err(|e| anyhow::anyhow!("sqlite error clearing pieces: {e}"))
+    }
+
+    async fn store_initial_check(
+        &self,
+        id: TorrentIdOrHash,
+        b: BF,
+    ) -> anyhow::Result<Box<dyn BitV>> {
+        if let Some(hash) = info_hash_of(id) {
+            self.db
+                .save_pieces(&hash, b.as_raw_slice())
+                .map_err(|e| anyhow::anyhow!("sqlite error saving pieces: {e}"))?;
+        }
+        Ok(Box::new(b))
+    }
+}
 
 #[derive(Clone)]
 pub struct TorrentEngine {
@@ -18,7 +72,7 @@ pub struct TorrentEngine {
 }
 
 impl TorrentEngine {
-    pub async fn new(download_dir: PathBuf) -> Result<Self> {
+    pub async fn new(download_dir: PathBuf, db: Arc<Database>) -> Result<Self> {
         std::fs::create_dir_all(&download_dir)?;
         let opts = SessionOptions {
             // Keep DHT enabled for peer discovery but disable on-disk
@@ -31,6 +85,9 @@ impl TorrentEngine {
             // No session-level persistence / fastresume in v1.
             persistence: None,
             fastresume: false,
+            // Piece progress lives in sqlite (see SqliteBitVFactory) instead
+            // of librqbit's own fastresume files.
+            bitv_factory: Some(Arc::new(SqliteBitVFactory { db })),
             ..Default::default()
         };
         let session = Session::new_with_opts(download_dir, opts)
@@ -65,6 +122,36 @@ impl TorrentEngine {
             .await
             .map_err(|e| Error::Torrent(e.to_string()))?;
 
+        self.attach_torrent(library_id, response).await
+    }
+
+    /// Add a torrent from its cached .torrent file bytes (no magnet
+    /// resolution needed). Used to resume across restarts.
+    pub async fn add_torrent_bytes_with_opts(
+        &self,
+        library_id: i64,
+        torrent_bytes: bytes::Bytes,
+        output_dir: &Path,
+        mut opts: AddTorrentOptions,
+    ) -> Result<Arc<ManagedTorrent>> {
+        opts.output_folder = Some(output_dir.to_string_lossy().to_string());
+        opts.overwrite = true;
+
+        let response = self
+            .session
+            .clone()
+            .add_torrent(AddTorrent::TorrentFileBytes(torrent_bytes), Some(opts))
+            .await
+            .map_err(|e| Error::Torrent(e.to_string()))?;
+
+        self.attach_torrent(library_id, response).await
+    }
+
+    async fn attach_torrent(
+        &self,
+        library_id: i64,
+        response: AddTorrentResponse,
+    ) -> Result<Arc<ManagedTorrent>> {
         let handle = response
             .into_handle()
             .ok_or_else(|| Error::Torrent("torrent was not added".into()))?;
@@ -72,8 +159,8 @@ impl TorrentEngine {
         let id = handle.id();
         let name = handle.name().unwrap_or_else(|| "Unknown".to_string());
         info!(
-            "Torrent added: name={}, id={}, output={:?}",
-            name, id, output_dir
+            "Torrent added: name={}, id={}, library_id={}",
+            name, id, library_id
         );
 
         self.torrents
@@ -171,6 +258,32 @@ impl TorrentEngine {
             *slot = raw[i / 8] & (1 << (7 - (i % 8))) != 0;
         }
         Ok(Some((bits, total)))
+    }
+
+    /// The raw downloaded-pieces bitfield bytes for a torrent, keyed by its
+    /// info hash. Used to persist progress to sqlite.
+    pub async fn piece_raw(&self, library_id: i64) -> Option<(String, Vec<u8>)> {
+        let handle = self.get_torrent(library_id).await?;
+        let api = Api::new(self.session.clone(), None);
+        let (bf, _total) = api.api_dump_haves(handle.id().into()).ok()?;
+        Some((handle.info_hash().as_string(), bf.as_raw_slice().to_vec()))
+    }
+
+    /// Cached .torrent file bytes so a torrent can be re-added offline.
+    pub async fn torrent_bytes(&self, library_id: i64) -> Option<bytes::Bytes> {
+        let handle = self.get_torrent(library_id).await?;
+        handle.with_metadata(|m| m.torrent_bytes.clone()).ok()
+    }
+
+    /// Library ids of every torrent currently registered with the engine.
+    pub async fn active_ids(&self) -> Vec<i64> {
+        self.torrents.read().await.keys().copied().collect()
+    }
+
+    /// The info hash of a registered torrent (hex) if we have one.
+    pub async fn info_hash_of(&self, library_id: i64) -> Option<String> {
+        let handle = self.get_torrent(library_id).await?;
+        Some(handle.info_hash().as_string())
     }
 
     pub async fn find_largest_video_file(

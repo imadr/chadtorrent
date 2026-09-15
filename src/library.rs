@@ -67,66 +67,72 @@ pub struct StatusUpdate {
 }
 
 impl LibraryManager {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(config: Config) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.library_dir)?;
         std::fs::create_dir_all(&config.temp_dir)?;
 
         let db = Arc::new(Database::new(&config.db_path.to_string_lossy())?);
         let download_base = config.temp_dir.join("rqbit");
-        let engine = Arc::new(TorrentEngine::new(download_base).await?);
+        let engine = Arc::new(TorrentEngine::new(download_base, db.clone()).await?);
         let (status_tx, _) = broadcast::channel(256);
 
-        let manager = Self {
+        let manager = Arc::new(Self {
             db,
             engine,
             config,
             status_tx,
-        };
-        manager.reconcile_completed().await?;
+        });
+        manager.resume_existing_torrents().await?;
 
         Ok(manager)
     }
 
-    /// On startup, mark fully-downloaded items as ready even though the
-    /// torrent engine has no handle for them anymore (engine state is not
-    /// persisted across restarts). A download is considered complete when a
-    /// video file on disk matches the recorded size of the largest video.
-    async fn reconcile_completed(&self) -> Result<()> {
+    /// On startup, re-attach every in-progress library item to the torrent
+    /// engine (piece progress, cached .torrent bytes and paused/downloading
+    /// state all come from sqlite). There is deliberately no completion
+    /// heuristic: nothing here marks an item "ready" by inspecting file sizes.
+    async fn resume_existing_torrents(self: &Arc<Self>) -> Result<()> {
         for item in self.db.list_items()? {
-            if item.state == "ready" {
+            if item.magnet.is_empty() || matches!(item.state.as_str(), "ready" | "error") {
                 continue;
             }
-            let dir = match item.file_path.as_ref() {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    let lib = self.config.library_dir.join(item.id.to_string());
-                    if lib.exists() {
-                        lib
-                    } else {
-                        self.config.temp_dir.join(item.id.to_string())
-                    }
-                }
-            };
-            if !dir.exists() {
-                continue;
-            }
-            let Some(expected) = item.size_bytes.filter(|s| *s > 0) else {
-                continue;
-            };
-            let complete = find_largest_video_in(&dir)
-                .and_then(|p| p.metadata().ok().map(|m| m.len() as i64 == expected))
-                .unwrap_or(false);
-            if complete {
-                if item.file_path.is_none() {
-                    let _ = self
-                        .db
-                        .update_file_path(item.id, &dir.to_string_lossy());
-                }
-                self.db.update_state(item.id, "ready")?;
-                info!("Reconciled item {} as ready at {:?}", item.id, dir);
-            }
+            let output_dir = self.config.library_dir.join(item.id.to_string());
+            let _ = std::fs::create_dir_all(&output_dir);
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.register_torrent(item.id, output_dir, None).await;
+            });
         }
         Ok(())
+    }
+
+    /// Persist the downloaded-pieces bitfield for a torrent to sqlite.
+    async fn store_pieces(&self, id: i64) {
+        if let Some((hash, raw)) = self.engine.piece_raw(id).await {
+            if let Err(e) = self.db.save_pieces(&hash, &raw) {
+                warn!("Failed to save pieces for {}: {}", id, e);
+            }
+        }
+    }
+
+    pub async fn flush_all_pieces(&self) {
+        for id in self.engine.active_ids().await {
+            self.store_pieces(id).await;
+        }
+    }
+
+    /// Periodically flush piece progress so it survives a crash, not just a
+    /// clean shutdown.
+    pub fn spawn_piece_flusher(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                me.flush_all_pieces().await;
+            }
+        });
     }
 
     /// Record that a torrent finished downloading: store its on-disk location
@@ -197,9 +203,8 @@ impl LibraryManager {
         }
 
         let me = self.clone();
-        let magnet = magnet.to_string();
         tokio::spawn(async move {
-            me.register_torrent(library_id, magnet, output_dir, initial_peers)
+            me.register_torrent(library_id, output_dir, initial_peers)
                 .await;
         });
 
@@ -210,21 +215,44 @@ impl LibraryManager {
     async fn register_torrent(
         self: &Arc<Self>,
         library_id: i64,
-        magnet: String,
         output_dir: PathBuf,
         initial_peers: Option<Vec<SocketAddr>>,
     ) {
-        let mut opts = librqbit::AddTorrentOptions {
-            initial_peers: initial_peers.clone(),
+        let Ok(Some(item)) = self.db.get_item(library_id) else {
+            return;
+        };
+        if item.magnet.is_empty() {
+            return;
+        }
+        // A paused item must stay paused across restarts; everything else
+        // resumes downloading.
+        let resume_paused = item.state == "paused";
+        let opts = librqbit::AddTorrentOptions {
+            initial_peers,
+            paused: resume_paused,
+            sequential: Some(item.sequential),
             ..Default::default()
         };
-        if let Ok(Some(item)) = self.db.get_item(library_id) {
-            opts.sequential = Some(item.sequential);
-        }
-        let handle = self
-            .engine
-            .add_torrent_with_opts(library_id, &magnet, &output_dir, opts)
-            .await;
+
+        // Prefer the cached .torrent bytes (no network needed), fall back to
+        // the magnet for items that never resolved.
+        let handle = match item.torrent_bytes.as_ref().filter(|b| !b.is_empty()) {
+            Some(bytes) => {
+                self.engine
+                    .add_torrent_bytes_with_opts(
+                        library_id,
+                        bytes::Bytes::from(bytes.clone()),
+                        &output_dir,
+                        opts,
+                    )
+                    .await
+            }
+            None => {
+                self.engine
+                    .add_torrent_with_opts(library_id, &item.magnet, &output_dir, opts)
+                    .await
+            }
+        };
 
         let handle = match handle {
             Ok(h) => h,
@@ -239,7 +267,19 @@ impl LibraryManager {
         if let Err(e) = self.db.update_title(library_id, &name) {
             warn!("Failed to set title for {}: {}", library_id, e);
         }
-        if let Err(e) = self.db.update_state(library_id, "downloading") {
+
+        // Keep the resolved .torrent bytes so the next restart can re-attach
+        // this torrent without re-resolving its magnet over the network.
+        if let Some(tb) = self.engine.torrent_bytes(library_id).await {
+            if let Err(e) = self.db.update_torrent_bytes(library_id, &tb) {
+                warn!("Failed to store torrent bytes for {}: {}", library_id, e);
+            }
+        }
+
+        if let Err(e) = self
+            .db
+            .update_state(library_id, if resume_paused { "paused" } else { "downloading" })
+        {
             warn!("Failed to set state for {}: {}", library_id, e);
         }
 
@@ -266,6 +306,7 @@ impl LibraryManager {
 
     pub async fn pause_item(&self, id: i64) -> Result<()> {
         self.engine.pause_torrent(id).await?;
+        self.store_pieces(id).await;
         self.db.update_state(id, "paused")?;
         Ok(())
     }
@@ -446,6 +487,14 @@ impl LibraryManager {
             .get_item(id)?
             .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
 
+        // Drop persisted piece progress before the engine torrent handle is
+        // removed (at which point we no longer know its info hash).
+        if let Some(hash) = self.engine.info_hash_of(id).await {
+            if let Err(e) = self.db.delete_pieces(&hash) {
+                warn!("Failed to drop pieces for {}: {}", id, e);
+            }
+        }
+
         self.remove_files_of(id).await;
 
         if hard {
@@ -492,6 +541,7 @@ impl LibraryManager {
 
     pub async fn stop(&self) {
         info!("Stopping library manager...");
+        self.flush_all_pieces().await;
         self.engine.stop().await;
         info!("Library manager stopped");
     }

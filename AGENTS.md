@@ -4,12 +4,6 @@
 
 Single-binary self-hosted torrent streamer: paste a magnet link (or search via indexer) → torrent downloads to `library_dir/{id}` → streams to browser via HTTP range requests. Built on vendored librqbit (local DHT-only, no trackers/DHT persistence; our SQLite is the source of truth).
 
-## TODO management
-
-- Open work is tracked in `TODO.md` at the repo root. Read it when starting; every agent must conform to it.
-- When tasks are requested, add them to `TODO.md` with the format `<number> - <priority> - <description>` (numbering incremental starting at 1; order can be resorted, but nothing is dropped).
-- Mark/remove items as they are completed, and renumber as needed.
-
 ## Build / test commands
 
 ```

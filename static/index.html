@@ -60,6 +60,7 @@
   .row { display: flex; align-items: center; gap: 12px; background: var(--panel);
          border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
   #mv-torrents .row { min-height: 68px; }
+  .row:hover { background: var(--panel2); border-color: var(--accent); }
   .row .nm { flex: 1; min-width: 0; }
   .row .nm .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .nm .s { color: var(--muted); font-size: 12px; }
@@ -119,12 +120,18 @@
   #player-modal[hidden] { display: none; }
   .pwrap { position: relative; width: 100vw; height: 100vh; background: #000; }
   #player { display: block; width: 100vw; height: 100vh; background: #000; pointer-events: none; object-fit: contain; }
+  .buf { position: absolute; left: 0; right: 0; top: 0; bottom: 48px; z-index: 5; display: flex; flex-direction: column; gap: 12px;
+         align-items: center; justify-content: center; background: rgba(0,0,0,.45); pointer-events: none; }
+  .buf .spin { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2);
+               border-top-color: #fff; animation: spin .8s linear infinite; }
+  .buf span { color: #fff; font-size: 14px; letter-spacing: .4px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .pback { position: absolute; top: 10px; left: 10px; z-index: 6; background: rgba(0,0,0,.6);
            border: 1px solid rgba(255,255,255,.25); color: #fff; border-radius: 8px; padding: 6px 14px; font-size: 14px;
            opacity: 0; pointer-events: none; transition: opacity .15s ease; }
   .pback.on { opacity: 1; pointer-events: auto; }
   .pback.on:hover { border-color: #fff; }
-  .ctrl { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 14px 10px; display: none; }
+  .ctrl { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 14px 10px; display: none; z-index: 7; }
   .strip { display: flex; align-items: center; gap: 10px; }
   .pb { cursor: pointer; padding: 0; width: 32px; height: 32px; background: none; border: none;
         flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
@@ -181,6 +188,7 @@
 <div class="modal" id="player-modal" hidden>
   <div class="pwrap" id="videowrap">
     <video id="player"></video>
+    <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span></div>
     <button class="pback" id="pback" title="Back">← Back</button>
     <div class="ctrl" id="ctrl">
       <div class="strip">
@@ -225,6 +233,8 @@ const v = $('player');
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
+var pendingSeek = null;
+var seekGen = 0;
 
 const TMDB_IMG = 'https://image.tmdb.org/t/p';
 const POSTER_IDX = 'w342';
@@ -333,6 +343,46 @@ function renderPieceBar(bar, have, total) {
     html += '<b style="background:' + (f > 0 ? (f >= 1 ? '#3ddc84' : 'rgba(61,220,132,' + (0.15 + f * 0.8).toFixed(2) + ')') : 'transparent') + '"></b>';
   }
   bar.innerHTML = html;
+}
+
+function piecesToPct(p) {
+  let have = [], total = 0, overall = null;
+  if (p && p.total) {
+    have = p.have; total = p.total;
+    let got = 0;
+    for (const b of have) if (b) got++;
+    overall = (got / total) * 100;
+  }
+  return { have, total, pct: overall };
+}
+
+function applyDlRow(row, id, p, s) {
+  const st = row.dataset.state;
+  const { have, total, pct: opct } = piecesToPct(p);
+  const pct = opct !== null ? opct : Math.max(0, Math.min(100, s.progress_pct || 0));
+  const dl = row.querySelector('.dl');
+  dl.hidden = false;
+  renderPieceBar(dl.querySelector('.bar'), have, total);
+  let text;
+  if (st === 'paused') {
+    text = 'Paused · ' + Math.round(pct) + '%';
+  } else {
+    const speed = s.download_speed_bps || 0;
+    const remain = (s.total_bytes || 0) - (s.contiguous_bytes || 0);
+    const eta = speed > 0 ? remain / speed : null;
+    text = Math.round(pct) + '% · ' + fmtSpeed(speed) + (eta !== null ? ' · ETA ' + fmtEta(eta) : '');
+  }
+  dlState[id] = { pct, text, have, total };
+  dl.querySelector('.txt').textContent = text;
+}
+
+async function warmDl(id) {
+  try {
+    const s = await api('/api/library/' + id + '/status');
+    const p = await api('/api/library/' + id + '/pieces');
+    const row = document.querySelector('#mv-torrents .row[data-id="' + id + '"]');
+    if (row && row.dataset.state === 'paused') applyDlRow(row, id, p, s);
+  } catch (e) { /* torrent may be gone; keep row as-is */ }
 }
 
 async function refreshLibrary() {
@@ -458,18 +508,23 @@ function renderTorrentRow(el, t) {
   } else if (isPaused) {
     if (dlState[t.id]) {
       renderPieceBar(bar, dlState[t.id].have, dlState[t.id].total);
+      txt.textContent = dlState[t.id].text;
+    } else {
+      txt.textContent = 'Paused';
+      warmDl(t.id);
     }
-    txt.textContent = 'Paused';
   } else if (t.state === 'error') {
     txt.textContent = 'Failed';
   } else {
     txt.textContent = 'Stopped';
   }
-  const pb = document.createElement('button');
-  pb.className = 'btn primary'; pb.textContent = 'Play';
-  pb.disabled = t.state === '_pending' || t.state === 'connecting' || t.state === 'error';
-  pb.onclick = () => playTorrent(t);
-  el.appendChild(pb);
+  const canPlay = t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error';
+  el.style.cursor = canPlay ? 'pointer' : 'default';
+  el.onclick = (e) => {
+    if (!canPlay) return;
+    if (e.target.closest('button, label, input, a')) return;
+    playTorrent(t);
+  };
   if (isDown) {
     const pr = document.createElement('button');
     pr.className = 'ibtn'; pr.innerHTML = IC_PAUSE;
@@ -714,6 +769,8 @@ function playTorrent(item) {
 function stopPlayback() {
   currentId = null;
   lastSkKey = null;
+  pendingSeek = null;
+  hideBuf();
   $('seekbar').style.backgroundImage = '';
   v.pause();
   v.removeAttribute('src');
@@ -733,7 +790,7 @@ $('ppbtn').addEventListener('click', () => { v.paused ? v.play().catch(()=>{}) :
 
 function updSeek() {
   const el = $('seekbar');
-  if (seeking || !v.duration) return;
+  if (seeking || pendingSeek !== null || !v.duration) return;
   const pct = (v.currentTime / v.duration) * 100;
   el.value = Math.round(pct * 10);
   el.style.setProperty('--val', pct.toFixed(2) + '%');
@@ -792,8 +849,94 @@ $('seekbar').addEventListener('input', () => {
   const pct = $('seekbar').value / 10;
   $('seekbar').style.setProperty('--val', pct + '%');
   updSk();
-  if (v.duration) v.currentTime = (pct / 100) * v.duration;
+  if (!v.duration) return;
+  trySeek((pct / 100) * v.duration);
 });
+
+/* ---------- seek gating ----------
+ * Never let the <video> element issue a request for an undownloaded piece:
+ * any HTTP error status (416, 503, …) permanently kills the media source in
+ * Firefox. So before actually seeking, ask the server with a tiny 1-byte Range
+ * probe. If the piece exists the server answers 206 and we jump there; if it
+ * does not exist yet the server answers 503 immediately and we just show a
+ * buffering icon and retry — no error, no freeze, nothing else.
+ */
+function showBuf(txt) {
+  const b = $('buf');
+  b.querySelector('span').textContent = txt || 'Buffering…';
+  b.hidden = false;
+}
+function hideBuf() { $('buf').hidden = true; }
+
+async function pieceIsReady(time, dur, size) {
+  const byte = Math.min(Math.max(0, Math.floor((time / dur) * size)), size - 1);
+  try {
+    const r = await fetch('/stream/' + currentId, {
+      headers: { Range: 'bytes=' + byte + '-' + byte },
+    });
+    const body = r.body;
+    if (body) { try { await body.getReader().cancel(); } catch (e) {} }
+    // Only a missing piece returns 503 (buffering). Everything else (206 from
+    // the torrent stream, 200/206 from disk or the remux pipe) means the seek
+    // is safe — the browser's own request won't hit an error status.
+    return r.status !== 503;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function trySeek(t) {
+  const gen = ++seekGen;
+  const it = items.find(i => i.id === currentId);
+  if (!it || !v.duration || !isFinite(v.duration)) return;
+  t = Math.min(Math.max(t, 0), v.duration - 0.05);
+  const size = it.size_bytes;
+  if (it.state === 'ready' || !size) {
+    pendingSeek = null;
+    hideBuf();
+    v.currentTime = t;
+    return;
+  }
+  if (await pieceIsReady(t, v.duration, size)) {
+    if (gen !== seekGen) return; // stale probe, a newer seek won
+    pendingSeek = null;
+    hideBuf();
+    v.currentTime = t;
+  } else {
+    if (gen !== seekGen) return; // stale probe, a newer seek won
+    pendingSeek = t;
+    showBuf('Buffering…');
+    if (!v.paused) v.pause(); // freeze at current playhead; thumb stays at target
+  }
+}
+
+async function retryPendingSeek() {
+  if (pendingSeek === null) return;
+  const it = items.find(i => i.id === currentId);
+  if (!it || !v.duration) return;
+  const size = it.size_bytes;
+  if (it.state === 'ready' || !size) { trySeek(pendingSeek); return; }
+  const gen = ++seekGen;
+  if (await pieceIsReady(pendingSeek, v.duration, size)) {
+    if (gen !== seekGen) return;
+    const t = pendingSeek;
+    pendingSeek = null;
+    v.currentTime = t;
+    hideBuf();
+    v.play().catch(() => {});
+  }
+}
+
+v.addEventListener('seeking', () => {
+  if (pendingSeek === null) hideBuf();
+});
+v.addEventListener('playing', () => { if (pendingSeek === null) hideBuf(); });
+v.addEventListener('seeked', () => { pendingSeek = null; hideBuf(); });
+// Native stall: the browser buffered into a piece that's still downloading,
+// so the server body hangs. Show the buffering overlay until data flows.
+v.addEventListener('waiting', () => { showBuf('Buffering…'); });
+v.addEventListener('stalled', () => { showBuf('Buffering…'); });
+v.addEventListener('canplay', () => { if (pendingSeek === null) hideBuf(); });
 
 function updVol() {
   const vol = Math.round((v.volume || 0) * 100);
@@ -885,32 +1028,17 @@ async function pollDownloads() {
   pollBusy = 1;
   try {
     for (const row of document.querySelectorAll('#mv-torrents .row[data-id]')) {
-      if (row.dataset.state !== 'downloading') continue;
+      const st = row.dataset.state;
+      if (st !== 'downloading' && st !== 'paused') continue;
       try {
         const s = await api('/api/library/' + row.dataset.id + '/status');
-        if (s.state && s.state !== 'downloading') {
+        if (s.state && s.state !== st) {
           row.dataset.state = s.state;
           refreshLibrary();
           continue;
         }
         const p = await api('/api/library/' + row.dataset.id + '/pieces');
-        let have = [], total = 0, overall = null;
-        if (p && p.total) {
-          have = p.have; total = p.total;
-          let got = 0;
-          for (const b of have) if (b) got++;
-          overall = (got / total) * 100;
-        }
-        const pct = overall !== null ? overall : Math.max(0, Math.min(100, s.progress_pct || 0));
-        const speed = s.download_speed_bps || 0;
-        const remain = (s.total_bytes || 0) - (s.contiguous_bytes || 0);
-        const eta = speed > 0 ? remain / speed : null;
-        const text = Math.round(pct) + '% · ' + fmtSpeed(speed) + (eta !== null ? ' · ETA ' + fmtEta(eta) : '');
-        dlState[row.dataset.id] = { pct, text, have, total };
-        const dl = row.querySelector('.dl');
-        dl.hidden = false;
-        renderPieceBar(dl.querySelector('.bar'), have, total);
-        dl.querySelector('.txt').textContent = text;
+        applyDlRow(row, row.dataset.id, p, s);
       } catch (e) { /* torrent may be gone; keep row as-is */ }
     }
   } finally { pollBusy = 0; }
@@ -920,6 +1048,7 @@ updVol();
 refreshLibrary();
 setInterval(pollDownloads, 1000);
 setInterval(refreshLibrary, 3000);
+setInterval(retryPendingSeek, 1000);
 </script>
 </body>
 </html>

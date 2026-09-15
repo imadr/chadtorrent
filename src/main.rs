@@ -60,12 +60,13 @@ async fn main() {
     );
 
     let library = match LibraryManager::new(config.clone()).await {
-        Ok(l) => Arc::new(l),
+        Ok(l) => l,
         Err(e) => {
             error!("Failed to initialize: {e}");
             std::process::exit(1);
         }
     };
+    library.spawn_piece_flusher();
 
     let tmdb = config
         .tmdb_api_key
