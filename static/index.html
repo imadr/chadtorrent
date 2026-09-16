@@ -329,7 +329,7 @@
 const $ = (id) => document.getElementById(id);
 const v = $('player');
 const wrap = $('videowrap');
-var items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
+var items = [], currentId = null, seeking = false, currentMovie = null, pollBusy = 0, dlState = {};
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
 var mseAbort = null, mseBlobUrl = null, mseSourceBuffer = null, mseGen = 0, mseMime = null, fullDur = 0, mseOff = 0, mseBitrate = 0;
 var libSel = -1, mvSelIdx = -1;
@@ -719,15 +719,19 @@ $('btn-back').addEventListener('click', () => {
   setView(false);
 });
 
+let findSeq = 0;
 async function findTorrents(rep) {
+  const seq = ++findSeq;
   const box = $('mv-results');
   box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
   try {
     const res = await api('/api/torrents?q=' + encodeURIComponent(rep.title || ''));
+    if (seq !== findSeq) return;   // a newer search started — discard stale results
     searchResults = res;
     curRep = rep;
     renderSearch();
   } catch (e) {
+    if (seq !== findSeq) return;
     searchResults = [];
     box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
   }
@@ -736,6 +740,13 @@ async function findTorrents(rep) {
 function renderSearch() {
   const box = $('mv-results');
   if (!box) return;
+  // Stale-response guard: `searchResults`/`curRep` are globals shared across
+  // movies. Only render when the search belongs to the movie currently open
+  // (otherwise refreshLibrary ticks + background fetches would dump the
+  // previous movie's torrent links into this one's "Find torrents" box, and
+  // clicking one would attach it to the wrong movie).
+  const rep = currentMovie ? movieRep(currentMovie.rows) : null;
+  if (!curRep || !rep || curRep.tmdb_id !== rep.tmdb_id) return;
   box.innerHTML = '';
   if (!searchResults.length) {
     box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>';
@@ -841,12 +852,15 @@ $('am-search').addEventListener('input', () => {
   searchTimer = setTimeout(() => doSearch(q), 300);
 });
 
+let amSeq = 0;
 async function doSearch(q) {
+  const seq = ++amSeq;
   const box = $('am-results');
   amSel = -1;
   box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
   try {
     const res = await api('/api/search?q=' + encodeURIComponent(q));
+    if (seq !== amSeq || $('add-modal').hidden) return;   // superseded or closed
     box.innerHTML = '';
     if (!res.length) { box.innerHTML = '<div class="empty" style="padding:10px 0">No results.</div>'; return; }
     for (const r of res) {
@@ -876,7 +890,8 @@ async function doSearch(q) {
       box.appendChild(row);
     }
   } catch (e) {
-    box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
+    if (seq === amSeq && !$('add-modal').hidden)
+      box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
   }
 }
 
@@ -1303,11 +1318,26 @@ const DEFAULT_KEYBIND = [
   { id: 'lib-next',    ctx: KCTX_LIBRARY,code: 'ArrowRight', label: 'Next movie',             fn: selNext },
   { id: 'lib-prev',    ctx: KCTX_LIBRARY,code: 'ArrowLeft',  label: 'Previous movie',         fn: selPrev },
   { id: 'lib-open',    ctx: KCTX_LIBRARY,code: 'Enter',      label: 'Open movie',             fn: selOpen },
+  { id: 'lib-settings',ctx: KCTX_LIBRARY,code: 'Escape',     label: 'Open settings',           fn: openSettings },
+  { id: 'lib-add',    ctx: KCTX_LIBRARY,code: 'Space',      label: 'Add movie',               fn: openAdd },
   { id: 'modal-close', ctx: KCTX_MODAL,  code: 'Escape',     label: 'Close',                  fn: closeModal },
 ];
 
 const KCTX_NAMES = { player: 'Player', modal: 'Modal', movie: 'Movie', library: 'Library' };
 const KB_STORE = 'chadtorrent.keybinds';
+const KB_DEL_STORE = 'chadtorrent.keybinds.deleted';
+
+function delKbIds() {
+  try { return new Set(JSON.parse(localStorage.getItem(KB_DEL_STORE) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function tombKb(id) {
+  const s = delKbIds(); s.add(id);
+  try { localStorage.setItem(KB_DEL_STORE, JSON.stringify([...s])); } catch (e) {}
+}
+function untombAllKb() {
+  try { localStorage.removeItem(KB_DEL_STORE); } catch (e) {}
+}
 
 const CODE_PRETTY = { Space: 'Space', Enter: 'Enter', Escape: 'Esc', Tab: 'Tab',
   Backspace: 'Backspace', ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓' };
@@ -1350,11 +1380,19 @@ function decodeKeybinds(saved) {
   return out;
 }
 function loadKeybinds() {
+  let saved = null;
   try {
     const raw = localStorage.getItem(KB_STORE);
-    if (raw) return decodeKeybinds(JSON.parse(raw));
+    if (raw) saved = JSON.parse(raw);
   } catch (e) {}
-  return defaultKeybinds();
+  if (!Array.isArray(saved)) return defaultKeybinds();
+  const out = decodeKeybinds(saved);
+  const have = new Set(out.map(b => b.id));
+  const gone = delKbIds();
+  for (const d of defaultKeybinds()) {
+    if (!have.has(d.id) && !gone.has(d.id)) out.push({ id: d.id, ctx: d.ctx, code: d.code, mods: [], label: d.label, fn: d.fn });
+  }
+  return out;
 }
 let KEYBIND = loadKeybinds();
 function saveKeybinds() {
@@ -1599,6 +1637,7 @@ function renderKbSettings() {
     del.onclick = () => {
       stopKbRec(true);
       KEYBIND = KEYBIND.filter(x => x !== b);
+      tombKb(b.id);
       saveKeybinds();
       renderKbSettings();
     };
@@ -1639,6 +1678,7 @@ document.querySelectorAll('.kb-table th[data-sort]').forEach(th =>
 $('kb-restore').addEventListener('click', () => {
   stopKbRec(true);
   KEYBIND = defaultKeybinds();
+  untombAllKb();
   saveKeybinds();
   renderKbSettings();
 });
