@@ -28,9 +28,7 @@
   .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
   main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; }
   main[hidden] { display: none; }
-  .toolbar { display: flex; align-items: baseline; gap: 12px; margin-bottom: 18px; }
-  .toolbar h2 { margin: 0; font-size: 20px; }
-  .toolbar span { color: var(--muted); font-size: 13px; }
+  #view-library { max-width: none; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px; }
   .card { position: relative; background: var(--panel); border: 1px solid var(--line);
           border-radius: 10px; overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s; }
@@ -96,7 +94,7 @@
   input[type=text], input[type=url] { flex: 1; background: var(--panel); color: var(--text);
          border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font: inherit; outline: none; }
   input:focus { border-color: var(--accent); }
-  #am-search { width: 100%; display: block; }
+  #am-search { width: 100%; display: block; flex: none; }
   label.k { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; white-space: nowrap; }
   .panel.confirm { max-width: 380px; }
   .cf-msg { color: var(--text); margin: 0 0 20px; line-height: 1.5; white-space: pre-line; }
@@ -113,6 +111,7 @@
   .x:hover { color: var(--text); }
   .srow { display: flex; gap: 12px; padding: 10px; border-radius: 10px; align-items: center; }
   .srow:hover { background: var(--panel2); }
+  .srow.sel { background: var(--panel2); box-shadow: inset 0 0 0 1px var(--accent); }
   .srow .poster { width: 46px; height: 69px; aspect-ratio: 2/3; border-radius: 6px; flex-shrink: 0; }
   .srow .poster img, .srow .poster .ph { width: 100%; height: 100%; object-fit: cover; }
   .srow .poster .ph { display: flex; align-items: center; justify-content: center; font-size: 16px; }
@@ -121,24 +120,43 @@
   .srow .info .s { color: var(--muted); font-size: 12px; }
   .divider { border-top: 1px solid var(--line); margin: 16px 0; }
 
-  .kb-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px; }
-  .kb-ctxhead { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted);
-                margin: 12px 0 4px; }
-  .kb-ctxhead:first-child { margin-top: 0; }
-  .kb-row { display: flex; align-items: center; gap: 12px; }
+  .sec-title { font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted);
+               margin: 0 0 4px; }
+  .kb-table { width: 100%; border-collapse: collapse; margin: 4px 0 12px; }
+  .kb-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+                 color: var(--muted); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  .kb-table th.sort { cursor: pointer; user-select: none; }
+  .kb-table th.sort:hover { color: var(--text); }
+  .kb-table th[data-dir="asc"]::after { content: ' ▲'; font-size: 9px; }
+  .kb-table th[data-dir="desc"]::after { content: ' ▼'; font-size: 9px; }
+  .kb-table td { padding: 5px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  .kb-table tbody tr:hover { background: var(--panel2); }
   .kb-key { width: 150px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px;
             background: var(--panel2); color: var(--text); font: inherit; font-size: 13px;
             text-align: center; outline: none; cursor: pointer; flex-shrink: 0; }
   .kb-key:hover { border-color: var(--accent); }
   .kb-key.rec { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: rgba(91,140,255,.12); }
-  .kb-ctx { width: 90px; flex-shrink: 0; color: var(--muted); font-size: 12px;
-            text-transform: uppercase; letter-spacing: .5px; }
-  .kb-label { flex: 1; font-size: 14px; min-width: 0; }
-  .kb-new { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
-  .kb-new select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-                   border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; }
-  .kb-status { color: var(--ok); font-size: 13px; min-height: 18px; margin-bottom: 6px; }
-  .kb-status.err { color: var(--danger); }
+  .kb-ctx { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+  .kb-label { font-size: 14px; min-width: 0; }
+  .kb-table select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+                     border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; }
+  .kb-table th:last-child, .kb-table td.kb-del { width: 40px; }
+  .kb-table td.kb-del { text-align: right; }
+  .kb-table .ibtn { width: 26px; height: 26px; padding: 0; display: inline-flex; align-items: center;
+                    justify-content: center; background: transparent; border: 1px solid var(--line);
+                    border-radius: 6px; color: var(--muted); }
+  .kb-table .ibtn:hover { color: var(--danger); border-color: var(--danger); }
+  .kb-table .ibtn svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2; fill: none;
+                        stroke-linecap: round; stroke-linejoin: round; }
+  .kb-actions { display: flex; justify-content: flex-start; gap: 10px; margin-top: 2px; }
+  /* Settings + Add-to-library panels: fixed height; header bar (title / close /
+   * search input) stays put, only the main area scrolls. */
+  #settings-modal .panel, #add-modal .panel {
+    height: min(88vh, 760px); display: flex; flex-direction: column; overflow: hidden;
+  }
+  #settings-modal .panel { width: 720px; }
+  .modal-body { flex: 1; min-height: 0; overflow-y: auto; padding-right: 10px; }
+  .am-body { flex: 1; min-height: 0; overflow-y: auto; margin-top: 10px; }
 
   #player-modal { padding: 0; background: #000; }
   #player-modal[hidden] { display: none; }
@@ -190,7 +208,6 @@
 </div>
 
 <main id="view-library">
-  <div class="toolbar"><h2>Library</h2><span id="lib-count"></span></div>
   <div id="grid" class="grid"></div>
 </main>
 
@@ -242,7 +259,7 @@
   <div class="panel">
     <div class="phead"><span>Add to library</span><button class="x" id="am-close">✕</button></div>
     <input type="text" id="am-search" placeholder="Search movies &amp; shows…">
-    <div id="am-results" style="margin-top:10px"></div>
+    <div id="am-results" class="am-body"></div>
   </div>
 </div>
 
@@ -260,10 +277,35 @@
 <div class="modal" id="settings-modal" hidden>
   <div class="panel">
     <div class="phead"><span>Settings</span><button class="x" id="st-close">✕</button></div>
-    <div class="kb-status" id="kb-status"></div>
-    <div id="kb-list" class="kb-list"></div>
-    <div class="cf-actions">
-      <button class="btn" id="kb-restore">Restore defaults</button>
+    <div class="modal-body">
+      <h3 class="sec-title">Keybindings</h3>
+      <table class="kb-table" id="kb-table">
+      <thead>
+        <tr>
+          <th class="sort" data-sort="key">Key</th>
+          <th class="sort" data-sort="ctx">Context</th>
+          <th class="sort" data-sort="action">Action</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="kb-tbody"></tbody>
+      <tfoot>
+        <tr>
+          <td><input class="kb-key" id="nb-key" value="+ new key" readonly
+                     title="Click, then press the new keys and hit Enter"></td>
+          <td><select id="nb-ctx">
+            <option value="player">Player</option>
+            <option value="movie">Movie</option>
+            <option value="library">Library</option>
+            <option value="modal">Modal</option>
+          </select></td>
+          <td><select id="nb-action"></select></td>
+        </tr>
+      </tfoot>
+    </table>
+      <div class="kb-actions">
+        <button class="btn" id="kb-restore">Restore defaults</button>
+      </div>
     </div>
   </div>
 </div>
@@ -367,7 +409,6 @@ function renderGrid() {
   const grid = $('grid');
   grid.innerHTML = '';
   const g = groupItems(items);
-  $('lib-count').textContent = g.size + (g.size === 1 ? ' title' : ' titles');
   for (const [k, rows] of g) {
     const rep = movieRep(rows);
     const card = document.createElement('div');
@@ -763,21 +804,46 @@ async function addTorrentFromSearch(t) {
 
 /* ---------- add modal (TMDB search) ---------- */
 let searchTimer = null;
-function openAdd() { $('add-modal').hidden = false; $('am-search').focus(); }
-function closeAdd() { $('add-modal').hidden = true; $('am-results').innerHTML = ''; $('am-search').value = ''; }
+function openAdd() { $('add-modal').hidden = false; amSel = -1; $('am-search').focus(); }
+function closeAdd() { $('add-modal').hidden = true; amSel = -1; $('am-results').innerHTML = ''; $('am-search').value = ''; }
 $('btn-add').addEventListener('click', openAdd);
 $('am-close').addEventListener('click', closeAdd);
 $('add-modal').addEventListener('click', (e) => { if (e.target === $('add-modal')) closeAdd(); });
 
+let amSel = -1;
+const amRows = () => [...$('am-results').querySelectorAll('.srow')];
+function amSet(rows, i) {
+  rows.forEach((r, j) => r.classList.toggle('sel', j === i));
+  if (i >= 0 && rows[i]) rows[i].scrollIntoView({ block: 'nearest' });
+  amSel = i;
+}
+$('am-search').addEventListener('keydown', (e) => {
+  const rows = amRows();
+  if (e.key === 'ArrowDown') {
+    if (!rows.length) return;
+    e.preventDefault();
+    amSet(rows, amSel < 0 ? 0 : Math.min(rows.length - 1, amSel + 1));
+  } else if (e.key === 'ArrowUp') {
+    if (amSel < 0) return;
+    e.preventDefault();
+    amSet(rows, amSel === 0 ? -1 : amSel - 1);
+  } else if (e.key === 'Enter' && amSel >= 0 && rows[amSel]) {
+    e.preventDefault();
+    const b = rows[amSel].querySelector('button');
+    if (b) b.click();
+  }
+});
 $('am-search').addEventListener('input', () => {
   clearTimeout(searchTimer);
   const q = $('am-search').value.trim();
+  amSet([...$('am-results').querySelectorAll('.srow')], -1);
   if (!q) { $('am-results').innerHTML = ''; return; }
   searchTimer = setTimeout(() => doSearch(q), 300);
 });
 
 async function doSearch(q) {
   const box = $('am-results');
+  amSel = -1;
   box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
   try {
     const res = await api('/api/search?q=' + encodeURIComponent(q));
@@ -1215,10 +1281,10 @@ document.addEventListener('mousemove', (e) => {
  * Bindings can be remapped in Settings (top-right gear); every binding is
  * plain data backed by a default table, and edits persist via localStorage.
  */
-const KCTX_PLAYER  = 'player';   /* player modal open        */
-const KCTX_ADD     = 'add';      /* add-torrent modal open   */
-const KCTX_MOVIE   = 'movie';    /* movie detail page open   */
-const KCTX_LIBRARY = 'library';  /* library grid open        */
+const KCTX_PLAYER  = 'player';   /* player modal open            */
+const KCTX_MODAL   = 'modal';    /* add/settings/confirm overlay  */
+const KCTX_MOVIE   = 'movie';    /* movie detail page open        */
+const KCTX_LIBRARY = 'library';  /* library grid open             */
 
 // Default bindings (restore-target in Settings). 'mods' holds Ctrl/Alt/Shift/
 // Meta combinations; the fn references below are hoisted function declarations.
@@ -1237,10 +1303,10 @@ const DEFAULT_KEYBIND = [
   { id: 'lib-next',    ctx: KCTX_LIBRARY,code: 'ArrowRight', label: 'Next movie',             fn: selNext },
   { id: 'lib-prev',    ctx: KCTX_LIBRARY,code: 'ArrowLeft',  label: 'Previous movie',         fn: selPrev },
   { id: 'lib-open',    ctx: KCTX_LIBRARY,code: 'Enter',      label: 'Open movie',             fn: selOpen },
-  { id: 'add-close',   ctx: KCTX_ADD,    code: 'Escape',     label: 'Close add modal',        fn: () => $('am-close').click() },
+  { id: 'modal-close', ctx: KCTX_MODAL,  code: 'Escape',     label: 'Close',                  fn: closeModal },
 ];
 
-const KCTX_NAMES = { player: 'Player', add: 'Add', movie: 'Movie', library: 'Library' };
+const KCTX_NAMES = { player: 'Player', modal: 'Modal', movie: 'Movie', library: 'Library' };
 const KB_STORE = 'chadtorrent.keybinds';
 
 const CODE_PRETTY = { Space: 'Space', Enter: 'Enter', Escape: 'Esc', Tab: 'Tab',
@@ -1275,9 +1341,11 @@ function decodeKeybinds(saved) {
   if (!Array.isArray(saved)) return out;
   for (const s of saved) {
     if (!s || typeof s.ctx !== 'string' || typeof s.code !== 'string') continue;
-    const d = DEFAULT_KEYBIND.find(x => x.id === s.id);
+    const d = DEFAULT_KEYBIND.find(x => x.id === s.id)
+      || DEFAULT_KEYBIND.find(x => x.ctx === s.ctx && x.label === s.label);
+    if (!d) continue;
     out.push({ id: s.id, ctx: s.ctx, code: s.code, mods: Array.isArray(s.mods) ? s.mods : [],
-               label: s.label, fn: d ? d.fn : actionFor(s.ctx, s.label) });
+               label: s.label, fn: d.fn });
   }
   return out;
 }
@@ -1297,7 +1365,9 @@ function saveKeybinds() {
 }
 function activeKeyCtx() {
   if (!$('player-modal').hidden) return KCTX_PLAYER;
-  if (!$('add-modal').hidden) return KCTX_ADD;
+  if (!$('settings-modal').hidden) return KCTX_MODAL;
+  if (!$('add-modal').hidden) return KCTX_MODAL;
+  if (!$('confirm-modal').hidden) return KCTX_MODAL;
   if (!$('view-movie').hidden) return KCTX_MOVIE;
   return KCTX_LIBRARY;
 }
@@ -1387,13 +1457,13 @@ const ksIsText = (t) => {
 };
 
 document.addEventListener('keydown', (e) => {
-  if (!$('settings-modal').hidden) {
-    // While Settings is open no shortcut runs (the recorder's capture-phase
-    // listener handles whatever key it is recording). Focused inputs/selects
-    // keep their native behavior; Escape closes the window.
-    if (ksIsText(e.target)) return;
+  // Escape always closes whichever overlay is open — even when the focus is
+  // inside a text input (e.g. the add-to-library search box), which would
+  // otherwise be swallowed by the typing guard below.
+  if (e.key === 'Escape' && activeKeyCtx() === KCTX_MODAL) {
     e.preventDefault();
-    if (!kbRec && e.key === 'Escape') closeSettings();
+    const b = KEYBIND.find(x => x.ctx === KCTX_MODAL && x.code === e.code && modMatch(x, e));
+    if (b) b.fn();
     return;
   }
   if (ksIsText(e.target)) return;                       // typing untouched
@@ -1409,14 +1479,6 @@ document.addEventListener('keydown', (e) => {
 
 /* ---------- settings (keybinding remap) ---------- */
 let kbRec = null, kbPending = null, kbSeq = 100;
-
-function flashStatus(msg, isErr) {
-  const s = $('kb-status');
-  s.textContent = msg;
-  s.classList.toggle('err', !!isErr);
-  clearTimeout(s._t);
-  if (msg) s._t = setTimeout(() => { s.textContent = ''; }, 2500);
-}
 function stopKbRec(restore) {
   if (!kbRec) return;
   const el = kbRec.el;
@@ -1469,62 +1531,82 @@ function commitKbRec() {
   b.mods = kbPending.mods;
   if (kbConflict(b)) {
     kbRec = null; kbPending = null;
+    resetNbKey();
     renderKbSettings();
-    flashStatus('That key is already bound in ' + (KCTX_NAMES[b.ctx] || b.ctx) + '.', true);
     return;
   }
   if (isNew) KEYBIND.push(b);
   saveKeybinds();
   kbRec = null; kbPending = null;
+  resetNbKey();
   renderKbSettings();
-  flashStatus('Saved.');
+}
+function resetNbKey() {
+  const el = $('nb-key');
+  el.classList.remove('rec');
+  el.value = '+ new key';
+  el.placeholder = '';
+}
+let kbSort = { col: 'key', dir: 1 };
+function kbGet(b) {
+  const col = kbSort ? kbSort.col : 'key';
+  if (col === 'ctx') return KCTX_NAMES[b.ctx] || b.ctx;
+  if (col === 'action') return b.label;
+  return prettyKey(b);
+}
+function sortKb() {
+  const rows = [...KEYBIND];
+  if (!kbSort) return rows;
+  rows.sort((a, b) => {
+    const x = kbGet(a).toLowerCase(), y = kbGet(b).toLowerCase();
+    return x < y ? -kbSort.dir : x > y ? kbSort.dir : 0;
+  });
+  return rows;
+}
+function syncSortInd() {
+  document.querySelectorAll('.kb-table th[data-sort]').forEach(th => {
+    if (kbSort && th.dataset.sort === kbSort.col) th.dataset.dir = kbSort.dir > 0 ? 'asc' : 'desc';
+    else delete th.dataset.dir;
+  });
+}
+function fillNbActions() {
+  const sel = $('nb-action');
+  sel.innerHTML = '';
+  for (const l of actionsForCtx($('nb-ctx').value)) {
+    const o = document.createElement('option'); o.value = l; o.textContent = l; sel.appendChild(o);
+  }
 }
 function renderKbSettings() {
-  const list = $('kb-list');
-  list.innerHTML = '';
-  for (const ctx of [KCTX_PLAYER, KCTX_MOVIE, KCTX_LIBRARY, KCTX_ADD]) {
-    const rows = KEYBIND.filter(b => b.ctx === ctx);
-    if (!rows.length) continue;
-    const head = document.createElement('div');
-    head.className = 'kb-ctxhead';
-    head.textContent = KCTX_NAMES[ctx];
-    list.appendChild(head);
-    for (const b of rows) {
-      const row = document.createElement('div');
-      row.className = 'kb-row';
-      const key = document.createElement('input');
-      key.className = 'kb-key'; key.readOnly = true; key.value = prettyKey(b);
-      key.title = 'Click, then press the new keys and hit Enter';
-      key.addEventListener('click', () => startKbRec(key, b));
-      const cx = document.createElement('span'); cx.className = 'kb-ctx'; cx.textContent = KCTX_NAMES[b.ctx] || b.ctx;
-      const lb = document.createElement('span'); lb.className = 'kb-label'; lb.textContent = b.label;
-      row.appendChild(key); row.appendChild(cx); row.appendChild(lb);
-      list.appendChild(row);
-    }
+  fillNbActions();
+  const tbody = $('kb-tbody');
+  tbody.innerHTML = '';
+  for (const b of sortKb()) {
+    const tr = document.createElement('tr');
+    const key = document.createElement('input');
+    key.className = 'kb-key'; key.readOnly = true; key.value = prettyKey(b);
+    key.title = 'Click, then press the new keys and hit Enter';
+    key.addEventListener('click', () => startKbRec(key, b));
+    const tdKey = document.createElement('td'); tdKey.appendChild(key);
+    const tdCtx = document.createElement('td'); tdCtx.className = 'kb-ctx';
+    tdCtx.textContent = KCTX_NAMES[b.ctx] || b.ctx;
+    const tdAct = document.createElement('td'); tdAct.className = 'kb-label'; tdAct.textContent = b.label;
+    tr.appendChild(tdKey); tr.appendChild(tdCtx); tr.appendChild(tdAct);
+    const tdDel = document.createElement('td'); tdDel.className = 'kb-del';
+    const del = document.createElement('button');
+    del.className = 'ibtn';
+    del.innerHTML = IC_BIN;
+    del.title = 'Delete keybinding';
+    del.onclick = () => {
+      stopKbRec(true);
+      KEYBIND = KEYBIND.filter(x => x !== b);
+      saveKeybinds();
+      renderKbSettings();
+    };
+    tdDel.appendChild(del);
+    tr.appendChild(tdDel);
+    tbody.appendChild(tr);
   }
-  const addRow = document.createElement('div');
-  addRow.className = 'kb-row kb-new';
-  const rec = document.createElement('input');
-  rec.className = 'kb-key'; rec.readOnly = true; rec.value = '+ new key';
-  rec.title = 'Record a new key for the chosen context / action';
-  rec.addEventListener('click', () => startKbRec(rec, null));
-  const ctxSel = document.createElement('select');
-  ctxSel.id = 'nb-ctx';
-  for (const c of [KCTX_PLAYER, KCTX_MOVIE, KCTX_LIBRARY, KCTX_ADD]) {
-    const o = document.createElement('option'); o.value = c; o.textContent = KCTX_NAMES[c]; ctxSel.appendChild(o);
-  }
-  const actSel = document.createElement('select');
-  actSel.id = 'nb-action';
-  const fillActions = () => {
-    actSel.innerHTML = '';
-    for (const l of actionsForCtx(ctxSel.value)) {
-      const o = document.createElement('option'); o.value = l; o.textContent = l; actSel.appendChild(o);
-    }
-  };
-  ctxSel.addEventListener('change', fillActions);
-  fillActions();
-  addRow.appendChild(rec); addRow.appendChild(ctxSel); addRow.appendChild(actSel);
-  list.appendChild(addRow);
+  syncSortInd();
 }
 function openSettings() {
   $('settings-modal').hidden = false;
@@ -1534,15 +1616,31 @@ function closeSettings() {
   stopKbRec(true);
   $('settings-modal').hidden = true;
 }
+/* Close whichever overlay is open. Drives the KEYBIND "modal" context's
+ * single action (label 'Close'), so e.g. Escape closes the confirm-delete
+ * dialog instead of letting the movie/library binding underneath fire. */
+function closeModal() {
+  if (!$('settings-modal').hidden) { closeSettings(); return; }
+  if (!$('add-modal').hidden) { closeAdd(); return; }
+  if (!$('confirm-modal').hidden) { $('cf-cancel').click(); return; }
+}
 $('btn-settings').addEventListener('click', openSettings);
 $('st-close').addEventListener('click', closeSettings);
 $('settings-modal').addEventListener('click', (e) => { if (e.target === $('settings-modal')) closeSettings(); });
+$('nb-key').addEventListener('click', () => startKbRec($('nb-key'), null));
+$('nb-ctx').addEventListener('change', () => { fillNbActions(); renderKbSettings(); });
+document.querySelectorAll('.kb-table th[data-sort]').forEach(th =>
+  th.addEventListener('click', () => {
+    const col = th.dataset.sort;
+    if (kbSort && kbSort.col === col) kbSort.dir *= -1;
+    else kbSort = { col, dir: 1 };
+    renderKbSettings();
+  }));
 $('kb-restore').addEventListener('click', () => {
   stopKbRec(true);
   KEYBIND = defaultKeybinds();
   saveKeybinds();
   renderKbSettings();
-  flashStatus('Default keybindings restored.');
 });
 
 /* ---------- misc ---------- */
