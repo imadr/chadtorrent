@@ -19,7 +19,9 @@
   .floats { position: fixed; top: 14px; right: 18px; z-index: 40; display: flex; gap: 10px; }
   button { font: inherit; color: var(--text); cursor: pointer; }
   .btn { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-         padding: 8px 14px; }
+         padding: 8px 14px; display: inline-flex; align-items: center; gap: 6px; }
+  .btn svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none;
+             stroke-linecap: round; stroke-linejoin: round; }
   .btn:hover { border-color: var(--accent); }
   .btn.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; font-weight: 600; }
   .btn.primary:hover { filter: brightness(1.1); }
@@ -119,6 +121,25 @@
   .srow .info .s { color: var(--muted); font-size: 12px; }
   .divider { border-top: 1px solid var(--line); margin: 16px 0; }
 
+  .kb-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 16px; }
+  .kb-ctxhead { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted);
+                margin: 12px 0 4px; }
+  .kb-ctxhead:first-child { margin-top: 0; }
+  .kb-row { display: flex; align-items: center; gap: 12px; }
+  .kb-key { width: 150px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px;
+            background: var(--panel2); color: var(--text); font: inherit; font-size: 13px;
+            text-align: center; outline: none; cursor: pointer; flex-shrink: 0; }
+  .kb-key:hover { border-color: var(--accent); }
+  .kb-key.rec { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: rgba(91,140,255,.12); }
+  .kb-ctx { width: 90px; flex-shrink: 0; color: var(--muted); font-size: 12px;
+            text-transform: uppercase; letter-spacing: .5px; }
+  .kb-label { flex: 1; font-size: 14px; min-width: 0; }
+  .kb-new { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .kb-new select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+                   border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; }
+  .kb-status { color: var(--ok); font-size: 13px; min-height: 18px; margin-bottom: 6px; }
+  .kb-status.err { color: var(--danger); }
+
   #player-modal { padding: 0; background: #000; }
   #player-modal[hidden] { display: none; }
   .pwrap { position: relative; width: 100vw; height: 100vh; background: #000; }
@@ -164,7 +185,8 @@
 </style>
 
 <div class="floats">
-  <button class="btn primary" id="btn-add">+ Add</button>
+  <button class="btn primary" id="btn-add"><svg viewBox="0 0 24 24"><use href="#ic-plus"/></svg>Add</button>
+  <button class="btn" id="btn-settings" title="Settings"><svg viewBox="0 0 24 24"><use href="#ic-settings"/></svg>Settings</button>
 </div>
 
 <main id="view-library">
@@ -235,6 +257,17 @@
   </div>
 </div>
 
+<div class="modal" id="settings-modal" hidden>
+  <div class="panel">
+    <div class="phead"><span>Settings</span><button class="x" id="st-close">✕</button></div>
+    <div class="kb-status" id="kb-status"></div>
+    <div id="kb-list" class="kb-list"></div>
+    <div class="cf-actions">
+      <button class="btn" id="kb-restore">Restore defaults</button>
+    </div>
+  </div>
+</div>
+
 <!-- Icons from Tabler Icons (https://tabler.io/icons), MIT license. Inlined once
      as <symbol> defs and referenced with <svg><use href="#ic-…"/></svg>. -->
 <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
@@ -246,6 +279,8 @@
   <symbol id="ic-maximize" viewBox="0 0 24 24"><path d="M4 8v-2a2 2 0 0 1 2 -2h2"/><path d="M4 16v2a2 2 0 0 0 2 2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M16 20h2a2 2 0 0 0 2 -2v-2"/></symbol>
   <symbol id="ic-minimize" viewBox="0 0 24 24"><path d="M5 9l-3 3l3 3"/><path d="M9 5l3 -3l3 3"/><path d="M9 19l3 3l3 -3"/><path d="M19 9l3 3l-3 3"/></symbol>
   <symbol id="ic-bin" viewBox="0 0 24 24"><path d="M4 7l16 0"/><path d="M10 11l0 6"/><path d="M14 11l0 6"/><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12"/><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3"/></symbol>
+  <symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></symbol>
+  <symbol id="ic-settings" viewBox="0 0 24 24"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 1 0-6 0a3 3 0 0 0 6 0"/></symbol>
 </svg>
 
 <script>
@@ -425,7 +460,7 @@ async function refreshLibrary() {
 function setView(isMovie) {
   $('view-library').hidden = isMovie;
   $('view-movie').hidden = !isMovie;
-  document.querySelector('.floats').hidden = isMovie;
+  $('btn-add').hidden = isMovie;
 }
 
 function syncMovie() {
@@ -1177,31 +1212,89 @@ document.addEventListener('mousemove', (e) => {
  * A key only acts via an explicit binding below, gated by CONTEXT (which
  * screen is open). Real text entry and browser-level shortcuts (Cmd+R, F5,
  * Cmd+F, F11… and browser fullscreen-Escape) always pass through untouched.
- * A settings window will let the user remap keys later — every binding is
- * plain data so it's a table edit away.
+ * Bindings can be remapped in Settings (top-right gear); every binding is
+ * plain data backed by a default table, and edits persist via localStorage.
  */
 const KCTX_PLAYER  = 'player';   /* player modal open        */
 const KCTX_ADD     = 'add';      /* add-torrent modal open   */
 const KCTX_MOVIE   = 'movie';    /* movie detail page open   */
 const KCTX_LIBRARY = 'library';  /* library grid open        */
 
-const KEYBIND = [
-  // { ctx, code, label, fn }
-  { ctx: KCTX_PLAYER, code: 'Space',      label: 'Play / Pause',   fn: togglePlay },
-  { ctx: KCTX_PLAYER, code: 'ArrowLeft',  label: 'Seek back 5s',   fn: () => seekBy(-5) },
-  { ctx: KCTX_PLAYER, code: 'ArrowRight', label: 'Seek forward 5s',fn: () => seekBy(5) },
-  { ctx: KCTX_PLAYER, code: 'KeyF',       label: 'Toggle fullscreen',fn: toggleFs },
-  { ctx: KCTX_PLAYER, code: 'Escape',     label: 'Exit player',    fn: exitPlayer },
-  { ctx: KCTX_MOVIE,  code: 'Escape',     label: 'Back to library',fn: () => $('btn-back').click() },
-  { ctx: KCTX_MOVIE,  code: 'ArrowDown',  label: 'Next item / torrent', fn: selNext },
-  { ctx: KCTX_MOVIE,  code: 'ArrowUp',    label: 'Previous item',  fn: selPrev },
-  { ctx: KCTX_MOVIE,  code: 'Enter',      label: 'Open selected',  fn: selOpen },
-  { ctx: KCTX_MOVIE,  code: 'Space',      label: 'Pause / resume torrent', fn: selToggleDl },
-  { ctx: KCTX_LIBRARY,code: 'ArrowRight', label: 'Next movie',     fn: selNext },
-  { ctx: KCTX_LIBRARY,code: 'ArrowLeft',  label: 'Previous movie', fn: selPrev },
-  { ctx: KCTX_LIBRARY,code: 'Enter',      label: 'Open movie',     fn: selOpen },
-  { ctx: KCTX_ADD,    code: 'Escape',     label: 'Close add modal',fn: () => $('am-close').click() },
+// Default bindings (restore-target in Settings). 'mods' holds Ctrl/Alt/Shift/
+// Meta combinations; the fn references below are hoisted function declarations.
+const DEFAULT_KEYBIND = [
+  // { id, ctx, code, label, fn }
+  { id: 'pl-toggle',   ctx: KCTX_PLAYER, code: 'Space',      label: 'Play / Pause',           fn: togglePlay },
+  { id: 'pl-back5',    ctx: KCTX_PLAYER, code: 'ArrowLeft',  label: 'Seek back 5s',           fn: () => seekBy(-5) },
+  { id: 'pl-fwd5',     ctx: KCTX_PLAYER, code: 'ArrowRight', label: 'Seek forward 5s',        fn: () => seekBy(5) },
+  { id: 'pl-fs',       ctx: KCTX_PLAYER, code: 'KeyF',       label: 'Toggle fullscreen',      fn: toggleFs },
+  { id: 'pl-exit',     ctx: KCTX_PLAYER, code: 'Escape',     label: 'Exit player',            fn: exitPlayer },
+  { id: 'mv-back',     ctx: KCTX_MOVIE,  code: 'Escape',     label: 'Back to library',        fn: () => $('btn-back').click() },
+  { id: 'mv-next',     ctx: KCTX_MOVIE,  code: 'ArrowDown',  label: 'Next item / torrent',    fn: selNext },
+  { id: 'mv-prev',     ctx: KCTX_MOVIE,  code: 'ArrowUp',    label: 'Previous item',          fn: selPrev },
+  { id: 'mv-open',     ctx: KCTX_MOVIE,  code: 'Enter',      label: 'Open selected',          fn: selOpen },
+  { id: 'mv-dltoggle', ctx: KCTX_MOVIE,  code: 'Space',      label: 'Pause / resume torrent', fn: selToggleDl },
+  { id: 'lib-next',    ctx: KCTX_LIBRARY,code: 'ArrowRight', label: 'Next movie',             fn: selNext },
+  { id: 'lib-prev',    ctx: KCTX_LIBRARY,code: 'ArrowLeft',  label: 'Previous movie',         fn: selPrev },
+  { id: 'lib-open',    ctx: KCTX_LIBRARY,code: 'Enter',      label: 'Open movie',             fn: selOpen },
+  { id: 'add-close',   ctx: KCTX_ADD,    code: 'Escape',     label: 'Close add modal',        fn: () => $('am-close').click() },
 ];
+
+const KCTX_NAMES = { player: 'Player', add: 'Add', movie: 'Movie', library: 'Library' };
+const KB_STORE = 'chadtorrent.keybinds';
+
+const CODE_PRETTY = { Space: 'Space', Enter: 'Enter', Escape: 'Esc', Tab: 'Tab',
+  Backspace: 'Backspace', ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓' };
+function prettyCode(code) {
+  if (CODE_PRETTY[code]) return CODE_PRETTY[code];
+  if (code && code.startsWith('Key')) return code.slice(3);
+  if (code && code.startsWith('Digit')) return code.slice(5);
+  return code || '';
+}
+function prettyKey(b) { return (b.mods || []).concat(prettyCode(b.code)).join('+'); }
+function modsFor(e) {
+  return [e.ctrlKey && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', e.metaKey && 'Meta'].filter(Boolean);
+}
+function modsEq(a, b) { return (a || []).join(',') === (b || []).join(','); }
+function modMatch(b, e) { return modsEq(b.mods || [], modsFor(e)); }
+
+function actionFor(ctx, label) {
+  const d = DEFAULT_KEYBIND.find(x => x.ctx === ctx && x.label === label);
+  return d ? d.fn : (() => {});
+}
+function actionsForCtx(ctx) {
+  const seen = new Set(), out = [];
+  for (const b of DEFAULT_KEYBIND) if (b.ctx === ctx && !seen.has(b.label)) { seen.add(b.label); out.push(b.label); }
+  return out;
+}
+function defaultKeybinds() {
+  return DEFAULT_KEYBIND.map(b => ({ id: b.id, ctx: b.ctx, code: b.code, mods: [], label: b.label, fn: b.fn }));
+}
+function decodeKeybinds(saved) {
+  const out = [];
+  if (!Array.isArray(saved)) return out;
+  for (const s of saved) {
+    if (!s || typeof s.ctx !== 'string' || typeof s.code !== 'string') continue;
+    const d = DEFAULT_KEYBIND.find(x => x.id === s.id);
+    out.push({ id: s.id, ctx: s.ctx, code: s.code, mods: Array.isArray(s.mods) ? s.mods : [],
+               label: s.label, fn: d ? d.fn : actionFor(s.ctx, s.label) });
+  }
+  return out;
+}
+function loadKeybinds() {
+  try {
+    const raw = localStorage.getItem(KB_STORE);
+    if (raw) return decodeKeybinds(JSON.parse(raw));
+  } catch (e) {}
+  return defaultKeybinds();
+}
+let KEYBIND = loadKeybinds();
+function saveKeybinds() {
+  try {
+    localStorage.setItem(KB_STORE, JSON.stringify(
+      KEYBIND.map(b => ({ id: b.id, ctx: b.ctx, code: b.code, mods: b.mods, label: b.label }))));
+  } catch (e) {}
+}
 function activeKeyCtx() {
   if (!$('player-modal').hidden) return KCTX_PLAYER;
   if (!$('add-modal').hidden) return KCTX_ADD;
@@ -1294,6 +1387,15 @@ const ksIsText = (t) => {
 };
 
 document.addEventListener('keydown', (e) => {
+  if (!$('settings-modal').hidden) {
+    // While Settings is open no shortcut runs (the recorder's capture-phase
+    // listener handles whatever key it is recording). Focused inputs/selects
+    // keep their native behavior; Escape closes the window.
+    if (ksIsText(e.target)) return;
+    e.preventDefault();
+    if (!kbRec && e.key === 'Escape') closeSettings();
+    return;
+  }
   if (ksIsText(e.target)) return;                       // typing untouched
   if (e.ctrlKey || e.metaKey || e.altKey) return;        // browser shortcuts
   if (/^F\d+$/.test(e.key)) return;                      // F1…F12 pass through
@@ -1301,8 +1403,146 @@ document.addEventListener('keydown', (e) => {
   e.preventDefault();                                    // every key does nothing by default
   const ctx = activeKeyCtx();
   if (!ctx) return;
-  const b = KEYBIND.find(x => x.ctx === ctx && x.code === e.code);
+  const b = KEYBIND.find(x => x.ctx === ctx && x.code === e.code && modMatch(x, e));
   if (b) b.fn();
+});
+
+/* ---------- settings (keybinding remap) ---------- */
+let kbRec = null, kbPending = null, kbSeq = 100;
+
+function flashStatus(msg, isErr) {
+  const s = $('kb-status');
+  s.textContent = msg;
+  s.classList.toggle('err', !!isErr);
+  clearTimeout(s._t);
+  if (msg) s._t = setTimeout(() => { s.textContent = ''; }, 2500);
+}
+function stopKbRec(restore) {
+  if (!kbRec) return;
+  const el = kbRec.el;
+  el.classList.remove('rec');
+  el.placeholder = '';
+  if (restore) el.value = kbRec.binding ? prettyKey(kbRec.binding) : kbRec.orig;
+  kbRec = null; kbPending = null;
+}
+function startKbRec(el, binding) {
+  if (kbRec) stopKbRec(true);
+  kbRec = { el, binding, orig: el.value };
+  el.classList.add('rec');
+  el.value = '';
+  el.placeholder = 'Press keys… ↵ save';
+  el.focus();
+}
+function prettyPending() {
+  const m = (kbPending.mods || []).join('+');
+  const c = kbPending.code ? prettyCode(kbPending.code) : (kbPending ? '…' : '');
+  return m ? m + '+' + c : c;
+}
+document.addEventListener('keydown', (e) => {
+  // capture-phase recorder: register the combo, Enter saves, Esc cancels
+  if (!kbRec) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === 'Escape') { stopKbRec(true); return; }
+  const mods = modsFor(e);
+  if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) { kbPending = { mods, code: null }; kbRec.el.value = prettyPending(); return; }
+  if (e.key === 'Enter') { if (kbPending && kbPending.code) commitKbRec(); return; }
+  kbPending = { mods, code: e.code };
+  kbRec.el.value = prettyPending();
+}, true);
+function kbConflict(b) {
+  return KEYBIND.some(x => x !== b && x.ctx === b.ctx && x.code === b.code && modsEq(x.mods || [], b.mods || []));
+}
+function nextKbId() {
+  while (KEYBIND.some(b => b.id === 'c' + kbSeq)) kbSeq++;
+  return 'c' + kbSeq++;
+}
+function commitKbRec() {
+  const cur = kbRec;
+  if (!cur) return;
+  const isNew = !cur.binding;
+  const b = isNew
+    ? { id: nextKbId(), ctx: $('nb-ctx').value, label: $('nb-action').value,
+        fn: actionFor($('nb-ctx').value, $('nb-action').value) }
+    : cur.binding;
+  b.code = kbPending.code;
+  b.mods = kbPending.mods;
+  if (kbConflict(b)) {
+    kbRec = null; kbPending = null;
+    renderKbSettings();
+    flashStatus('That key is already bound in ' + (KCTX_NAMES[b.ctx] || b.ctx) + '.', true);
+    return;
+  }
+  if (isNew) KEYBIND.push(b);
+  saveKeybinds();
+  kbRec = null; kbPending = null;
+  renderKbSettings();
+  flashStatus('Saved.');
+}
+function renderKbSettings() {
+  const list = $('kb-list');
+  list.innerHTML = '';
+  for (const ctx of [KCTX_PLAYER, KCTX_MOVIE, KCTX_LIBRARY, KCTX_ADD]) {
+    const rows = KEYBIND.filter(b => b.ctx === ctx);
+    if (!rows.length) continue;
+    const head = document.createElement('div');
+    head.className = 'kb-ctxhead';
+    head.textContent = KCTX_NAMES[ctx];
+    list.appendChild(head);
+    for (const b of rows) {
+      const row = document.createElement('div');
+      row.className = 'kb-row';
+      const key = document.createElement('input');
+      key.className = 'kb-key'; key.readOnly = true; key.value = prettyKey(b);
+      key.title = 'Click, then press the new keys and hit Enter';
+      key.addEventListener('click', () => startKbRec(key, b));
+      const cx = document.createElement('span'); cx.className = 'kb-ctx'; cx.textContent = KCTX_NAMES[b.ctx] || b.ctx;
+      const lb = document.createElement('span'); lb.className = 'kb-label'; lb.textContent = b.label;
+      row.appendChild(key); row.appendChild(cx); row.appendChild(lb);
+      list.appendChild(row);
+    }
+  }
+  const addRow = document.createElement('div');
+  addRow.className = 'kb-row kb-new';
+  const rec = document.createElement('input');
+  rec.className = 'kb-key'; rec.readOnly = true; rec.value = '+ new key';
+  rec.title = 'Record a new key for the chosen context / action';
+  rec.addEventListener('click', () => startKbRec(rec, null));
+  const ctxSel = document.createElement('select');
+  ctxSel.id = 'nb-ctx';
+  for (const c of [KCTX_PLAYER, KCTX_MOVIE, KCTX_LIBRARY, KCTX_ADD]) {
+    const o = document.createElement('option'); o.value = c; o.textContent = KCTX_NAMES[c]; ctxSel.appendChild(o);
+  }
+  const actSel = document.createElement('select');
+  actSel.id = 'nb-action';
+  const fillActions = () => {
+    actSel.innerHTML = '';
+    for (const l of actionsForCtx(ctxSel.value)) {
+      const o = document.createElement('option'); o.value = l; o.textContent = l; actSel.appendChild(o);
+    }
+  };
+  ctxSel.addEventListener('change', fillActions);
+  fillActions();
+  addRow.appendChild(rec); addRow.appendChild(ctxSel); addRow.appendChild(actSel);
+  list.appendChild(addRow);
+}
+function openSettings() {
+  $('settings-modal').hidden = false;
+  renderKbSettings();
+}
+function closeSettings() {
+  stopKbRec(true);
+  $('settings-modal').hidden = true;
+}
+$('btn-settings').addEventListener('click', openSettings);
+$('st-close').addEventListener('click', closeSettings);
+$('settings-modal').addEventListener('click', (e) => { if (e.target === $('settings-modal')) closeSettings(); });
+$('kb-restore').addEventListener('click', () => {
+  stopKbRec(true);
+  KEYBIND = defaultKeybinds();
+  saveKeybinds();
+  renderKbSettings();
+  flashStatus('Default keybindings restored.');
 });
 
 /* ---------- misc ---------- */
