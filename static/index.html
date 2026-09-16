@@ -33,6 +33,7 @@
   .card { position: relative; background: var(--panel); border: 1px solid var(--line);
           border-radius: 10px; overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s; }
   .card:hover { transform: translateY(-3px); border-color: var(--accent); }
+  .card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(91,140,255,.30); }
   .poster { width: 100%; aspect-ratio: 2/3; background: var(--panel2); display: flex;
             align-items: center; justify-content: center; overflow: hidden; }
   .card .poster img, .bigposter img { width: 100%; height: 100%; object-fit: cover; }
@@ -61,6 +62,7 @@
          border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; }
   #mv-torrents .row { min-height: 68px; }
   .row:hover { background: var(--panel2); border-color: var(--accent); }
+  .row.sel { background: var(--panel2); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .row .nm { flex: 1; min-width: 0; }
   .row .nm .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .nm .s { color: var(--muted); font-size: 12px; }
@@ -86,7 +88,8 @@
   .row .ibtn.primary { background: var(--accent); border-color: var(--accent); color: #0b0e14; }
   .row .ibtn.primary:hover { filter: brightness(1.1); }
   .row .ibtn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
-  .row .ibtn svg { width: 15px; height: 15px; fill: currentColor; }
+  .row .ibtn svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none;
+                   stroke-linecap: round; stroke-linejoin: round; }
   .formline { display: flex; gap: 8px; margin-top: 12px; }
   input[type=text], input[type=url] { flex: 1; background: var(--panel); color: var(--text);
          border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; font: inherit; outline: none; }
@@ -135,7 +138,8 @@
   .strip { display: flex; align-items: center; gap: 10px; }
   .pb { cursor: pointer; padding: 0; width: 32px; height: 32px; background: none; border: none;
         flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
-  .pb svg { width: 16px; height: 16px; fill: #fff; }
+  .pb svg { width: 16px; height: 16px; stroke: #fff; stroke-width: 2; fill: none;
+            stroke-linecap: round; stroke-linejoin: round; }
   .tm { color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap;
         flex-shrink: 0; letter-spacing: .3px; }
   .seek { flex: 1; height: 5px; min-width: 0; appearance: none; -webkit-appearance: none;
@@ -146,7 +150,8 @@
           appearance: none; -webkit-appearance: none; height: 0; width: 0;
           background: transparent; border: none; cursor: pointer; }
   .sv { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-  .sv svg { width: 16px; height: 16px; fill: #fff; }
+  .sv svg { width: 16px; height: 16px; stroke: #fff; stroke-width: 2; fill: none;
+            stroke-linecap: round; stroke-linejoin: round; }
   .vl { width: 70px; height: 5px; appearance: none; -webkit-appearance: none;
         background: linear-gradient(to right, #fff var(--val, 0%), #555 0); cursor: pointer;
         border: none; outline: none; }
@@ -195,15 +200,15 @@
     <div class="ctrl" id="ctrl">
       <div class="strip">
         <button class="pb" id="ppbtn" title="Play / Pause">
-          <svg id="ppicon" viewBox="0 0 16 16"><polygon id="ppshape" points="3,1 13,8 3,15"/></svg>
+          <svg id="ppicon" viewBox="0 0 24 24"><use href="#ic-play"/></svg>
         </button>
         <div class="tm" id="tm">0:00 / 0:00</div>
         <div class="skwrap"><input class="seek" id="seekbar" type="range" min="0" max="1000" value="0"></div>
         <div class="sv">
-          <svg id="vicon" viewBox="0 0 16 16"><polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/></svg>
+          <svg id="vicon" viewBox="0 0 24 24"><use href="#ic-vol-hi"/></svg>
           <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
           <button class="pb" id="fsbtn" title="Fullscreen">
-            <svg id="fsicon" viewBox="0 0 16 16"><polygon points="2,2 7,2 7,3.5 3.5,3.5 3.5,7 2,7"/><polygon points="14,2 9,2 9,3.5 12.5,3.5 12.5,7 14,7"/><polygon points="2,14 7,14 7,12.5 3.5,12.5 3.5,9 2,9"/><polygon points="14,14 9,14 9,12.5 12.5,12.5 12.5,9 14,9"/></svg>
+            <svg id="fsicon" viewBox="0 0 24 24"><use href="#ic-maximize"/></svg>
           </button>
         </div>
       </div>
@@ -230,13 +235,27 @@
   </div>
 </div>
 
+<!-- Icons from Tabler Icons (https://tabler.io/icons), MIT license. Inlined once
+     as <symbol> defs and referenced with <svg><use href="#ic-…"/></svg>. -->
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+  <symbol id="ic-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></symbol>
+  <symbol id="ic-pause" viewBox="0 0 24 24"><path d="M6 4h4v16h-4z"/><path d="M14 4h4v16h-4z"/></symbol>
+  <symbol id="ic-vol-hi" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M15 8a5 5 0 0 1 0 8"/><path d="M17.7 5a9 9 0 0 1 0 14"/></symbol>
+  <symbol id="ic-vol-lo" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M15 8a5 5 0 0 1 0 8"/></symbol>
+  <symbol id="ic-vol-mute" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M17 9l4 4"/><path d="M21 9l-4 4"/></symbol>
+  <symbol id="ic-maximize" viewBox="0 0 24 24"><path d="M4 8v-2a2 2 0 0 1 2 -2h2"/><path d="M4 16v2a2 2 0 0 0 2 2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M16 20h2a2 2 0 0 0 2 -2v-2"/></symbol>
+  <symbol id="ic-minimize" viewBox="0 0 24 24"><path d="M5 9l-3 3l3 3"/><path d="M9 5l3 -3l3 3"/><path d="M9 19l3 3l3 -3"/><path d="M19 9l3 3l-3 3"/></symbol>
+  <symbol id="ic-bin" viewBox="0 0 24 24"><path d="M4 7l16 0"/><path d="M10 11l0 6"/><path d="M14 11l0 6"/><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12"/><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3"/></symbol>
+</svg>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const v = $('player');
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
-var mseAbort = null, mseBlobUrl = null, mseSourceBuffer = null, mseGen = 0, mseMime = null, fullDur = 0, mseOff = 0;
+var mseAbort = null, mseBlobUrl = null, mseSourceBuffer = null, mseGen = 0, mseMime = null, fullDur = 0, mseOff = 0, mseBitrate = 0;
+var libSel = -1, mvSelIdx = -1;
 
 const TMDB_IMG = 'https://image.tmdb.org/t/p';
 const POSTER_IDX = 'w342';
@@ -330,6 +349,7 @@ function renderGrid() {
     card.onclick = () => openMovie(k);
     grid.appendChild(card);
   }
+  libHighlight();
 }
 
 function renderPieceBar(bar, have, total) {
@@ -426,6 +446,7 @@ function openMovie(k) {
   currentMovie = { key: k, rows };
   dlState = {};
   setView(true);
+  mvSelIdx = -1;
   $('mv-results').innerHTML = '';
   window.scrollTo(0, 0);
   renderMovie();
@@ -433,9 +454,9 @@ function openMovie(k) {
   if (rep.tmdb_id) findTorrents(rep);
 }
 
-const IC_PLAY = '<svg viewBox="0 0 16 16"><polygon points="3,1 13,8 3,15"/></svg>';
-const IC_PAUSE = '<svg viewBox="0 0 16 16"><rect x="3.2" y="1.5" width="3.8" height="13"/><rect x="9" y="1.5" width="3.8" height="13"/></svg>';
-const IC_BIN = '<svg viewBox="0 0 16 16"><path d="M6.4 1h3.2l.35 1.25h3.15v1.2h-12v-1.2h3.15L6.4 1Zm-3 5 1 9h7.2l1-9h-1.15l-.85 7.8H5.4L4.55 6H3.4Zm3.1.7v5.3h1.05V6.7H6.5Zm2.45 0v5.3H10V6.7H8.95Z"/></svg>';
+const IC_PLAY = '<svg viewBox="0 0 24 24"><use href="#ic-play"/></svg>';
+const IC_PAUSE = '<svg viewBox="0 0 24 24"><use href="#ic-pause"/></svg>';
+const IC_BIN = '<svg viewBox="0 0 24 24"><use href="#ic-bin"/></svg>';
 
 function icBtn(inner, cls, onclick) {
   const b = document.createElement('button');
@@ -484,6 +505,7 @@ function renderMovie() {
 
   const sec = $('mv-searchsec');
   sec.hidden = !rep.tmdb_id;
+  mvSyncSel();
 }
 
 function renderTorrentRow(el, t) {
@@ -663,6 +685,7 @@ function renderSearch() {
     row.appendChild(add);
     box.appendChild(row);
   }
+  mvSyncSel();
 }
 
 async function addTorrentFromSearch(t) {
@@ -759,20 +782,25 @@ async function doSearch(q) {
 /* ---------- MSE player ---------- */
 const MSE_KEEP_BEHIND = 60;
 const MSE_MAX_AHEAD = 60;
+// Safari throws "MediaSource buffer not sufficient" (QuotaExceededError) when
+// the buffered byte *total* passes its budget, regardless of seconds. Cap the
+// window by estimated bytes too, so a high-bitrate 1080p stream can't blow the
+// quota while well under the 120s span cap.
+const MSE_BYTE_BUDGET = 48 * 1024 * 1024;
 
-// Buffer-window backpressure: once the SourceBuffer holds more than
-// MSE_MAX_AHEAD + MSE_KEEP_BEHIND seconds of media, pause pulling from the
-// fetch stream until played-out data can be evicted from behind the playhead.
-// The stopped read backpressures the server pipe (ffmpeg blocks on full
-// stdout) so we never buffer an entire big file — which is what caused
-// "MediaSource buffer not sufficient" on first launch. The span-based bound
-// alone is enough: it caps memory regardless of how the media clock moves.
+// Backpressure: pause pulling from the fetch once the SourceBuffer holds a full
+// window, then evict played-out data behind the playhead to slide it forward.
+// The stopped read backpressures the server pipe (ffmpeg blocks on full stdout)
+// so we never buffer more than a window at a time.
 function sbHasHeadroom(sb) {
   const b = sb.buffered;
   if (!b.length) return true;
   const end = b.end(b.length - 1);
   const start = b.start(0);
-  return (end - start) < MSE_MAX_AHEAD + MSE_KEEP_BEHIND;
+  const span = end - start;
+  if (span >= MSE_MAX_AHEAD + MSE_KEEP_BEHIND) return false;
+  if (mseBitrate > 0 && span * mseBitrate >= MSE_BYTE_BUDGET) return false;
+  return true;
 }
 function waitForHeadroom(sb, gen) {
   return new Promise((res) => {
@@ -808,7 +836,7 @@ function isQuota(e) {
 
 function appendChunk(sb, value) {
   return new Promise((resolve, reject) => {
-    const doAppend = (retried) => {
+    const doAppend = () => {
       const ok = () => {
         sb.removeEventListener('updateend', ok);
         sb.removeEventListener('error', err);
@@ -818,8 +846,17 @@ function appendChunk(sb, value) {
         sb.removeEventListener('updateend', ok);
         sb.removeEventListener('error', err);
         const e = sb && sb.error ? new Error(sb.error.name + ': ' + (sb.error.message || '')) : new Error('SourceBuffer error');
-        if (!retried && isQuota(e)) {
-          evictBehind(sb).then(() => doAppend(true));
+        if (isQuota(e)) {
+          // Quota: this chunk won't fit. Free whatever history we can (keep
+          // only ~2s behind the playhead, not the whole MSE_KEEP_BEHIND
+          // window) and retry shortly. Near the start nothing is behind to
+          // free, so we idle — the already-buffered window keeps playing out,
+          // which advances the playhead, which makes eviction start freeing
+          // the exact bytes on top of the budget, which is what unblocks the
+          // append. Killing the pump here is wrong: the buffer draining is the
+          // FIX for quota, not a reason to throw the "Playback error" overlay
+          // while the movie is clearly still playing.
+          evictHistory(sb).then(() => setTimeout(doAppend, 150));
         } else {
           reject(e);
         }
@@ -831,14 +868,29 @@ function appendChunk(sb, value) {
       } catch (e) {
         sb.removeEventListener('updateend', ok);
         sb.removeEventListener('error', err);
-        if (!retried && isQuota(e)) {
-          evictBehind(sb).then(() => doAppend(true));
+        if (isQuota(e)) {
+          evictHistory(sb).then(() => setTimeout(doAppend, 150));
         } else {
           reject(e);
         }
       }
     };
-    doAppend(false);
+    doAppend();
+  });
+}
+
+// Free buffered media behind the playhead, keeping only ~2s so we shed as many
+// bytes as possible. Returns immediately if there's nothing behind to drop.
+function evictHistory(sb) {
+  return new Promise((res) => {
+    try {
+      const cut = Math.max(0, (v.currentTime || 0) - 2);
+      const b = sb.buffered;
+      if (!b.length || b.start(0) >= cut) return res();
+      const onEnd = () => { sb.removeEventListener('updateend', onEnd); res(); };
+      sb.addEventListener('updateend', onEnd);
+      sb.remove(b.start(0), cut);
+    } catch (e) { res(); }
   });
 }
 
@@ -852,6 +904,13 @@ async function playTorrent(item) {
     const c = await api('/api/library/' + item.id + '/codecs');
     mseMime = c.mime;
     fullDur = (c.duration && isFinite(c.duration)) ? c.duration : 0;
+    // Average stream bitrate (bytes/sec) so the pump can bound the buffered
+    // window by BYTES, not just seconds. The browser's MSE quota is byte-based:
+    // at 1080p the 120s glass span easily carries 50+ MB, which throws
+    // QuotaExceededError ("MediaSource buffer not sufficient") even though we
+    // never left the 120s window. Sizing the window by bytes keeps us under the
+    // quota instead of finding out mid-append.
+    mseBitrate = (item.size_bytes > 0 && fullDur > 0) ? (item.size_bytes / fullDur) : 0;
     await runMse(item.id, mseMime, 0);
   } catch (e) {
     if (e.name === 'AbortError') return;
@@ -970,8 +1029,8 @@ window.addEventListener('beforeunload', () => stopPlayback());
 
 /* ---------- player controls ---------- */
 const ppic = () => $('ppicon');
-v.addEventListener('play',  () => { ppic().innerHTML = '<rect x="4" y="2" width="2.5" height="12"/><rect x="9.5" y="2" width="2.5" height="12"/>'; });
-v.addEventListener('pause', () => { ppic().innerHTML = '<polygon points="3,1 13,8 3,15"/>'; });
+v.addEventListener('play',  () => { ppic().innerHTML = '<use href="#ic-pause"/>'; });
+v.addEventListener('pause', () => { ppic().innerHTML = '<use href="#ic-play"/>'; });
 $('ppbtn').addEventListener('click', () => { v.paused ? v.play().catch(()=>{}) : v.pause(); });
 
 function updSeek() {
@@ -1074,16 +1133,10 @@ function updVol() {
   const vol = Math.round((v.volume || 0) * 100);
   $('volbar').value = vol;
   $('volbar').style.setProperty('--val', vol + '%');
-  const tri = '<polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/>';
-  const wave1 = '<path d="M8 5.5c1.5 1.5 1.5 3.5 0 5" stroke="#fff" stroke-width="1.5" fill="none"/>';
-  const wave2 = '<path d="M10.5 3.5c2.5 2.5 2.5 6.5 0 9" stroke="#fff" stroke-width="1.5" fill="none"/>';
-  const mute = tri + '<line x1="7" y1="6" x2="13" y2="12" stroke="#fff" stroke-width="2"/><line x1="13" y1="6" x2="7" y2="12" stroke="#fff" stroke-width="2"/>';
   const pct = v.volume === 0 ? 0 : v.volume * 100;
-  let icon = tri;
-  if (v.muted) icon = mute;
-  else if (pct >= 50) icon = tri + wave1 + wave2;
-  else if (pct >= 10) icon = tri + wave1;
-  $('vicon').innerHTML = icon;
+  let use = '#ic-vol-mute';
+  if (!v.muted) use = pct >= 50 ? '#ic-vol-hi' : (pct >= 10 ? '#ic-vol-lo' : '#ic-vol-mute');
+  $('vicon').innerHTML = '<use href="' + use + '"/>';
 }
 v.addEventListener('volumechange', updVol);
 $('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
@@ -1096,19 +1149,13 @@ function applyFs() {
   v.style.cssText = on ? 'position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;' : '';
 }
 function fsIcon() {
-  $('fsicon').innerHTML = fsIsOn()
-    ? '<polygon points="4,4 7,4 7,5.5 5.5,5.5 5.5,7 4,7"/><polygon points="12,4 9,4 9,5.5 10.5,5.5 10.5,7 12,7"/><polygon points="4,12 7,12 7,10.5 5.5,10.5 5.5,9 4,9"/><polygon points="12,12 9,12 9,10.5 10.5,10.5 10.5,9 12,9"/>'
-    : '<polygon points="2,2 7,2 7,3.5 3.5,3.5 3.5,7 2,7"/><polygon points="14,2 9,2 9,3.5 12.5,3.5 12.5,7 14,7"/><polygon points="2,14 7,14 7,12.5 3.5,12.5 3.5,9 2,9"/><polygon points="14,14 9,14 9,12.5 12.5,12.5 12.5,9 14,9"/>';
+  $('fsicon').innerHTML = fsIsOn() ? '<use href="#ic-minimize"/>' : '<use href="#ic-maximize"/>';
 }
 document.addEventListener('fullscreenchange', () => { fsIcon(); applyFs(); });
 document.addEventListener('webkitfullscreenchange', () => { fsIcon(); applyFs(); });
 fsIcon();
 applyFs();
-$('fsbtn').addEventListener('click', () => {
-  if (fsIsOn()) { document.exitFullscreen().catch(() => {}); }
-  else if (wrap.requestFullscreen) { wrap.requestFullscreen().catch(() => {}); }
-  else if (v.webkitEnterFullscreen) { v.webkitEnterFullscreen(); }
-});
+$('fsbtn').addEventListener('click', toggleFs);
 
 /* show controls only when cursor in bottom 10% of video; back button only near top-left corner */
 document.addEventListener('mousemove', (e) => {
@@ -1123,11 +1170,139 @@ document.addEventListener('mousemove', (e) => {
   $('pback').classList.toggle('on', near);
 });
 
-/* no spacebar pause except in inputs; escape closes player */
+/* ---------- input system ----------
+ * No key does anything by default. The browser's native behaviors are killed
+ * globally: spacebar / arrow page-scroll, native stepping on a focused
+ * <input type=range> (seek/vol bars), button activation, Tab focus, Escape.
+ * A key only acts via an explicit binding below, gated by CONTEXT (which
+ * screen is open). Real text entry and browser-level shortcuts (Cmd+R, F5,
+ * Cmd+F, F11… and browser fullscreen-Escape) always pass through untouched.
+ * A settings window will let the user remap keys later — every binding is
+ * plain data so it's a table edit away.
+ */
+const KCTX_PLAYER  = 'player';   /* player modal open        */
+const KCTX_ADD     = 'add';      /* add-torrent modal open   */
+const KCTX_MOVIE   = 'movie';    /* movie detail page open   */
+const KCTX_LIBRARY = 'library';  /* library grid open        */
+
+const KEYBIND = [
+  // { ctx, code, label, fn }
+  { ctx: KCTX_PLAYER, code: 'Space',      label: 'Play / Pause',   fn: togglePlay },
+  { ctx: KCTX_PLAYER, code: 'ArrowLeft',  label: 'Seek back 5s',   fn: () => seekBy(-5) },
+  { ctx: KCTX_PLAYER, code: 'ArrowRight', label: 'Seek forward 5s',fn: () => seekBy(5) },
+  { ctx: KCTX_PLAYER, code: 'KeyF',       label: 'Toggle fullscreen',fn: toggleFs },
+  { ctx: KCTX_PLAYER, code: 'Escape',     label: 'Exit player',    fn: exitPlayer },
+  { ctx: KCTX_MOVIE,  code: 'Escape',     label: 'Back to library',fn: () => $('btn-back').click() },
+  { ctx: KCTX_MOVIE,  code: 'ArrowDown',  label: 'Next item / torrent', fn: selNext },
+  { ctx: KCTX_MOVIE,  code: 'ArrowUp',    label: 'Previous item',  fn: selPrev },
+  { ctx: KCTX_MOVIE,  code: 'Enter',      label: 'Open selected',  fn: selOpen },
+  { ctx: KCTX_MOVIE,  code: 'Space',      label: 'Pause / resume torrent', fn: selToggleDl },
+  { ctx: KCTX_LIBRARY,code: 'ArrowRight', label: 'Next movie',     fn: selNext },
+  { ctx: KCTX_LIBRARY,code: 'ArrowLeft',  label: 'Previous movie', fn: selPrev },
+  { ctx: KCTX_LIBRARY,code: 'Enter',      label: 'Open movie',     fn: selOpen },
+  { ctx: KCTX_ADD,    code: 'Escape',     label: 'Close add modal',fn: () => $('am-close').click() },
+];
+function activeKeyCtx() {
+  if (!$('player-modal').hidden) return KCTX_PLAYER;
+  if (!$('add-modal').hidden) return KCTX_ADD;
+  if (!$('view-movie').hidden) return KCTX_MOVIE;
+  return KCTX_LIBRARY;
+}
+function togglePlay() { v.paused ? v.play().catch(() => {}) : v.pause(); }
+function seekBy(dt) { seekTo(mseOff + v.currentTime + dt); }
+function exitPlayer() { if (!fsIsOn()) $('pback').click(); }
+
+function toggleFs() {
+  if (fsIsOn()) { document.exitFullscreen().catch(() => {}); }
+  else if (wrap.requestFullscreen) { wrap.requestFullscreen().catch(() => {}); }
+  else if (v.webkitEnterFullscreen) { v.webkitEnterFullscreen(); }
+}
+
+function libCount() { return document.querySelectorAll('#grid .card').length; }
+function libHighlight() {
+  document.querySelectorAll('#grid .card').forEach((c, i) => c.classList.toggle('sel', i === libSel));
+}
+function libSelMove(d) {
+  const n = libCount();
+  if (!n) return;
+  if (libSel < 0 || libSel >= n) libSel = d > 0 ? 0 : n - 1;
+  else libSel = Math.max(0, Math.min(n - 1, libSel + d));
+  libHighlight();
+  const els = document.querySelectorAll('#grid .card');
+  if (els[libSel]) els[libSel].scrollIntoView({ block: 'nearest' });
+}
+
+function mvFlat() {
+  const out = [];
+  for (const el of document.querySelectorAll('#mv-torrents .row[data-id]')) out.push({ kind: 'content', el });
+  for (const el of document.querySelectorAll('#mv-results .row'))         out.push({ kind: 'torrent',  el });
+  return out;
+}
+function mvHighlight() {
+  mvFlat().forEach((x, i) => x.el.classList.toggle('sel', i === mvSelIdx));
+}
+function mvSyncSel() {
+  const l = mvFlat();
+  if (!l.length) { mvSelIdx = -1; return; }
+  if (mvSelIdx < 0 || mvSelIdx >= l.length) mvSelIdx = 0;
+  mvHighlight();
+}
+function mvSelMove(d) {
+  const l = mvFlat();
+  if (!l.length) return;
+  if (mvSelIdx < 0 || mvSelIdx >= l.length) mvSelIdx = d > 0 ? 0 : l.length - 1;
+  else mvSelIdx = Math.max(0, Math.min(l.length - 1, mvSelIdx + d));
+  mvHighlight();
+  const x = l[mvSelIdx];
+  if (x) x.el.scrollIntoView({ block: 'nearest' });
+}
+
+function selNext() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(1); else libSelMove(1); }
+function selPrev() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(-1); else libSelMove(-1); }
+function selOpen() {
+  if (activeKeyCtx() === KCTX_LIBRARY) {
+    const cards = document.querySelectorAll('#grid .card');
+    if (libSel >= 0 && libSel < cards.length) cards[libSel].click();
+    return;
+  }
+  const x = mvFlat()[mvSelIdx];
+  if (!x) return;
+  if (x.kind === 'content') {
+    const t = items.find(i => String(i.id) === String(x.el.dataset.id));
+    if (t && t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error') playTorrent(t);
+  } else {
+    const add = x.el.querySelector('button.btn');
+    if (add && !add.disabled) add.click();
+  }
+}
+function selToggleDl() {
+  const x = mvFlat()[mvSelIdx];
+  if (!x || x.kind !== 'content') return;
+  const btn = x.el.dataset.state === 'paused'
+    ? x.el.querySelector('.ibtn.primary')
+    : x.el.querySelector('.ibtn:not(.primary):not(.danger)');
+  if (btn) btn.click();
+}
+
+/* True for elements where the user is actually typing/editing text. */
+const ksIsText = (t) => {
+  if (!t || !t.tagName) return false;
+  const tag = t.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') return !['range', 'checkbox', 'radio', 'button', 'submit', 'file', 'hidden'].includes(t.type);
+  return !!t.isContentEditable;
+};
+
 document.addEventListener('keydown', (e) => {
-  if (e.code === 'Space' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) e.preventDefault();
-  if (e.key === 'Escape' && !$('player-modal').hidden && !fsIsOn()) { $('pback').click(); }
-  if (e.key === 'Escape' && !$('add-modal').hidden) $('am-close').click();
+  if (ksIsText(e.target)) return;                       // typing untouched
+  if (e.ctrlKey || e.metaKey || e.altKey) return;        // browser shortcuts
+  if (/^F\d+$/.test(e.key)) return;                      // F1…F12 pass through
+  if (e.key === 'Escape' && fsIsOn()) return;            // native fullscreen exit
+  e.preventDefault();                                    // every key does nothing by default
+  const ctx = activeKeyCtx();
+  if (!ctx) return;
+  const b = KEYBIND.find(x => x.ctx === ctx && x.code === e.code);
+  if (b) b.fn();
 });
 
 /* ---------- misc ---------- */
