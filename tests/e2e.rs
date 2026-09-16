@@ -74,7 +74,7 @@ async fn http_error_handling() {
     assert_eq!(resp.status(), 404);
 
     let resp = client
-        .get(format!("{http}/stream/999999"))
+        .get(format!("{http}/mse/999999"))
         .send()
         .await
         .unwrap();

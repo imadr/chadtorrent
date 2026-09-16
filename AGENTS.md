@@ -2,7 +2,7 @@
 
 ## What this is
 
-Single-binary self-hosted torrent streamer: paste a magnet link (or search via indexer) → torrent downloads to `library_dir/{id}` → streams to browser via HTTP range requests. Built on vendored librqbit (local DHT-only, no trackers/DHT persistence; our SQLite is the source of truth).
+Single-binary self-hosted torrent streamer: paste a magnet link (or search via indexer) → torrent downloads to `library_dir/{id}` → streams to browser via MediaSource Extensions. Built on vendored librqbit (local DHT-only, no trackers/DHT persistence; our SQLite is the source of truth). Nothing is ever re-encoded: ffmpeg only rewraps containers to fragmented MP4 (`-c copy`); the browser does all decoding.
 
 ## Build / test commands
 
@@ -24,7 +24,7 @@ src/
   torrent.rs     TorrentEngine: wraps librqbit Session + ManagedTorrent map
   library.rs     LibraryManager: orchestrates DB + TorrentEngine + file paths
   http.rs        Axum server: REST routes + WS status + streaming + remux
-  remux.rs       ffmpeg MKV→MP4 remux via pipe (no re-encoding)
+  remux.rs       ffmpeg any-container → fragmented MP4 remux via pipe (`-c copy`, no re-encoding) + MSE codec probing
   metadata.rs    TMDB API client (search + detail fetch)
   error.rs       Error types mapping to HTTP status codes
   lib.rs         Module re-exports
@@ -42,9 +42,11 @@ tests/
 
 2. **Download**: librqbit downloads sequentially to `library_dir/{id}/`. State flows `connecting → downloading → ready`. On failure: `error`.
 
-3. **Stream** (`GET /stream/:id`): if file exists locally → serve from disk with range support. If downloading → use librqbit's `FileStream` (blocks until requested piece arrives). If container needs remux (MKV/AVI/etc) → pipe through ffmpeg.
+3. **Stream** (`GET /mse/:id`): server always runs ffmpeg with `-c copy` to fragmented MP4 on stdout, which the browser appends to a MSE `SourceBuffer` via a blob URL. Two sources: finished file on disk (ffmpeg reads the path) or a still-downloading torrent's librqbit `FileStream` fed to ffmpeg's stdin. If even byte 0 isn't ready the server answers `503` immediately; ffmpeg consumes exactly the bytes that exist, so a missing piece just pauses the pipe (no hang, no error) and the frontend's `waiting`/`stalled` events show the spinner until data flows. Codec MIME (`/api/library/:id/codecs`) is probed via ffprobe so `addSourceBuffer(msmime)` succeeds; that endpoint also returns `duration` so the seekbar works before first decode metadata.
 
-4. **Delete** (`DELETE /api/library/:id`): removes the row, deletes `library_dir/{id}` and `temp_dir/{id}`, removes from engine. If `?hard=1`, cascades to all torrents sharing the same `tmdb_id` (movie delete).
+4. **Seek** (`?t=<seconds>` on `/mse/:id`): ffmpeg's fragmented-MP4 muxer always rebases timestamps to 0 (verified — `-copyts`/`-ss` ordering, `-avoid_negative_ts disabled` etc. all produce first PTS 0), so each seek is a *fresh 0-based MSE session*. The frontend tracks `mseOff` (the movie-time at which the session started): seekbar position = `mseOff + v.currentTime`, and `seekTo(globalT)` maps to session-local `local = globalT - mseOff`. If `local` falls inside the SourceBuffer's buffered ranges (within ±0.5s) it does a native `v.currentTime` seek; otherwise it tears down and reconnects with `?t=globalT`. Reconnects also happen automatically if byte 0 isn't ready.
+
+5. **Delete** (`DELETE /api/library/:id`): removes the row, deletes `library_dir/{id}` and `temp_dir/{id}`, removes from engine. If `?hard=1`, cascades to all torrents sharing the same `tmdb_id` (movie delete).
 
 ## Frontend conventions
 
@@ -70,7 +72,7 @@ Key columns: `id, magnet, title, state, added_at, file_path, size_bytes, tmdb_id
 
 ## Test suite
 
-- **Unit tests** in `http.rs` (range parsing, MIME detection, video file selection) and `db.rs` (CRUD, migration).
+- **Unit tests** in `db.rs` (CRUD, migration) and `http.rs` (video file selection).
 - **E2e tests** in `tests/e2e.rs`: no torrent downloads. Use `db.insert_item` directly, create fake files on disk, verify delete/rollback/cascade behavior, HTTP error codes.
 - Run with `cargo test -- --test-threads=1` (sequential to avoid SQLite lock contention).
 - Tests that use real torrent downloads have been intentionally removed — iteration speed was prioritized over coverage.

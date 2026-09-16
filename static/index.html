@@ -233,8 +233,7 @@ const v = $('player');
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, mvSearchDone = false, pollBusy = 0, dlState = {};
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
-var pendingSeek = null;
-var seekGen = 0;
+var mseAbort = null, mseBlobUrl = null, mseSourceBuffer = null, mseGen = 0, mseMime = null, fullDur = 0, mseOff = 0;
 
 const TMDB_IMG = 'https://image.tmdb.org/t/p';
 const POSTER_IDX = 'w342';
@@ -754,22 +753,200 @@ async function doSearch(q) {
   }
 }
 
-/* ---------- player ---------- */
-function playTorrent(item) {
+/* ---------- MSE player ---------- */
+const MSE_KEEP_BEHIND = 60;
+const MSE_MAX_AHEAD = 60;
+
+// Buffer-window backpressure: once the SourceBuffer holds more than
+// MSE_MAX_AHEAD + MSE_KEEP_BEHIND seconds of media, pause pulling from the
+// fetch stream until played-out data can be evicted from behind the playhead.
+// The stopped read backpressures the server pipe (ffmpeg blocks on full
+// stdout) so we never buffer an entire big file — which is what caused
+// "MediaSource buffer not sufficient" on first launch. The span-based bound
+// alone is enough: it caps memory regardless of how the media clock moves.
+function sbHasHeadroom(sb) {
+  const b = sb.buffered;
+  if (!b.length) return true;
+  const end = b.end(b.length - 1);
+  const start = b.start(0);
+  return (end - start) < MSE_MAX_AHEAD + MSE_KEEP_BEHIND;
+}
+function waitForHeadroom(sb, gen) {
+  return new Promise((res) => {
+    (function tick() {
+      if (gen !== mseGen) return res();
+      if (sbHasHeadroom(sb)) return res();
+      // Buffer full: evict played-out data behind the playhead to slide the
+      // window forward, then retry shortly. While the playhead hasn't moved
+      // past MSE_KEEP_BEHIND yet there's nothing behind to free, so the pump
+      // idles until playback advances — the already-buffered window keeps
+      // playing smoothly meanwhile.
+      evictBehind(sb).then(() => setTimeout(tick, 150));
+    })();
+  });
+}
+
+function evictBehind(sb) {
+  return new Promise((res) => {
+    try {
+      const cut = Math.max(0, (v.currentTime || 0) - MSE_KEEP_BEHIND);
+      const b = sb.buffered;
+      if (!b.length || b.start(0) >= cut) return res();
+      const onEnd = () => { sb.removeEventListener('updateend', onEnd); res(); };
+      sb.addEventListener('updateend', onEnd);
+      sb.remove(b.start(0), cut);
+    } catch (e) { res(); }
+  });
+}
+
+function isQuota(e) {
+  return /quota|insufficient|sufficient|space/i.test((e.name || '') + ' ' + (e.message || ''));
+}
+
+function appendChunk(sb, value) {
+  return new Promise((resolve, reject) => {
+    const doAppend = (retried) => {
+      const ok = () => {
+        sb.removeEventListener('updateend', ok);
+        sb.removeEventListener('error', err);
+        resolve();
+      };
+      const err = () => {
+        sb.removeEventListener('updateend', ok);
+        sb.removeEventListener('error', err);
+        const e = sb && sb.error ? new Error(sb.error.name + ': ' + (sb.error.message || '')) : new Error('SourceBuffer error');
+        if (!retried && isQuota(e)) {
+          evictBehind(sb).then(() => doAppend(true));
+        } else {
+          reject(e);
+        }
+      };
+      sb.addEventListener('updateend', ok);
+      sb.addEventListener('error', err);
+      try {
+        sb.appendBuffer(value);
+      } catch (e) {
+        sb.removeEventListener('updateend', ok);
+        sb.removeEventListener('error', err);
+        if (!retried && isQuota(e)) {
+          evictBehind(sb).then(() => doAppend(true));
+        } else {
+          reject(e);
+        }
+      }
+    };
+    doAppend(false);
+  });
+}
+
+async function playTorrent(item) {
   stopPlayback();
   currentId = item.id;
   $('player-modal').hidden = false;
   $('ctrl').style.display = 'block';
-  v.src = '/stream/' + item.id;
-  v.load();
-  updSk();
-  v.play().catch(() => {});
+  showBuf('Loading…');
+  try {
+    const c = await api('/api/library/' + item.id + '/codecs');
+    mseMime = c.mime;
+    fullDur = (c.duration && isFinite(c.duration)) ? c.duration : 0;
+    await runMse(item.id, mseMime, 0);
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    hideBuf();
+    showBuf('Playback error: ' + e.message);
+  }
+}
+
+async function runMse(id, mime, off) {
+  const gen = ++mseGen;
+  mseOff = off;
+  const ms = new MediaSource();
+  mseBlobUrl = URL.createObjectURL(ms);
+  mseAbort = new AbortController();
+
+  await new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error('MediaSource timed out')), 5000);
+    ms.addEventListener('sourceopen', () => { clearTimeout(timer); res(); }, { once: true });
+    ms.addEventListener('error', () => { clearTimeout(timer); rej(new Error('MediaSource failed')); }, { once: true });
+    v.src = mseBlobUrl;
+  });
+
+  if (gen !== mseGen) return;
+
+  let sb;
+  try {
+    sb = ms.addSourceBuffer(mime);
+  } catch (e) {
+    const fallback = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
+    if (mime !== fallback) {
+      mseMime = fallback;
+      sb = ms.addSourceBuffer(fallback);
+    } else {
+      throw e;
+    }
+  }
+  mseSourceBuffer = sb;
+  const url = '/mse/' + id + (off > 0.5 ? ('?t=' + off.toFixed(1)) : '');
+  const resp = await fetch(url, { signal: mseAbort.signal });
+  if (!resp.ok) throw new Error('MSE stream returned ' + resp.status);
+  const reader = resp.body.getReader();
+  let first = true;
+  while (true) {
+    if (gen !== mseGen) return;
+    await waitForHeadroom(sb, gen);
+    if (gen !== mseGen) return;
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (gen !== mseGen) return;
+    await appendChunk(sb, value);
+    if (gen !== mseGen) return;
+    if (first) {
+      first = false;
+      if (v.paused) v.play().catch(() => {});
+      hideBuf();
+    }
+  }
+  if (gen !== mseGen) return;
+  if (ms.readyState === 'open' && !sb.updating) {
+    try { ms.endOfStream(); } catch (e) {}
+  }
+}
+
+function seekTo(globalT) {
+  if (fullDur && globalT > fullDur) globalT = fullDur;
+  if (globalT < 0) globalT = 0;
+  const sb = mseSourceBuffer;
+  const local = globalT - mseOff;
+  if (sb && sb.buffered && sb.buffered.length) {
+    for (let i = 0; i < sb.buffered.length; i++) {
+      if (local >= sb.buffered.start(i) - 0.5 && local <= sb.buffered.end(i) + 0.5) {
+        v.currentTime = Math.max(0, Math.min(local, sb.buffered.end(i) - 0.05));
+        return;
+      }
+    }
+  }
+  mseGen++;
+  const sg = mseGen;
+  if (mseAbort) { mseAbort.abort(); mseAbort = null; }
+  if (mseBlobUrl) { URL.revokeObjectURL(mseBlobUrl); mseBlobUrl = null; }
+  if (mseSourceBuffer) { try { mseSourceBuffer.abort(); } catch(e){} mseSourceBuffer = null; }
+  showBuf('Buffering…');
+  runMse(currentId, mseMime, globalT).catch(e => {
+    if (e.name === 'AbortError') return;
+    if (mseGen !== sg + 1) return; // superseded by a newer session
+    hideBuf();
+    showBuf('Playback error: ' + e.message);
+  });
 }
 
 function stopPlayback() {
+  mseGen++;
+  if (mseAbort) { mseAbort.abort(); mseAbort = null; }
+  if (mseSourceBuffer) { try { mseSourceBuffer.abort(); } catch(e){} mseSourceBuffer = null; }
+  if (mseBlobUrl) { URL.revokeObjectURL(mseBlobUrl); mseBlobUrl = null; }
+  mseMime = null; fullDur = 0;
   currentId = null;
   lastSkKey = null;
-  pendingSeek = null;
   hideBuf();
   $('seekbar').style.backgroundImage = '';
   v.pause();
@@ -781,6 +958,12 @@ $('pback').addEventListener('click', () => {
   stopPlayback();
   $('player-modal').hidden = true;
 });
+/* When the page is torn down (tab close, navigate away, bfcache) the in-flight
+ * MSE fetch must be destroyed too, otherwise the server keeps remuxing the
+ * whole file to a dead client. pagehide also fires for bfcache, where
+ * beforeunload may not. */
+window.addEventListener('pagehide', () => stopPlayback());
+window.addEventListener('beforeunload', () => stopPlayback());
 
 /* ---------- player controls ---------- */
 const ppic = () => $('ppicon');
@@ -790,8 +973,11 @@ $('ppbtn').addEventListener('click', () => { v.paused ? v.play().catch(()=>{}) :
 
 function updSeek() {
   const el = $('seekbar');
-  if (seeking || pendingSeek !== null || !v.duration) return;
-  const pct = (v.currentTime / v.duration) * 100;
+  if (seeking) return;
+  const dur = fullDur || v.duration;
+  if (!dur) return;
+  const global = mseOff + v.currentTime;
+  const pct = (global / dur) * 100;
   el.value = Math.round(pct * 10);
   el.style.setProperty('--val', pct.toFixed(2) + '%');
   updSk();
@@ -848,19 +1034,22 @@ $('seekbar').addEventListener('touchend',    () => { seeking = false; });
 $('seekbar').addEventListener('input', () => {
   const pct = $('seekbar').value / 10;
   $('seekbar').style.setProperty('--val', pct + '%');
-  updSk();
-  if (!v.duration) return;
-  trySeek((pct / 100) * v.duration);
+});
+$('seekbar').addEventListener('change', () => {
+  const pct = $('seekbar').value / 10;
+  $('seekbar').style.setProperty('--val', pct + '%');
+  seeking = false;
+  const dur = fullDur || v.duration;
+  if (!dur || !isFinite(dur)) return;
+  const target = (pct / 100) * dur;
+  if (target < 0.1) { v.currentTime = 0; return; }
+  seekTo(target);
 });
 
-/* ---------- seek gating ----------
- * Never let the <video> element issue a request for an undownloaded piece:
- * any HTTP error status (416, 503, …) permanently kills the media source in
- * Firefox. So before actually seeking, ask the server with a tiny 1-byte Range
- * probe. If the piece exists the server answers 206 and we jump there; if it
- * does not exist yet the server answers 503 immediately and we just show a
- * buffering icon and retry — no error, no freeze, nothing else.
- */
+/* ---------- buffering overlay ----------
+ * MSE backpressure is driven natively by the SourceBuffer:
+ * the browser fires 'waiting'/'stalled' when data isn't available
+ * and 'playing'/'canplay' when playback resumes. */
 function showBuf(txt) {
   const b = $('buf');
   b.querySelector('span').textContent = txt || 'Buffering…';
@@ -868,75 +1057,14 @@ function showBuf(txt) {
 }
 function hideBuf() { $('buf').hidden = true; }
 
-async function pieceIsReady(time, dur, size) {
-  const byte = Math.min(Math.max(0, Math.floor((time / dur) * size)), size - 1);
-  try {
-    const r = await fetch('/stream/' + currentId, {
-      headers: { Range: 'bytes=' + byte + '-' + byte },
-    });
-    const body = r.body;
-    if (body) { try { await body.getReader().cancel(); } catch (e) {} }
-    // Only a missing piece returns 503 (buffering). Everything else (206 from
-    // the torrent stream, 200/206 from disk or the remux pipe) means the seek
-    // is safe — the browser's own request won't hit an error status.
-    return r.status !== 503;
-  } catch (e) {
-    return false;
-  }
-}
-
-async function trySeek(t) {
-  const gen = ++seekGen;
-  const it = items.find(i => i.id === currentId);
-  if (!it || !v.duration || !isFinite(v.duration)) return;
-  t = Math.min(Math.max(t, 0), v.duration - 0.05);
-  const size = it.size_bytes;
-  if (it.state === 'ready' || !size) {
-    pendingSeek = null;
-    hideBuf();
-    v.currentTime = t;
-    return;
-  }
-  if (await pieceIsReady(t, v.duration, size)) {
-    if (gen !== seekGen) return; // stale probe, a newer seek won
-    pendingSeek = null;
-    hideBuf();
-    v.currentTime = t;
-  } else {
-    if (gen !== seekGen) return; // stale probe, a newer seek won
-    pendingSeek = t;
-    showBuf('Buffering…');
-    if (!v.paused) v.pause(); // freeze at current playhead; thumb stays at target
-  }
-}
-
-async function retryPendingSeek() {
-  if (pendingSeek === null) return;
-  const it = items.find(i => i.id === currentId);
-  if (!it || !v.duration) return;
-  const size = it.size_bytes;
-  if (it.state === 'ready' || !size) { trySeek(pendingSeek); return; }
-  const gen = ++seekGen;
-  if (await pieceIsReady(pendingSeek, v.duration, size)) {
-    if (gen !== seekGen) return;
-    const t = pendingSeek;
-    pendingSeek = null;
-    v.currentTime = t;
-    hideBuf();
-    v.play().catch(() => {});
-  }
-}
-
-v.addEventListener('seeking', () => {
-  if (pendingSeek === null) hideBuf();
+v.addEventListener('seeking',  () => hideBuf());
+v.addEventListener('playing',  () => hideBuf());
+v.addEventListener('canplay',  () => hideBuf());
+v.addEventListener('waiting',  () => showBuf('Buffering…'));
+v.addEventListener('stalled',  () => showBuf('Buffering…'));
+v.addEventListener('loadedmetadata', () => {
+  if (v.duration && isFinite(v.duration) && (!fullDur || v.duration > fullDur)) fullDur = v.duration;
 });
-v.addEventListener('playing', () => { if (pendingSeek === null) hideBuf(); });
-v.addEventListener('seeked', () => { pendingSeek = null; hideBuf(); });
-// Native stall: the browser buffered into a piece that's still downloading,
-// so the server body hangs. Show the buffering overlay until data flows.
-v.addEventListener('waiting', () => { showBuf('Buffering…'); });
-v.addEventListener('stalled', () => { showBuf('Buffering…'); });
-v.addEventListener('canplay', () => { if (pendingSeek === null) hideBuf(); });
 
 function updVol() {
   const vol = Math.round((v.volume || 0) * 100);
@@ -1048,7 +1176,6 @@ updVol();
 refreshLibrary();
 setInterval(pollDownloads, 1000);
 setInterval(refreshLibrary, 3000);
-setInterval(retryPendingSeek, 1000);
 </script>
 </body>
 </html>

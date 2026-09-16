@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use librqbit::{
     api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, BitV, BitVFactory,
-    DhtSessionConfig, ManagedTorrent, Session, SessionOptions, TorrentMetadata, TorrentStats, BF,
+    DhtSessionConfig, ManagedTorrent, Session, SessionOptions, TorrentStats, BF,
 };
 use tokio::sync::RwLock;
 use tracing::info;
@@ -209,11 +209,6 @@ impl TorrentEngine {
     pub async fn get_stats(&self, library_id: i64) -> Option<TorrentStats> {
         let handle = self.get_torrent(library_id).await?;
         Some(handle.stats())
-    }
-
-    pub async fn get_metadata(&self, library_id: i64) -> Option<Arc<TorrentMetadata>> {
-        let handle = self.get_torrent(library_id).await?;
-        handle.with_metadata(|m| m.clone()).ok()
     }
 
     pub async fn pause_torrent(&self, library_id: i64) -> Result<()> {

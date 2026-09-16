@@ -4,22 +4,21 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::info;
+use tracing::warn;
 
+use crate::db::LibraryItem;
 use crate::error::{Error, Result};
 use crate::library::{find_largest_video_in, LibraryManager};
 use crate::metadata::TmdbClient;
 use crate::remux::Remuxer;
-
-#[allow(dead_code)]
-const RANGE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 pub struct AddItemRequest {
@@ -36,6 +35,12 @@ pub struct AddItemRequest {
 #[derive(Deserialize)]
 pub struct SetSequentialRequest {
     sequential: bool,
+}
+
+/// Query params for `GET /mse/{id}`: optional seek in seconds.
+#[derive(Deserialize, Default)]
+pub struct MseQuery {
+    t: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -78,7 +83,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/{id}/pause", post(pause_item))
         .route("/api/library/{id}/resume", post(resume_item))
         .route("/api/library/{id}/sequential", post(set_sequential))
-        .route("/stream/{id}", get(stream_handler))
+        .route("/mse/{id}", get(mse_handler))
+        .route("/api/library/{id}/codecs", get(mse_codecs))
         .route("/ws/torrent/{id}", get(ws_handler))
         .with_state(state)
 }
@@ -244,7 +250,24 @@ async fn list_items(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse> {
     let items = state.library.list_items().await?;
-    Ok(Json(items))
+    let with_flag = items
+        .into_iter()
+        .map(item_json_with_mse)
+        .collect::<Vec<_>>();
+    Ok(Json(with_flag))
+}
+
+/// Every playable item is served through the MSE endpoint (fragmented MP4
+/// regardless of the source container). The flag is a convenience for the
+/// frontend to pick the MSE player vs the plain `<video>` fallback.
+fn item_json_with_mse(it: LibraryItem) -> serde_json::Value {
+    let playable = matches!(
+        it.state.as_str(),
+        "ready" | "downloading" | "paused" | "stopped"
+    );
+    let mut v = serde_json::to_value(it).unwrap_or_else(|_| json!({}));
+    v["mse"] = json!(playable);
+    v
 }
 
 async fn delete_item(
@@ -308,65 +331,56 @@ async fn set_sequential(
     Ok(Json(json!({ "success": true })))
 }
 
-fn parse_range(range: Option<&str>, file_size: u64) -> (u64, u64) {
-    let Some(range) = range else {
-        return (0, file_size.saturating_sub(1));
-    };
-    let range = range.trim();
-    if let Some(suffix) = range.strip_prefix("bytes=") {
-        if let Some((start_str, end_str)) = suffix.split_once('-') {
-            if start_str.is_empty() {
-                if let Ok(suffix_len) = end_str.trim().parse::<u64>() {
-                    if suffix_len == 0 {
-                        return (0, file_size.saturating_sub(1));
-                    }
-                    let start = file_size.saturating_sub(suffix_len);
-                    return (start, file_size.saturating_sub(1));
-                }
-                return (0, file_size.saturating_sub(1));
-            }
-            if let Ok(start) = start_str.trim().parse::<u64>() {
-                if start >= file_size {
-                    return (0, file_size.saturating_sub(1));
-                }
-                let end = if end_str.is_empty() {
-                    file_size.saturating_sub(1)
-                } else {
-                    end_str
-                        .trim()
-                        .parse::<u64>()
-                        .map(|e| e.min(file_size.saturating_sub(1)))
-                        .unwrap_or(file_size.saturating_sub(1))
-                };
-                return (start, end);
-            }
+/// Resolve the (file_id, size) of the largest video file inside a torrent
+/// from its metadata. Mirrors `stream_handler`'s on-disk scan for the
+/// engine-side stream.
+fn best_video_file_id(
+    handle: &librqbit::ManagedTorrent,
+) -> Option<(usize, u64)> {
+    let metadata = handle.with_metadata(|m| m.clone()).ok()?;
+    let mut best: Option<(usize, u64)> = None;
+    let mut best_size: u64 = 0;
+    for (i, fi) in metadata.file_infos.iter().enumerate() {
+        let name = fi.relative_filename.to_string_lossy();
+        let ext = PathBuf::from(name.as_ref())
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_video = [
+            "mp4", "m4v", "mkv", "avi", "webm", "mov", "ts",
+            "flv", "wmv", "mpg", "mpeg", "vob",
+        ]
+        .contains(&ext.as_str());
+        if is_video && fi.len > best_size {
+            best_size = fi.len;
+            best = Some((i, fi.len));
         }
     }
-    (0, file_size.saturating_sub(1))
+    best
 }
 
-fn mime_for(path: &std::path::Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp4")
-        .to_lowercase()
-        .as_str()
-    {
-        "mkv" => "video/x-matroska",
-        "webm" => "video/webm",
-        "avi" => "video/x-msvideo",
-        "ts" => "video/mp2t",
-        "flv" => "video/x-flv",
-        "wmv" => "video/x-ms-wmv",
-        _ => "video/mp4",
-    }
-}
-
-async fn stream_handler(
+/// Progressive streaming endpoint for the MSE blob player.
+///
+/// The server runs ffmpeg with `-c copy` (container only — it never decodes,
+/// re-encodes, or reorders; the browser does all decoding). Output is
+/// fragmented MP4 so the browser can `appendBuffer` it piece by piece.
+///
+/// Two backing sources:
+///   - a finished file on disk (ffmpeg reads the path directly), or
+///   - a still-downloading torrent's `FileStream` fed to ffmpeg's stdin
+///     (ffmpeg consumes exactly the bytes that exist; when a piece isn't
+///     downloaded yet nothing flows — there's no hang, no error, the client
+///     just shows its buffering spinner until bytes arrive).
+///
+/// Buffering protocol is entirely driven by what ffmpeg is able to emit:
+/// the moment the head of the file isn't available we return 503 with a short
+/// retry window so the client reconnects after a moment instead of holding a
+/// dead connection.
+async fn mse_handler(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    headers: HeaderMap,
+    Query(params): Query<MseQuery>,
 ) -> Result<Response> {
     let item = state
         .library
@@ -374,71 +388,37 @@ async fn stream_handler(
         .get_item(id)?
         .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
 
-    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
-
-    // 1) If kept and local file exists, serve from disk directly
+    // 1) Finished file on disk.
     if let Some(file_path) = item.file_path.as_ref() {
         if item.state == "ready" {
-            let pb = PathBuf::from(file_path);
-            if let Some(full) = find_largest_video_in(&pb) {
-                let needs_remux = Remuxer::needs_remux(&full.to_string_lossy())
-                    || Remuxer::probe_needs_remux(&full.to_string_lossy())
-                        .await;
-                if needs_remux {
-                    return serve_remux(&full, range_header).await;
-                }
-                return serve_local_file(&full, range_header).await;
+            let dir = PathBuf::from(file_path);
+            if let Some(full) = find_largest_video_in(&dir) {
+                return serve_mse_from_file(&full, params.t).await;
             }
         }
     }
 
-    // 2) Try streaming from torrent engine (partial or complete)
+    // 2) Live torrent stream.
     if let Some(handle) = state.library.engine.get_torrent(id).await {
-        let output_folder = handle.output_folder().to_path_buf();
-        if let Some(full_path) = find_largest_video_in(&output_folder) {
-            let needs_remux = Remuxer::needs_remux(&full_path.to_string_lossy())
-                || Remuxer::probe_needs_remux(&full_path.to_string_lossy())
-                    .await;
-
-            if needs_remux {
-                return serve_remux(&full_path, range_header).await;
-            }
-
-            // Try to find the file_id in metadata for FileStream streaming
-            if let Some(metadata) = state.library.engine.get_metadata(id).await {
-                let mut best_file_id: Option<usize> = None;
-                let mut best_size: u64 = 0;
-                for (i, fi) in metadata.file_infos.iter().enumerate() {
-                    let name = fi.relative_filename.to_string_lossy();
-                    let ext = PathBuf::from(name.as_ref())
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    let is_video = [
-                        "mp4", "m4v", "mkv", "avi", "webm", "mov", "ts",
-                        "flv", "wmv", "mpg", "mpeg", "vob",
-                    ]
-                    .contains(&ext.as_str());
-                    if is_video && fi.len > best_size {
-                        best_size = fi.len;
-                        best_file_id = Some(i);
-                    }
+        if let Some((file_id, _size)) = best_video_file_id(&handle) {
+            // If even the first byte isn't there, say so immediately instead
+            // of holding the connection: the client shows buffering and
+            // retries in a moment.
+            match handle.is_file_byte_ready(file_id, 0) {
+                Ok(true) => {
+                    return serve_mse_from_stream(handle, file_id, params.t).await;
                 }
-
-                if let Some(file_id) = best_file_id {
-                    return serve_from_torrent_stream(
-                        handle.clone(),
-                        file_id,
-                        best_size,
-                        range_header,
-                    )
-                    .await;
+                Ok(false) => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header(header::RETRY_AFTER, "2")
+                        .body(Body::from("buffering"))
+                        .unwrap());
+                }
+                Err(e) => {
+                    warn!("is_file_byte_ready check failed: {e}");
                 }
             }
-
-            // Fallback: serve from the file on disk with wait-and-retry
-            return serve_file_with_wait(&full_path, range_header).await;
         }
     }
 
@@ -447,48 +427,67 @@ async fn stream_handler(
     )))
 }
 
-async fn serve_local_file(
-    path: &PathBuf,
-    range_header: Option<&str>,
-) -> Result<Response> {
-    let file = tokio::fs::File::open(path).await?;
-    let size = file.metadata().await?.len();
-    let (start, end) = parse_range(range_header, size);
-    let content_range = format!("bytes {start}-{end}/{size}");
-    let content_length = end - start + 1;
-    let mut file = file;
-    use tokio::io::AsyncSeekExt;
-    if start > 0 {
-        file.seek(std::io::SeekFrom::Start(start)).await?;
+/// Return the `SourceBuffer` MIME string the MSE player needs, e.g.
+/// `video/mp4; codecs="avc1.640028,mp4a.40.2"`. Codec metadata comes from
+/// ffprobe on the same source the `/mse` endpoint serves.
+async fn mse_codecs(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    let item = state
+        .library
+        .db
+        .get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+
+    // Finished file on disk.
+    if let Some(file_path) = item.file_path.as_ref() {
+        if item.state == "ready" {
+            let dir = PathBuf::from(file_path);
+            if let Some(full) = find_largest_video_in(&dir) {
+                let mime = Remuxer::probe_mse_mime(&full.to_string_lossy()).await;
+                let duration = Remuxer::probe_mse_duration(&full.to_string_lossy()).await;
+                return Ok(Json(json!({ "mime": mime, "duration": duration })));
+            }
+        }
     }
-    let stream = tokio_util::io::ReaderStream::with_capacity(file, 128 * 1024);
-    let body = Body::from_stream(stream);
-    let mime = mime_for(path);
-    Ok(Response::builder()
-        .status(StatusCode::PARTIAL_CONTENT)
-        .header(header::CONTENT_RANGE, content_range)
-        .header(header::CONTENT_LENGTH, content_length)
-        .header(header::CONTENT_TYPE, mime)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .body(body)
-        .unwrap())
+
+    // Torrent stream: probe the on-disk partial file (may not have its head
+    // yet — the client just retries; fallback MIME is a safe generic).
+    if let Some(handle) = state.library.engine.get_torrent(id).await {
+        if let Some((file_id, _size)) = best_video_file_id(&handle) {
+            let name = handle
+                .with_metadata(|m| {
+                    m.file_infos
+                        .get(file_id)
+                        .map(|fi| fi.relative_filename.to_string_lossy().to_string())
+                })
+                .ok()
+                .flatten();
+            if let Some(fname) = name {
+                let path = handle.output_folder().join(fname);
+                if path.exists() {
+                    let mime = Remuxer::probe_mse_mime(&path.to_string_lossy()).await;
+                    let duration = Remuxer::probe_mse_duration(&path.to_string_lossy()).await;
+                    return Ok(Json(json!({ "mime": mime, "duration": duration })));
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({ "mime": "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"", "duration": null })))
 }
 
-async fn serve_remux(
-    input_path: &PathBuf,
-    _range_header: Option<&str>,
-) -> Result<Response> {
-    let input_str = input_path.to_string_lossy().to_string();
-    let mut child = Remuxer::start_remux(&input_str)
+async fn serve_mse_from_file(path: &PathBuf, seek_sec: Option<f64>) -> Result<Response> {
+    let input_str = path.to_string_lossy().to_string();
+    let mut child = Remuxer::start_remux(&input_str, seek_sec)
         .await
         .map_err(|e| Error::Internal(format!("ffmpeg failed: {e}")))?;
-    info!("Remux started for {:?}", input_path);
+    info!("MSE remux started for {:?}", path);
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| Error::Internal("no stdout from ffmpeg".into()))?;
-    // Keep the child alive for as long as we're reading from its stdout;
-    // dropping it early (client disconnect / stream end) kills ffmpeg.
     let task = RemuxTask { _child: child, reader: stdout };
     let stream = tokio_util::io::ReaderStream::with_capacity(task, 64 * 1024);
     let body = Body::from_stream(stream);
@@ -499,8 +498,70 @@ async fn serve_remux(
         .unwrap())
 }
 
-/// Wraps an ffmpeg child plus its piped stdout so the two are dropped
-/// (and ffmpeg killed) together when the streaming body is finished.
+/// Feed a live `FileStream` into ffmpeg's stdin so ffmpeg only ever sees the
+/// bytes that actually exist. Attach the writer to the child so dropping the
+/// body kills both the feed task and ffmpeg together.
+async fn serve_mse_from_stream(
+    handle: Arc<librqbit::ManagedTorrent>,
+    file_id: usize,
+    seek_sec: Option<f64>,
+) -> Result<Response> {
+    let name = handle.name().unwrap_or_else(|| "torrent".to_string());
+    let mut child = Remuxer::start_remux_from_stream(&name, seek_sec)
+        .await
+        .map_err(|e| Error::Internal(format!("ffmpeg failed: {e}")))?;
+    let writer = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Internal("no stdin on ffmpeg".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Internal("no stdout from ffmpeg".into()))?;
+
+    let mut file_stream = handle
+        .clone()
+        .stream(file_id)
+        .await
+        .map_err(|e| Error::Torrent(format!("failed to open stream: {e}")))?;
+
+    // Copy FileStream -> ffmpeg stdin. FileStream returns Pending until the
+    // requested bytes are downloaded, so ffmpeg naturally idles while a piece
+    // is missing and resumes the moment it lands — never an error, never a hang.
+    let feed = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut writer = writer;
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            match file_stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = writer.flush().await;
+    });
+
+    let task = StreamRemuxTask {
+        _child: child,
+        feed,
+        reader: stdout,
+    };
+    let stream = tokio_util::io::ReaderStream::with_capacity(task, 64 * 1024);
+    let body = Body::from_stream(stream);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .body(body)
+        .unwrap())
+}
+
+/// Wraps an ffmpeg child piped to a byte stream so both are dropped (and
+/// ffmpeg killed) when the streaming body ends.
 struct RemuxTask {
     _child: tokio::process::Child,
     reader: tokio::process::ChildStdout,
@@ -516,82 +577,33 @@ impl tokio::io::AsyncRead for RemuxTask {
     }
 }
 
-/// Stream from librqbit's FileStream. If the piece at the requested start
-/// offset is not yet downloaded, returns 503 immediately so the client can
-/// show a buffering indicator and retry — instead of blocking the connection
-/// forever (which freezes the browser).
-async fn serve_from_torrent_stream(
-    handle: Arc<librqbit::ManagedTorrent>,
-    file_id: usize,
-    file_size: u64,
-    range_header: Option<&str>,
-) -> Result<Response> {
-    let (start, end) = parse_range(range_header, file_size);
-
-    // Quick check: is the first byte of the requested range available?
-    // If not, return 503 immediately so the client can show "buffering"
-    // and retry — never block the HTTP connection.
-    match handle.is_file_byte_ready(file_id, start) {
-        Ok(false) => {
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header(header::RETRY_AFTER, "2")
-                .body(Body::from("buffering"))
-                .unwrap());
-        }
-        Err(e) => {
-            tracing::warn!("is_file_byte_ready check failed: {e}");
-        }
-        _ => {}
-    }
-
-    let content_length = end - start + 1;
-    let content_range = format!("bytes {start}-{end}/{file_size}");
-
-    let mut file_stream = handle
-        .clone()
-        .stream(file_id)
-        .await
-        .map_err(|e| Error::Torrent(format!("failed to open stream: {e}")))?;
-
-    use tokio::io::AsyncSeekExt;
-    file_stream.seek(std::io::SeekFrom::Start(start)).await?;
-
-    let limited = tokio::io::AsyncReadExt::take(file_stream, content_length);
-    let stream = tokio_util::io::ReaderStream::with_capacity(limited, 128 * 1024);
-    let body = Body::from_stream(stream);
-    Ok(Response::builder()
-        .status(StatusCode::PARTIAL_CONTENT)
-        .header(header::CONTENT_RANGE, content_range)
-        .header(header::CONTENT_LENGTH, content_length)
-        .header(header::CONTENT_TYPE, "video/mp4")
-        .header(header::ACCEPT_RANGES, "bytes")
-        .body(body)
-        .unwrap())
+/// Like `RemuxTask` but also owns the stdin-feed task, so when the body is
+/// dropped the feed is aborted and ffmpeg is killed.
+struct StreamRemuxTask {
+    _child: tokio::process::Child,
+    feed: tokio::task::JoinHandle<()>,
+    reader: tokio::process::ChildStdout,
 }
 
-/// For files on disk from a torrent (may be growing), wait for the data to
-/// become available, with a bounded number of attempts.
-async fn serve_file_with_wait(
-    path: &PathBuf,
-    range_header: Option<&str>,
-) -> Result<Response> {
-    for _ in 0..60 {
-        if let Ok(file) = tokio::fs::File::open(path).await {
-            if let Ok(size) = file.metadata().await.map(|m| m.len()) {
-                if size == 0 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-                let (_start, end) = parse_range(range_header, size);
-                if end < size {
-                    return serve_local_file(path, range_header).await;
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+impl Drop for StreamRemuxTask {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle only detaches the task; the feed can be
+        // stuck inside FileStream.read() (Pending) while holding a
+        // BlockingSpawner semaphore permit.  Aborting the task cancels
+        // it at the next await point, dropping the FileStream and
+        // releasing the permit so the next `stream()` call can proceed.
+        self.feed.abort();
     }
-    serve_local_file(path, range_header).await
+}
+
+impl tokio::io::AsyncRead for StreamRemuxTask {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.reader).poll_read(cx, buf)
+    }
 }
 
 // ---- WebSocket handler ----
@@ -642,42 +654,6 @@ async fn handle_ws(mut socket: WebSocket, state: AppState, id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn test_parse_range_no_range() {
-        assert_eq!(parse_range(None, 1000), (0, 999));
-    }
-
-    #[test]
-    fn test_parse_range_from_start() {
-        assert_eq!(parse_range(Some("bytes=0-"), 1000), (0, 999));
-    }
-
-    #[test]
-    fn test_parse_range_suffix() {
-        assert_eq!(parse_range(Some("bytes=-500"), 1000), (500, 999));
-    }
-
-    #[test]
-    fn test_parse_range_specific() {
-        assert_eq!(parse_range(Some("bytes=100-199"), 1000), (100, 199));
-    }
-
-    #[test]
-    fn test_parse_range_invalid() {
-        assert_eq!(parse_range(Some("bytes=abc"), 1000), (0, 999));
-    }
-
-    #[test]
-    fn test_parse_range_start_past_end() {
-        assert_eq!(parse_range(Some("bytes=5000-"), 1000), (0, 999));
-    }
-
-    #[test]
-    fn test_parse_range_zero_suffix() {
-        assert_eq!(parse_range(Some("bytes=-0"), 1000), (0, 999));
-    }
 
     #[test]
     fn test_find_video_file_best_largest() {
@@ -707,12 +683,5 @@ mod tests {
         assert!(result.is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn test_mime_for() {
-        assert_eq!(mime_for(&PathBuf::from("x.mp4")), "video/mp4");
-        assert_eq!(mime_for(&PathBuf::from("x.mkv")), "video/x-matroska");
-        assert_eq!(mime_for(&PathBuf::from("x.xyz")), "video/mp4");
     }
 }
