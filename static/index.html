@@ -136,6 +136,8 @@
   .pb { cursor: pointer; padding: 0; width: 32px; height: 32px; background: none; border: none;
         flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
   .pb svg { width: 16px; height: 16px; fill: #fff; }
+  .tm { color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap;
+        flex-shrink: 0; letter-spacing: .3px; }
   .seek { flex: 1; height: 5px; min-width: 0; appearance: none; -webkit-appearance: none;
           background-color: rgba(255,255,255,.15); border-radius: 2px;
           cursor: pointer; border: none; outline: none; }
@@ -195,6 +197,7 @@
         <button class="pb" id="ppbtn" title="Play / Pause">
           <svg id="ppicon" viewBox="0 0 16 16"><polygon id="ppshape" points="3,1 13,8 3,15"/></svg>
         </button>
+        <div class="tm" id="tm">0:00 / 0:00</div>
         <div class="skwrap"><input class="seek" id="seekbar" type="range" min="0" max="1000" value="0"></div>
         <div class="sv">
           <svg id="vicon" viewBox="0 0 16 16"><polygon points="0,5 0,11 3,11 6,14 6,2 3,5"/></svg>
@@ -980,6 +983,7 @@ function updSeek() {
   const pct = (global / dur) * 100;
   el.value = Math.round(pct * 10);
   el.style.setProperty('--val', pct.toFixed(2) + '%');
+  $('tm').textContent = fmtClock(global) + ' / ' + fmtClock(dur);
   updSk();
 }
 
@@ -1127,6 +1131,16 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ---------- misc ---------- */
+function fmtClock(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+  const ss = String(s).padStart(2, '0');
+  return (h > 0 ? h + ':' : '') + mm + ':' + ss;
+}
+
 function fmtBytes(b) {
   if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
   if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';

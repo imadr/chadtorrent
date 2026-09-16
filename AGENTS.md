@@ -1,5 +1,15 @@
 # AGENTS.md
 
+## How to answer the user (read first — this takes priority over tone elsewhere)
+
+- Answer the **literal question asked**. Nothing adjacent, nothing extra.
+- Answer **from context you already have**. If the answer is in this file, in an earlier command you ran, or in code you've already read, do NOT re-investigate. Do not run a search or a verification step you don't need. Reach for tools only when the answer genuinely isn't knowable from what you have.
+- Be **fast and brief**. A one-fact question gets a one-fact answer, then stop.
+- Do NOT answer questions adjacent to the one asked (audibility, implications, "you could fix this", considerations the user didn't raise). If the user wants a fix, they'll ask for one.
+- Do NOT open with apologies, self-criticism, or "you're right" meta-commentary. If you got something wrong, state the correct answer plainly.
+- Do NOT explain your reasoning for a short answer. Do not pad with summaries of actions that were self-explanatory.
+- The user is direct and expects the same. Every extra sentence is noise.
+
 ## What this is
 
 Single-binary self-hosted torrent streamer: paste a magnet link (or search via indexer) → torrent downloads to `library_dir/{id}` → streams to browser via MediaSource Extensions. Built on vendored librqbit (local DHT-only, no trackers/DHT persistence; our SQLite is the source of truth). Nothing is ever re-encoded: ffmpeg only rewraps containers to fragmented MP4 (`-c copy`); the browser does all decoding.
