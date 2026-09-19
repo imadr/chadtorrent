@@ -331,8 +331,7 @@ const v = $('player');
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, pollBusy = 0, dlState = {};
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
-let segAbort = null, segMs = null, segBlobUrl = null, segSb = null, segGen = 0, fullDur = 0, segInfo = null;
-let segAppended = new Set(), segEosDone = false;
+let fullDur = 0; // declared here; player session state lives with the player below
 var libSel = -1, mvSelIdx = -1;
 
 const TMDB_IMG = 'https://image.tmdb.org/t/p';
@@ -983,10 +982,31 @@ async function startSegSession() {
     await segSleep(500);
   }
   if (gen !== segGen) return;
+  // Fragmented MP4 has no embedded duration (it stays Infinity until
+  // endOfStream) and Firefox clamps currentTime writes to the seekable range
+  // — so pin the duration from the manifest, or mid-movie seeks silently
+  // snap back to the buffered edge.
+  if (fullDur) { try { segMs.duration = fullDur; } catch (e) {} }
 
-  manifestPoller(gen, id);
-  pumpLoop(gen, id);
+  // Fire-and-forget, but never silently: a rejected pump/poller is a real
+  // playback failure and must surface (an unhandled rejection would stall
+  // invisibly at 'Loading…').
+  manifestPoller(gen, id).catch(e => segFatal(e));
+  pumpLoop(gen, id).catch(e => segFatal(e));
 }
+
+// Debug hook: inspect live session state from the console.
+window.__seg = () => ({
+  gen: segGen, segInfo, appended: [...segAppended],
+  sbUpdating: segSb && segSb.updating,
+  sbErr: segSb && segSb.error && segSb.error.name,
+  msReady: segMs && segMs.readyState,
+  vErr: v.error && (v.error.code + ' ' + v.error.message),
+  vBufLen: v.buffered && v.buffered.length,
+  sbBufLen: segSb && segSb.buffered && segSb.buffered.length,
+  sbBuf: (() => { try { const b = segSb && segSb.buffered; return b && b.length ? [b.start(0), b.end(b.length-1)] : null; } catch (e) { return 'err'; } })(),
+  vPaused: v.paused, vTime: v.currentTime,
+});
 
 async function manifestPoller(gen, id) {
   while (gen === segGen) {
@@ -1002,6 +1022,10 @@ async function manifestPoller(gen, id) {
     if (segInfo) {
       segInfo.done = !!info.done;
       for (const s of info.segments) segInfo.segs.set(s.n, s.t);
+    }
+    if (!fullDur && info.duration && isFinite(info.duration)) {
+      fullDur = info.duration;
+      if (segMs) { try { segMs.duration = fullDur; } catch (e) {} }
     }
   }
 }
@@ -1025,7 +1049,7 @@ async function pumpLoop(gen, id) {
     let appended = false;
     for (const [n] of want) {
       if (gen !== segGen) return;
-      const buf = await fetchSegBuf(id, 'seg-' + n);
+      const buf = await fetchSegBuf(id, 'seg/' + n);
       if (gen !== segGen) return;
       if (buf === null) break; // vanished? treat as frontier, poller refills
       try {
