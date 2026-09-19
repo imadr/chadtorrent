@@ -22,7 +22,8 @@ src/
   torrent.rs     TorrentEngine: wraps librqbit Session + ManagedTorrent map
   library.rs     LibraryManager: orchestrates DB + TorrentEngine + file paths
   http.rs        Axum server: REST routes + WS status + streaming + remux
-  remux.rs       ffmpeg any-container → fragmented MP4 remux via pipe (`-c copy`, no re-encoding) + MSE codec probing
+  remux.rs       ffprobe helpers: SourceBuffer MIME (AAC profile-aware) + duration
+  segmenter.rs   segment pipeline: ffmpeg `-c copy` → init.mp4 + seg-N.m4s on disk (per item), manifest state
   metadata.rs    TMDB API client (search + detail fetch)
   error.rs       Error types mapping to HTTP status codes
   lib.rs         Module re-exports
@@ -40,9 +41,9 @@ tests/
 
 2. **Download**: librqbit downloads sequentially to `library_dir/{id}/`. State flows `connecting → downloading → ready`. On failure: `error`.
 
-3. **Stream** (`GET /mse/:id`): server always runs ffmpeg with `-c copy` to fragmented MP4 on stdout, which the browser appends to a MSE `SourceBuffer` via a blob URL. Two sources: finished file on disk (ffmpeg reads the path) or a still-downloading torrent's librqbit `FileStream` fed to ffmpeg's stdin. If even byte 0 isn't ready the server answers `503` immediately; ffmpeg consumes exactly the bytes that exist, so a missing piece just pauses the pipe (no hang, no error) and the frontend's `waiting`/`stalled` events show the spinner until data flows. Codec MIME (`/api/library/:id/codecs`) is probed via ffprobe so `addSourceBuffer(msmime)` succeeds; that endpoint also returns `duration` so the seekbar works before first decode metadata.
+3. **Stream** (segment pipeline, one path for every item state): `GET /api/library/:id/stream` returns the manifest `{mime, duration, done, error, state, segments:[{n,t}]}` and lazily starts a per-item **segmenter** (`src/segmenter.rs`): ffmpeg `-c copy` (no re-encode) produces an interleaved fragmented-MP4 byte stream which the splitter writes as `library_dir/{id}/.seg/init.mp4` + `seg-N.m4s` (~10-20s each, keyframe-aligned via `frag_keyframe`). Sources: finished file → ffmpeg reads the path (whole movie segmented in seconds, cached); downloading torrent → ffmpeg reads the librqbit `FileStream` via stdin, which blocks exactly at the download frontier, so segments appear as pieces land. The client (`static/index.html`) polls the manifest, appends `init` then segments into one MSE `SourceBuffer` (blob URL), keeping ~60s ahead / 30s behind the playhead, and calls `ms.endOfStream()` once everything is appended. There is exactly one session per playback — no reconnects, no 0-based seek sessions. Segment times are read from the **video track's** tfdt (per-track timescales differ — never take min across trafs). The declared MIME **must match the actual stream**: HE-AAC → `mp4a.40.5`, AAC-LC → `mp4a.40.2` — Firefox wedges on a mismatch (browser A/B test); `probe_mse_mime` returns `None` instead of guessing when ffprobe can't see the codecs yet. `ms.duration` is pinned from the manifest (fragmented streams have no embedded duration; without it Firefox clamps seeks to the buffered range).
 
-4. **Seek** (`?t=<seconds>` on `/mse/:id`): ffmpeg's fragmented-MP4 muxer always rebases timestamps to 0 (verified — `-copyts`/`-ss` ordering, `-avoid_negative_ts disabled` etc. all produce first PTS 0), so each seek is a *fresh 0-based MSE session*. The frontend tracks `mseOff` (the movie-time at which the session started): seekbar position = `mseOff + v.currentTime`, and `seekTo(globalT)` maps to session-local `local = globalT - mseOff`. If `local` falls inside the SourceBuffer's buffered ranges (within ±0.5s) it does a native `v.currentTime` seek; otherwise it tears down and reconnects with `?t=globalT`. Reconnects also happen automatically if byte 0 isn't ready.
+4. **Seek**: `seekTo(t)` is just `v.currentTime = t` — instant when buffered (ready files: ~60-120ms to first frame, measured both directions); past the buffer the segment pump fetches the segment containing `t` (selection = segments *overlapping* the window, not just starting inside it) and playback resumes when it lands. While still downloading, a seek past the frontier simply waits for the sequential download to reach it — the overlay shows real download speed from the WS status; no piece-reprioritization tricks, no 503 path anymore.
 
 5. **Delete** (`DELETE /api/library/:id`): removes the row, deletes `library_dir/{id}` and `temp_dir/{id}`, removes from engine. If `?hard=1`, cascades to all torrents sharing the same `tmdb_id` (movie delete).
 
@@ -59,8 +60,12 @@ tests/
 
 - `static/index.html` is embedded at compile time. Any frontend edit requires `cargo build` before it shows up in the binary.
 - Torrent registration is non-blocking (returns immediately). A row can sit in `connecting` state for seconds; the frontend shows "Adding…" during this time. The Play button is disabled until the state advances.
-
-- `librqbit` is vendored locally at `vendor/librqbit/` with a Cargo path override in `Cargo.toml`.
+- **Browser quirks (verified with the MSE harness in `docs/browser-harness/`, served same-origin at `/__test`)**:
+  - Firefox wedges or degrades when the SourceBuffer MIME's AAC profile doesn't match the stream's actual AudioSpecificConfig (HE-AAC must be declared `mp4a.40.5`). Chrome tolerates the mismatch.
+  - Firefox clamps `v.currentTime` writes to the seekable range; with fragmented MP4 the duration is Infinity until `endOfStream()` — always pin `ms.duration` from the manifest before seeking.
+  - Firefox coalesces fetch body chunks into ~16–32MB batches (Chrome delivers ~64KB slices) — never assume chunk size on the client.
+  - Never `await v.play()` inside the pump loop — the promise can fail to settle (reproduced in headless Chrome) and would stall the pump forever. Fire-and-forget it.
+- `librqbit` is vendored locally at `vendor/librqbit/` with a Cargo path override in `Cargo.toml`. Its `FileStream` implements `AsyncSeek` and each open stream drives piece priority via a 32MB lookahead window from the read position.
 
 ## Database
 
@@ -70,7 +75,7 @@ Key columns: `id, magnet, title, state, added_at, file_path, size_bytes, tmdb_id
 
 ## Test suite
 
-- **Unit tests** in `db.rs` (CRUD, migration) and `http.rs` (video file selection).
+- **Unit tests** in `db.rs` (CRUD, migration), `http.rs` (video file selection) and `segmenter.rs` (box parsing: tfdt/tkhd/mdhd).
 - **E2e tests** in `tests/e2e.rs`: no torrent downloads. Use `db.insert_item` directly, create fake files on disk, verify delete/rollback/cascade behavior, HTTP error codes.
 - Run with `cargo test -- --test-threads=1` (sequential to avoid SQLite lock contention).
 - Tests that use real torrent downloads have been intentionally removed — iteration speed was prioritized over coverage.

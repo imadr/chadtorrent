@@ -5,6 +5,7 @@ mod http;
 mod library;
 mod metadata;
 mod remux;
+mod segmenter;
 mod torrent;
 
 use std::sync::Arc;

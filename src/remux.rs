@@ -1,16 +1,16 @@
 use std::process::Stdio;
-use tokio::process::{Child, Command};
-use tracing::info;
+use tokio::process::Command;
 
 pub struct Remuxer;
 
 impl Remuxer {
     /// Build the `SourceBuffer` MIME type for a file, e.g.
-    /// `video/mp4; codecs="avc1.640028,mp4a.40.2"`. The codec/base string is
-    /// discovered with ffprobe; anything unknown falls back to generic
-    /// H.264 + AAC. The player always ends up feeding fMP4 (we remux to that
-    /// container), so this is `video/mp4` plus codec hints.
-    pub async fn probe_mse_mime(path: &str) -> String {
+    /// `video/mp4; codecs="avc1.640028,mp4a.40.5"`. Returns `None` when the
+    /// file can't be probed yet (e.g. a partial download without its moov
+    /// atom) — the caller retries later instead of caching a guess. Guessing
+    /// is dangerous: Firefox wedges on an AAC profile mismatch, so a wrong
+    /// fallback is worse than no answer.
+    pub async fn probe_mse_mime(path: &str) -> Option<String> {
         let output = Command::new("ffprobe")
             .args([
                 "-v", "error",
@@ -21,111 +21,38 @@ impl Remuxer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
-            .await;
+            .await
+            .ok()?;
 
         let mut video: Option<String> = None;
         let mut audio: Option<String> = None;
-        if let Ok(out) = output {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
-                    for st in streams {
-                        let ctype = st.get("codec_type").and_then(|v| v.as_str()).unwrap_or("");
-                        let codec = st.get("codec_name").and_then(|v| v.as_str()).unwrap_or("");
-                        match ctype {
-                            "video" if video.is_none() => {
-                                video = Some(mse_video_codec(codec, st));
-                            }
-                            "audio" if audio.is_none() => {
-                                audio = Some(mse_audio_codec(codec));
-                            }
-                            _ => {}
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+                for st in streams {
+                    let ctype = st.get("codec_type").and_then(|v| v.as_str()).unwrap_or("");
+                    let codec = st.get("codec_name").and_then(|v| v.as_str()).unwrap_or("");
+                    match ctype {
+                        "video" if video.is_none() => {
+                            video = Some(mse_video_codec(codec, st));
                         }
+                        "audio" if audio.is_none() => {
+                            audio = Some(mse_audio_codec(codec, st));
+                        }
+                        _ => {}
                     }
                 }
             }
         }
 
+        let v = video.as_deref()?;
         let mut codecs: Vec<&str> = Vec::new();
-        if let Some(v) = video.as_deref() {
-            codecs.push(v);
-        } else {
-            codecs.push("avc1.640028");
-        }
+        codecs.push(v);
         if let Some(a) = audio.as_deref() {
             codecs.push(a);
         }
-        format!("video/mp4; codecs=\"{}\"", codecs.join(","))
+        Some(format!("video/mp4; codecs=\"{}\"", codecs.join(",")))
     }
 
-    /// Start ffmpeg remuxing an *input path* (already downloaded file) to
-    /// fragmented MP4 on stdout. Container-only (`-c copy`): the codec bytes
-    /// pass through untouched; the browser does all the decoding.
-    ///
-    /// `seek_sec` (if given) seeks into the input before remuxing, so a
-    /// reconnect can resume the stream from an arbitrary time instead of
-    /// starting at byte 0.
-    pub async fn start_remux(
-        input_path: &str,
-        seek_sec: Option<f64>,
-    ) -> Result<Child, std::io::Error> {
-        info!("Starting remux: {} -> fragmented mp4", input_path);
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
-        if let Some(t) = seek_sec {
-            if t > 0.0 {
-                cmd.args(["-ss", &t.to_string()]);
-            }
-        }
-        cmd.args(["-i", input_path])
-            .args([
-                "-map", "0:v:0?",
-                "-map", "0:a:0?",
-                "-c", "copy",
-                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                "-f", "mp4",
-                "pipe:1",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-    }
-
-    /// Like `start_remux` but reads the source from a progressive byte
-    /// stream (stdin). This is how a still-downloading librqbit `FileStream`
-    /// is fed: ffmpeg consumes exactly the bytes that exist, nothing more —
-    /// if a piece isn't there yet nothing flows, there's no hang, no error.
-    ///
-    /// `seek_sec` does an input-side seek: on a non-seekable stdin ffmpeg
-    /// reads-and-discards packets until the requested time, which costs
-    /// bandwidth but is exact and keeps `-c copy` intact.
-    pub async fn start_remux_from_stream(
-        input_name: &str,
-        seek_sec: Option<f64>,
-    ) -> Result<Child, std::io::Error> {
-        info!("Starting stream remux: {} -> fragmented mp4", input_name);
-        let mut cmd = Command::new("ffmpeg");
-        cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
-        if let Some(t) = seek_sec {
-            if t > 0.0 {
-                cmd.args(["-ss", &t.to_string()]);
-            }
-        }
-        cmd.arg("-i").arg("pipe:0")
-            .args([
-                "-map", "0:v:0?",
-                "-map", "0:a:0?",
-                "-c", "copy",
-                "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-                "-f", "mp4",
-                "pipe:1",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-    }
     pub async fn probe_mse_duration(path: &str) -> Option<f64> {
         let output = Command::new("ffprobe")
             .args([
@@ -188,9 +115,19 @@ fn mse_video_codec(codec: &str, st: &serde_json::Value) -> String {
     }
 }
 
-fn mse_audio_codec(codec: &str) -> String {
+fn mse_audio_codec(codec: &str, st: &serde_json::Value) -> String {
     match codec {
-        "aac" => "mp4a.40.2".to_string(),
+        "aac" => {
+            // The declared codec string must match the AudioSpecificConfig
+            // actually carried in the stream. Firefox wedges or degrades
+            // playback when the MIME says AAC-LC (40.2) but the stream is
+            // HE-AAC (40.5) — verified with a headless A/B test.
+            let profile = st.get("profile").and_then(|v| v.as_str()).unwrap_or("");
+            match profile {
+                "HE-AAC" | "HE-AAC v2" => "mp4a.40.5".to_string(),
+                _ => "mp4a.40.2".to_string(),
+            }
+        }
         "mp3" => "mp4a.6B".to_string(),
         "opus" => "opus".to_string(),
         "flac" => "fLaC".to_string(),

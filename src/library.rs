@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::db::{Database, LibraryItem, TorrentStatus};
 use crate::error::{Error, Result};
+use crate::segmenter::SegmenterManager;
 use crate::torrent::TorrentEngine;
 
 /// Video file extensions we consider "playable".
@@ -58,6 +59,7 @@ pub struct LibraryManager {
     pub engine: Arc<TorrentEngine>,
     pub config: Config,
     pub status_tx: broadcast::Sender<StatusUpdate>,
+    pub segments: Arc<SegmenterManager>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -75,12 +77,18 @@ impl LibraryManager {
         let download_base = config.temp_dir.join("rqbit");
         let engine = Arc::new(TorrentEngine::new(download_base, db.clone()).await?);
         let (status_tx, _) = broadcast::channel(256);
+        let segments = Arc::new(SegmenterManager::new(
+            config.library_dir.clone(),
+            engine.clone(),
+            db.clone(),
+        ));
 
         let manager = Arc::new(Self {
             db,
             engine,
             config,
             status_tx,
+            segments,
         });
         manager.resume_existing_torrents().await?;
 
@@ -148,6 +156,14 @@ impl LibraryManager {
             }
         }
         self.db.update_state(id, "ready")?;
+        // Kick off background segmentation so the first play of a finished
+        // item is instant. If a stream-mode segmenter is already running for
+        // this item (user watched during download), it reaches EOF on its own
+        // and `ensure` won't double-spawn.
+        let segments = self.segments.clone();
+        tokio::spawn(async move {
+            segments.ensure(id).await;
+        });
         Ok(())
     }
 
@@ -488,12 +504,14 @@ impl LibraryManager {
             .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
 
         // Drop persisted piece progress before the engine torrent handle is
-        // removed (at which point we no longer know its info hash).
+        // removed (at which point we no longer know its info hash), and stop
+        // any running segmenter before its output dir gets deleted.
         if let Some(hash) = self.engine.info_hash_of(id).await {
             if let Err(e) = self.db.delete_pieces(&hash) {
                 warn!("Failed to drop pieces for {}: {}", id, e);
             }
         }
+        self.segments.remove(id).await;
 
         self.remove_files_of(id).await;
 
@@ -542,6 +560,7 @@ impl LibraryManager {
     pub async fn stop(&self) {
         info!("Stopping library manager...");
         self.flush_all_pieces().await;
+        self.segments.stop_all().await;
         self.engine.stop().await;
         info!("Library manager stopped");
     }

@@ -227,3 +227,91 @@ async fn movie_delete_cascades_to_attached_torrents() {
 
     library.stop().await;
 }
+/// Segment pipeline end-to-end: a finished (ready) item with a real (tiny)
+/// MP4 gets segmented by the background ffmpeg job, the manifest reports
+/// segments with sane media times, init/segments are served, unknown
+/// segments 404, and a bogus item 404s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn segment_stream_pipeline() {
+    if which_ffmpeg().is_none() {
+        eprintln!("ffmpeg not installed; skipping segment pipeline test");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(&tmp.path().join("app")).await;
+    let (http, _ws, _srv) = start_http(library.clone()).await;
+    let client = reqwest::Client::new();
+
+    // 6s 64x64 test clip (video+audio) so at least one media segment exists.
+    let id = library.db.insert_item("magnet:?xt=urn:btih:0000000000000000000000000000000000000000").unwrap();
+    let dir = tmp.path().join("app").join("library").join(id.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("clip.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-f", "lavfi", "-i", "testsrc=duration=6:size=64x64:rate=10",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest",
+            file.to_string_lossy().as_ref(),
+        ])
+        .status()
+        .expect("ffmpeg should run");
+    assert!(status.success());
+    library.db.update_file_path(id, &dir.to_string_lossy()).unwrap();
+    library.db.update_state(id, "ready").unwrap();
+
+    // Manifest: the ensure() call inside kicks off segmentation; poll until done.
+    let mut manifest = None;
+    for _ in 0..100 {
+        let resp = client
+            .get(format!("{http}/api/library/{id}/stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let m: serde_json::Value = resp.json().await.unwrap();
+        assert!(m["error"].is_null(), "segmenter error: {}", m["error"]);
+        if m["done"].as_bool() == Some(true) && m["segments"].as_array().map(|s| !s.is_empty()).unwrap_or(false) {
+            manifest = Some(m);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let manifest = manifest.expect("segmenter should finish for a 6s clip");
+    assert!(manifest["mime"].as_str().unwrap().contains("avc1"));
+    assert!(manifest["duration"].as_f64().unwrap() > 5.0);
+    let segs = manifest["segments"].as_array().unwrap();
+    assert!(!segs.is_empty());
+    assert_eq!(segs[0]["n"], 1);
+    assert!(segs[0]["t"].as_f64().unwrap() < 1.0, "first segment starts at the head");
+
+    // init + first segment serve as fMP4 with immutable caching.
+    let resp = client.get(format!("{http}/mse/{id}/init")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "video/mp4");
+    let init = resp.bytes().await.unwrap();
+    assert!(&init[4..8] == b"ftyp");
+
+    let resp = client.get(format!("{http}/mse/{id}/seg/1")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let seg = resp.bytes().await.unwrap();
+    assert!(&seg[4..8] == b"moof" || &seg[4..8] == b"sidx" || &seg[4..8] == b"styp");
+
+    // Unknown segment + unknown item -> 404.
+    let resp = client.get(format!("{http}/mse/{id}/seg/99999")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = client.get(format!("{http}/api/library/999999/stream")).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+
+    library.stop().await;
+}
+
+fn which_ffmpeg() -> Option<std::path::PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|p| p.join("ffmpeg"))
+            .find(|p| p.is_file())
+    })
+}
