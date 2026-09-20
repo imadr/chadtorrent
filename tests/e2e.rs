@@ -26,7 +26,6 @@ fn config_for(tmp: &Path) -> Config {
         library_dir: tmp.join("library"),
         temp_dir: tmp.join("temp"),
         db_path: tmp.join("test.db"),
-        tmdb_api_key: None,
     }
 }
 
@@ -38,7 +37,7 @@ async fn start_http(
     library: Arc<LibraryManager>,
 ) -> (String, String, tokio::task::AbortHandle) {
     let index_html = include_str!("../static/index.html").to_string();
-    let router = build_router(AppState { library, index_html, tmdb: None });
+    let router = build_router(AppState { library, index_html, tmdb: None, subs: None });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();

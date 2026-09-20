@@ -6,8 +6,10 @@ mod library;
 mod metadata;
 mod remux;
 mod segmenter;
+mod subtitles;
 mod torrent;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use config::Config;
@@ -69,10 +71,26 @@ async fn main() {
     };
     library.spawn_piece_flusher();
 
-    let tmdb = config
-        .tmdb_api_key
-        .clone()
-        .map(|k| Arc::new(metadata::TmdbClient::new(k)));
+    let keys = match config::ApiKeys::load_or_create(Path::new("chadtorrent.json")) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("Failed to read chadtorrent.json: {e}");
+            std::process::exit(1);
+        }
+    };
+    let tmdb = if keys.tmdb_api_key.is_empty() {
+        None
+    } else {
+        Some(Arc::new(metadata::TmdbClient::new(keys.tmdb_api_key.clone())))
+    };
+    let subs = if keys.opensubtitles_api_keys.is_empty() {
+        None
+    } else {
+        Some(Arc::new(subtitles::SubtitlesClient::new(
+            Path::new("chadtorrent.json").to_path_buf(),
+            keys.clone(),
+        )))
+    };
 
     let index_html = include_str!("../static/index.html").to_string();
 
@@ -80,6 +98,7 @@ async fn main() {
         library: library.clone(),
         index_html,
         tmdb,
+        subs,
     };
 
     let router = http::build_router(state);

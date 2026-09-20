@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::library::LibraryManager;
 use crate::metadata::TmdbClient;
 use crate::remux::Remuxer;
+use crate::subtitles::{self, SubtitlesClient};
 
 #[derive(Deserialize)]
 pub struct AddItemRequest {
@@ -53,6 +55,7 @@ pub struct AppState {
     pub library: Arc<LibraryManager>,
     pub index_html: String,
     pub tmdb: Option<Arc<TmdbClient>>,
+    pub subs: Option<Arc<SubtitlesClient>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -76,6 +79,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/{id}/resume", post(resume_item))
         .route("/api/library/{id}/sequential", post(set_sequential))
         .route("/api/library/{id}/stream", get(stream_info))
+        .route("/api/library/{id}/subs", get(subs_list))
+        .route("/api/library/{id}/subs/search", get(subs_search))
+        .route("/api/library/{id}/subs/download", post(subs_download))
+        .route("/sub/{id}/{name}", get(sub_file))
         .route("/mse/{id}/init", get(seg_init))
         .route("/mse/{id}/seg/{n}", get(seg_n))
         .route("/ws/torrent/{id}", get(ws_handler))
@@ -433,6 +440,186 @@ async fn serve_seg_file(dir: &std::path::Path, name: &str) -> Response {
             .into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+// ---- subtitles ----
+
+fn subs_dirs(state: &AppState, id: i64) -> (PathBuf, PathBuf) {
+    let item_dir = state.library.config.library_dir.join(id.to_string());
+    let subs_dir = item_dir.join(".subs");
+    (item_dir, subs_dir)
+}
+
+async fn video_info(state: &AppState, id: i64) -> Option<(PathBuf, String)> {
+    // (largest video path, query name) — file may be partial while downloading
+    let handle = state.library.engine.get_torrent(id).await;
+    if let Some(handle) = handle {
+        if let Some((_file_id, name, _size)) = state.library.engine.find_largest_video_file(id).await {
+            let path = handle.output_folder().join(&name);
+            let stem = std::path::Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or(name.clone());
+            return Some((path, stem));
+        }
+    }
+    let item = state.library.db.get_item(id).ok().flatten()?;
+    let dir = PathBuf::from(item.file_path?);
+    let full = crate::library::find_largest_video_in(&dir)?;
+    let stem = full
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Some((full, stem))
+}
+
+/// Local subtitles: everything found in the torrent folder plus anything we
+/// downloaded into `.subs/`.
+async fn subs_list(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse> {
+    state
+        .library
+        .db
+        .get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+    let (item_dir, subs_dir) = subs_dirs(&state, id);
+    let mut local = subtitles::scan_local_subs(&item_dir);
+    for mut s in subtitles::scan_local_subs(&subs_dir) {
+        s.source = "downloaded".to_string();
+        if !local.iter().any(|e| e.name == s.name) {
+            local.push(s);
+        }
+    }
+    Ok(Json(json!({
+        "configured": state.subs.is_some(),
+        "local": local,
+    })))
+}
+
+/// Search OpenSubtitles for the item's video.
+async fn subs_search(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse> {
+    let Some(subs) = state.subs.clone() else {
+        return Ok(Json(json!({ "configured": false, "results": [] })));
+    };
+    state
+        .library
+        .db
+        .get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+    let Some((video_path, stem)) = video_info(&state, id).await else {
+        return Err(Error::NotFound("no video file found for item".into()));
+    };
+    let query = stem.replace('.', " ");
+    // the hash only identifies the complete file; a partial file would hash
+    // zeros and match garbage
+    let hash = if video_path.exists() && video_path.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+        let size = video_path.metadata().map(|m| m.len()).unwrap_or(0);
+        let p = video_path.clone();
+        tokio::task::spawn_blocking(move || subtitles::movie_hash(&p, size).ok())
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
+    let results = subs
+        .search(
+            &query,
+            hash.as_ref()
+                .map(|(h, size)| (h.as_str(), *size)),
+        )
+        .await
+        .map_err(|e| Error::BadRequest(format!("subtitle search failed: {e:#}")))?;
+    Ok(Json(json!({ "configured": true, "results": results })))
+}
+
+/// Download a subtitle from OpenSubtitles, convert to VTT, store in `.subs/`.
+async fn subs_download(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse> {
+    let Some(subs) = state.subs.clone() else {
+        return Err(Error::BadRequest("opensubtitles is not configured".into()));
+    };
+    state
+        .library
+        .db
+        .get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+    let file_id = body["file_id"]
+        .as_str()
+        .ok_or_else(|| Error::BadRequest("missing file_id".into()))?
+        .to_string();
+    let (saved_name, bytes) = subs
+        .download(&file_id)
+        .await
+        .map_err(|e| Error::BadRequest(format!("subtitle download failed: {e:#}")))?;
+    let vtt = subtitles::to_vtt(&saved_name, &bytes)
+        .map_err(|e| Error::BadRequest(format!("subtitle conversion failed: {e:#}")))?;
+    let lang = subtitles::detect_lang(&saved_name, Some(&vtt));
+    let stem = std::path::Path::new(&saved_name)
+        .file_stem()
+        .map(|s| {
+            s.to_string_lossy()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "subtitle".to_string());
+    let fname = format!(
+        "{}{}.vtt",
+        lang.as_deref().map(|l| format!("{l}_")).unwrap_or_default(),
+        stem
+    );
+    let (_item_dir, subs_dir) = subs_dirs(&state, id);
+    tokio::fs::create_dir_all(&subs_dir)
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    tokio::fs::write(subs_dir.join(&fname), vtt)
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    let flag = subtitles::flag_for(lang.as_deref());
+    Ok(Json(json!({ "name": fname, "lang": lang, "flag": flag, "source": "downloaded" })))
+}
+
+/// Serve a subtitle converted to WebVTT. `name` is matched against both the
+/// `.subs/` store (already VTT) and the raw torrent folder (converted on the
+/// fly, so the original .srt is never modified).
+async fn sub_file(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(i64, String)>,
+) -> Response {
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let (item_dir, subs_dir) = subs_dirs(&state, id);
+    // downloaded: already VTT
+    if let Ok(bytes) = tokio::fs::read(subs_dir.join(&name)).await {
+        return vtt_response(bytes);
+    }
+    // torrent folder: convert to VTT on the fly
+    if let Some(path) = subtitles::resolve_sub_path(&item_dir, &name) {
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            return match subtitles::to_vtt(&name, &bytes) {
+                Ok(vtt) => vtt_response(vtt.into_bytes()),
+                Err(e) => {
+                    warn!("subtitle conversion failed for {name}: {e:#}");
+                    StatusCode::UNPROCESSABLE_ENTITY.into_response()
+                }
+            };
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn vtt_response(bytes: Vec<u8>) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 // ---- WebSocket handler ----

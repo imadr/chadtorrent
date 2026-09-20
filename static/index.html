@@ -201,6 +201,22 @@
           appearance: none; -webkit-appearance: none; height: 0; width: 0;
           background: transparent; border: none; cursor: pointer; }
   .sv { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+  .subwrap { position: relative; }
+  .subpanel { position: absolute; bottom: calc(100% + 12px); right: -10px; width: 400px; max-width: 82vw;
+              max-height: 55vh; overflow: auto; background: rgba(8,8,8,.95); border: 1px solid rgba(255,255,255,.25);
+              padding: 10px 12px; display: none; z-index: 20; }
+  .subpanel.open { display: block; }
+  .subpanel h4 { margin: 8px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
+                 color: var(--muted); font-weight: 600; }
+  .subpanel h4:first-child { margin-top: 0; }
+  .subrow { display: flex; align-items: center; gap: 10px; padding: 6px 8px; cursor: pointer; font-size: 13px;
+            color: var(--text); border: 1px solid transparent; }
+  .subrow:hover { background: var(--panel2); }
+  .subrow.active { border-color: var(--accent); background: var(--panel2); }
+  .subrow .flag { font-size: 16px; flex-shrink: 0; }
+  .subrow .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .subrow .dl { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+  .subpanel .empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
   .sv svg { width: 16px; height: 16px; stroke: #fff; stroke-width: 2; fill: none;
             stroke-linecap: round; stroke-linejoin: round; }
   .vl { width: 70px; height: 5px; appearance: none; -webkit-appearance: none;
@@ -258,6 +274,12 @@
         <div class="sv">
           <svg id="vicon" viewBox="0 0 24 24"><use href="#ic-vol-hi"/></svg>
           <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
+          <div class="subwrap">
+            <button class="pb" id="subsbtn" title="Subtitles">
+              <svg viewBox="0 0 24 24"><use href="#ic-subs"/></svg>
+            </button>
+            <div class="subpanel" id="subpanel"></div>
+          </div>
           <button class="pb" id="fsbtn" title="Fullscreen">
             <svg id="fsicon" viewBox="0 0 24 24"><use href="#ic-maximize"/></svg>
           </button>
@@ -333,6 +355,7 @@
   <symbol id="ic-vol-hi" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M15 8a5 5 0 0 1 0 8"/><path d="M17.7 5a9 9 0 0 1 0 14"/></symbol>
   <symbol id="ic-vol-lo" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M15 8a5 5 0 0 1 0 8"/></symbol>
   <symbol id="ic-vol-mute" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M17 9l4 4"/><path d="M21 9l-4 4"/></symbol>
+  <symbol id="ic-subs" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="0"/><path d="M7 15h4M13 15h4M7 11h10"/></symbol>
   <symbol id="ic-maximize" viewBox="0 0 24 24"><path d="M4 8v-2a2 2 0 0 1 2 -2h2"/><path d="M4 16v2a2 2 0 0 0 2 2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M16 20h2a2 2 0 0 0 2 -2v-2"/></symbol>
   <symbol id="ic-minimize" viewBox="0 0 24 24"><path d="M5 9l-3 3l3 3"/><path d="M9 5l3 -3l3 3"/><path d="M9 19l3 3l3 -3"/><path d="M19 9l3 3l-3 3"/></symbol>
   <symbol id="ic-bin" viewBox="0 0 24 24"><path d="M4 7l16 0"/><path d="M10 11l0 6"/><path d="M14 11l0 6"/><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12"/><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3"/></symbol>
@@ -1008,6 +1031,8 @@ async function startSegSession() {
   // invisibly at 'Loading…').
   manifestPoller(gen, id).catch(e => segFatal(e));
   pumpLoop(gen, id).catch(e => segFatal(e));
+  // re-attach the active subtitle track for this item's new session
+  if (activeSub && activeSub.id === currentId) applySubTrack();
 }
 
 // Debug hook: inspect live session state from the console.
@@ -1159,6 +1184,9 @@ function stopPlayback() {
   if (segBlobUrl) { URL.revokeObjectURL(segBlobUrl); segBlobUrl = null; }
   segMs = null;
   segInfo = null;
+  subPanelOpen = false;
+  const sp = $('subpanel'); if (sp) sp.classList.remove('open');
+  subsLoadedFor = null;
   segAppended = new Set();
   segEosDone = false;
   fullDur = 0;
@@ -1316,6 +1344,110 @@ function updVol() {
   $('vicon').innerHTML = '<use href="' + use + '"/>';
 }
 v.addEventListener('volumechange', updVol);
+
+/* ---------- subtitles ---------- */
+let subPanelOpen = false, subsLocal = [], subsConfigured = false, subsOnline = null;
+let subsLoadedFor = null, activeSub = null, subBusy = false;
+
+const esc2 = esc;
+function flagSpan(f) { return '<span class="flag">' + esc2(f || '🏳') + '</span>'; }
+
+function renderSubPanel() {
+  const p = $('subpanel');
+  let html = '<h4>Subtitles</h4>';
+  if (!subsLocal.length) html += '<div class="empty">No subtitles in this torrent</div>';
+  else for (const s of subsLocal) {
+    html += '<div class="subrow' + (activeSub && activeSub.name === s.name ? ' active' : '') + '" data-name="' + esc2(s.name) + '" data-local="1">'
+      + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
+      + (s.source === 'downloaded' ? '<span class="dl">downloaded</span>' : '') + '</div>';
+  }
+  html += '<h4>Find online</h4>';
+  if (!subsConfigured) html += '<div class="empty">Online search disabled — add an OpenSubtitles API key to chadtorrent.json</div>';
+  else if (subBusy) html += '<div class="empty">Searching…</div>';
+  else if (!subsOnline) html += '<div class="empty">Search failed</div>';
+  else if (!subsOnline.length) html += '<div class="empty">Nothing found online</div>';
+  else for (const s of subsOnline) {
+    html += '<div class="subrow" data-fileid="' + esc2(s.file_id) + '">'
+      + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
+      + '<span class="dl">↓ ' + (s.downloads || 0) + '</span></div>';
+  }
+  p.innerHTML = html;
+  p.querySelectorAll('.subrow').forEach(row => {
+    row.addEventListener('click', () => onSubRowClick(row));
+  });
+}
+
+async function onSubRowClick(row) {
+  if (subBusy) return;
+  if (row.dataset.local) {
+    const name = row.dataset.name;
+    if (activeSub && activeSub.name === name) disableSub();
+    else enableSub(name);
+    renderSubPanel();
+    return;
+  }
+  const fileid = row.dataset.fileid;
+  subBusy = true; renderSubPanel();
+  try {
+    const added = await api('/api/library/' + currentId + '/subs/download', { method: 'POST', body: JSON.stringify({ file_id: fileid }) });
+    if (!subsLocal.some(x => x.name === added.name)) {
+      subsLocal.push({ name: added.name, lang: added.lang, flag: added.flag, source: 'downloaded' });
+    }
+    enableSub(added.name);
+  } catch (e) { console.error('sub download failed', e); }
+  subBusy = false; renderSubPanel();
+}
+
+function enableSub(name) {
+  activeSub = { id: currentId, name };
+  applySubTrack();
+}
+function disableSub() { activeSub = null; applySubTrack(); }
+
+function applySubTrack() {
+  // drop existing subtitle tracks
+  v.querySelectorAll('track').forEach(t => t.remove());
+  if (!activeSub || activeSub.id !== currentId) return;
+  const track = document.createElement('track');
+  track.kind = 'subtitles';
+  track.label = activeSub.name;
+  track.srclang = (activeSub.name.match(/\.([a-z]{2})_/i) || [])[1] || '';
+  track.src = '/sub/' + currentId + '/' + encodeURIComponent(activeSub.name);
+  track.default = true;
+  v.appendChild(track);
+  track.addEventListener('load', () => { if (track.track) track.track.mode = 'showing'; });
+  // mode may need setting once the browser processed the track
+  setTimeout(() => { if (track.track) track.track.mode = 'showing'; }, 0);
+  setTimeout(() => { if (track.track) track.track.mode = 'showing'; }, 300);
+}
+
+async function toggleSubsPanel(show) {
+  const p = $('subpanel');
+  subPanelOpen = show === undefined ? !subPanelOpen : show;
+  p.classList.toggle('open', subPanelOpen);
+  if (!subPanelOpen || currentId == null) return;
+  if (subsLoadedFor !== currentId) {
+    subsLocal = []; subsOnline = null; subsConfigured = false; subBusy = true; renderSubPanel();
+    try {
+      const info = await api('/api/library/' + currentId + '/subs');
+      subsLocal = info.local || []; subsConfigured = !!info.configured;
+      if (subsConfigured) {
+        subBusy = true; renderSubPanel();
+        try {
+          const res = await api('/api/library/' + currentId + '/subs/search');
+          subsOnline = res.results || []; subsConfigured = !!res.configured;
+        } catch (e) { subsOnline = null; }
+      }
+    } catch (e) { console.error('subs list failed', e); }
+    subBusy = false; subsLoadedFor = currentId;
+  }
+  renderSubPanel();
+}
+
+$('subsbtn').addEventListener('click', (e) => { e.stopPropagation(); toggleSubsPanel(); });
+document.addEventListener('click', (e) => {
+  if (subPanelOpen && !e.target.closest('.subwrap')) toggleSubsPanel(false);
+});
 $('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
 $('vicon').addEventListener('click', () => { v.muted = !v.muted; updVol(); });
 
