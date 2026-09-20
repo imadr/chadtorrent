@@ -138,14 +138,22 @@
   .kb-key.rec { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: rgba(91,140,255,.12); }
   .kb-ctx { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
   .kb-label { font-size: 14px; min-width: 0; }
-  .kb-table select { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-                     border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; }
+  .kb-table select { width: 100%; box-sizing: border-box; background: var(--panel2); color: var(--text);
+                     border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px;
+                     font: inherit; font-size: 14px; }
+  .kb-table select.placeholder { color: var(--muted); }
+  .kb-table select option { padding: 5px 9px; background: var(--panel2); color: var(--text);
+                            font: inherit; font-size: 14px; }
+  #kb-table tfoot td:nth-child(2), #kb-table tfoot td:nth-child(3) { padding: 5px 12px 5px 0; }
+  #nb-key { color: var(--muted); }
+  #nb-key.rec { color: var(--text); }
   .kb-table th:last-child, .kb-table td.kb-del { width: 40px; }
   .kb-table td.kb-del { text-align: right; }
   .kb-table .ibtn { width: 26px; height: 26px; padding: 0; display: inline-flex; align-items: center;
                     justify-content: center; background: transparent; border: 1px solid var(--line);
                     border-radius: 6px; color: var(--muted); }
   .kb-table .ibtn:hover { color: var(--danger); border-color: var(--danger); }
+  .kb-table .ibtn#nb-add:hover { color: var(--accent); border-color: var(--accent); }
   .kb-table .ibtn svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2; fill: none;
                         stroke-linecap: round; stroke-linejoin: round; }
   .kb-actions { display: flex; justify-content: flex-start; gap: 10px; margin-top: 2px; }
@@ -296,14 +304,16 @@
       <tfoot>
         <tr>
           <td><input class="kb-key" id="nb-key" value="+ new key" readonly
-                     title="Click, then press the new keys and hit Enter"></td>
+                     title="Click, then press the new keys"></td>
           <td><select id="nb-ctx">
+            <option value="">Context</option>
             <option value="player">Player</option>
             <option value="movie">Movie</option>
             <option value="library">Library</option>
             <option value="modal">Modal</option>
           </select></td>
           <td><select id="nb-action"></select></td>
+          <td class="kb-del"><button class="ibtn" id="nb-add" title="Add keybinding"><svg viewBox="0 0 24 24"><use href="#ic-check"/></svg></button></td>
         </tr>
       </tfoot>
     </table>
@@ -318,6 +328,7 @@
      as <symbol> defs and referenced with <svg><use href="#ic-…"/></svg>. -->
 <svg xmlns="http://www.w3.org/2000/svg" style="display:none">
   <symbol id="ic-play" viewBox="0 0 24 24"><path d="M7 4v16l13-8z"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 24 24"><path d="M5 12l5 5l10 -10"/></symbol>
   <symbol id="ic-pause" viewBox="0 0 24 24"><path d="M6 4h4v16h-4z"/><path d="M14 4h4v16h-4z"/></symbol>
   <symbol id="ic-vol-hi" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M15 8a5 5 0 0 1 0 8"/><path d="M17.7 5a9 9 0 0 1 0 14"/></symbol>
   <symbol id="ic-vol-lo" viewBox="0 0 24 24"><path d="M6 9h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l4 4v-14l-4 4z"/><path d="M15 8a5 5 0 0 1 0 8"/></symbol>
@@ -1580,7 +1591,7 @@ function startKbRec(el, binding) {
   kbRec = { el, binding, orig: el.value };
   el.classList.add('rec');
   el.value = '';
-  el.placeholder = 'Press keys… ↵ save';
+  el.placeholder = 'Press keys…';
   el.focus();
 }
 function prettyPending() {
@@ -1596,7 +1607,6 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { stopKbRec(true); return; }
   const mods = modsFor(e);
   if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) { kbPending = { mods, code: null }; kbRec.el.value = prettyPending(); return; }
-  if (e.key === 'Enter') { if (kbPending && kbPending.code) commitKbRec(); return; }
   kbPending = { mods, code: e.code };
   kbRec.el.value = prettyPending();
 }, true);
@@ -1610,10 +1620,14 @@ function nextKbId() {
 function commitKbRec() {
   const cur = kbRec;
   if (!cur) return;
+  if (!kbPending || !kbPending.code) return;
   const isNew = !cur.binding;
+  const ctx = $('nb-ctx').value, act = $('nb-action').value;
+  // New bindings need a context and an action picked; with either missing,
+  // Enter does nothing (keep recording, no error).
+  if (isNew && (!ctx || !act)) return;
   const b = isNew
-    ? { id: nextKbId(), ctx: $('nb-ctx').value, label: $('nb-action').value,
-        fn: actionFor($('nb-ctx').value, $('nb-action').value) }
+    ? { id: nextKbId(), ctx, label: act, fn: actionFor(ctx, act) }
     : cur.binding;
   b.code = kbPending.code;
   b.mods = kbPending.mods;
@@ -1627,7 +1641,14 @@ function commitKbRec() {
   saveKeybinds();
   kbRec = null; kbPending = null;
   resetNbKey();
+  if (isNew) resetNbFields();
   renderKbSettings();
+}
+function resetNbFields() {
+  const c = $('nb-ctx');
+  c.value = '';
+  c.classList.add('placeholder');
+  fillNbActions();
 }
 function resetNbKey() {
   const el = $('nb-key');
@@ -1660,7 +1681,11 @@ function syncSortInd() {
 function fillNbActions() {
   const sel = $('nb-action');
   sel.innerHTML = '';
-  for (const l of actionsForCtx($('nb-ctx').value)) {
+  const ph = document.createElement('option'); ph.value = ''; ph.textContent = 'Action'; sel.appendChild(ph);
+  sel.classList.add('placeholder');
+  const ctx = $('nb-ctx').value;
+  if (!ctx) return;
+  for (const l of actionsForCtx(ctx)) {
     const o = document.createElement('option'); o.value = l; o.textContent = l; sel.appendChild(o);
   }
 }
@@ -1672,7 +1697,7 @@ function renderKbSettings() {
     const tr = document.createElement('tr');
     const key = document.createElement('input');
     key.className = 'kb-key'; key.readOnly = true; key.value = prettyKey(b);
-    key.title = 'Click, then press the new keys and hit Enter';
+    key.title = 'Click, then press the new keys';
     key.addEventListener('click', () => startKbRec(key, b));
     const tdKey = document.createElement('td'); tdKey.appendChild(key);
     const tdCtx = document.createElement('td'); tdCtx.className = 'kb-ctx';
@@ -1699,6 +1724,7 @@ function renderKbSettings() {
 }
 function openSettings() {
   $('settings-modal').hidden = false;
+  resetNbFields();
   renderKbSettings();
 }
 function closeSettings() {
@@ -1717,7 +1743,13 @@ $('btn-settings').addEventListener('click', openSettings);
 $('st-close').addEventListener('click', closeSettings);
 $('settings-modal').addEventListener('click', (e) => { if (e.target === $('settings-modal')) closeSettings(); });
 $('nb-key').addEventListener('click', () => startKbRec($('nb-key'), null));
-$('nb-ctx').addEventListener('change', () => { fillNbActions(); renderKbSettings(); });
+$('nb-add').addEventListener('click', () => commitKbRec());
+$('nb-ctx').addEventListener('change', (e) => {
+  e.target.classList.toggle('placeholder', !e.target.value);
+  fillNbActions();
+  renderKbSettings();
+});
+$('nb-action').addEventListener('change', (e) => e.target.classList.toggle('placeholder', !e.target.value));
 document.querySelectorAll('.kb-table th[data-sort]').forEach(th =>
   th.addEventListener('click', () => {
     const col = th.dataset.sort;
