@@ -1361,7 +1361,7 @@ function renderSubPanel() {
       + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
       + (s.source === 'downloaded' ? '<span class="dl">downloaded</span>' : '') + '</div>';
   }
-  html += '<h4>Find online</h4>';
+  html += '<h4>OpenSubtitles</h4>';
   if (!subsConfigured) html += '<div class="empty">Online search disabled — add an OpenSubtitles API key to chadtorrent.json</div>';
   else if (subBusy) html += '<div class="empty">Searching…</div>';
   else if (!subsOnline) html += '<div class="empty">Search failed</div>';
@@ -1425,6 +1425,7 @@ async function toggleSubsPanel(show) {
   const p = $('subpanel');
   subPanelOpen = show === undefined ? !subPanelOpen : show;
   p.classList.toggle('open', subPanelOpen);
+  if (!subPanelOpen) syncCtrlVis(); // back to bottom-10% hide rule right away
   if (!subPanelOpen || currentId == null) return;
   if (subsLoadedFor !== currentId) {
     subsLocal = []; subsOnline = null; subsConfigured = false; subBusy = true; renderSubPanel();
@@ -1466,12 +1467,19 @@ fsIcon();
 applyFs();
 $('fsbtn').addEventListener('click', toggleFs);
 
-/* show controls only when cursor in bottom 10% of video; back button only near top-left corner */
-document.addEventListener('mousemove', (e) => {
+/* show controls only when cursor in bottom 10% of video; back button only near top-left corner.
+ * While the subtitles panel is open the controls never hide (the panel lives inside the bar). */
+let lastMouse = { x: innerWidth / 2, y: innerHeight };
+function syncCtrlVis() {
   if ($('player-modal').hidden) return;
   const r = v.getBoundingClientRect();
-  const show = r.width > 0 && e.clientY >= r.top + r.height * 0.9;
+  const show = subPanelOpen || (r.width > 0 && lastMouse.y >= r.top + r.height * 0.9);
   $('ctrl').style.display = show ? 'block' : 'none';
+}
+document.addEventListener('mousemove', (e) => {
+  lastMouse = { x: e.clientX, y: e.clientY };
+  if ($('player-modal').hidden) return;
+  syncCtrlVis();
   const br = $('pback').getBoundingClientRect();
   const pad = 30;
   const near = e.clientX >= br.left - pad && e.clientX <= br.right + pad &&
