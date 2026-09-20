@@ -184,7 +184,11 @@
   .seek { flex: 1; height: 5px; min-width: 0; appearance: none; -webkit-appearance: none;
           background-color: rgba(255,255,255,.15); border-radius: 2px;
           cursor: pointer; border: none; outline: none; }
-  .skwrap { flex: 1; display: flex; height: 5px; min-width: 0; }
+  .skwrap { flex: 1; display: flex; height: 5px; min-width: 0; position: relative; }
+  .sktip { position: absolute; bottom: 12px; transform: translateX(-50%);
+           background: rgba(0,0,0,.75); color: #fff; font-size: 12px; line-height: 1;
+           padding: 4px 7px; border-radius: 4px; pointer-events: none; white-space: nowrap;
+           font-variant-numeric: tabular-nums; }
   .seek::-webkit-slider-thumb, .seek::-moz-range-thumb {
           appearance: none; -webkit-appearance: none; height: 0; width: 0;
           background: transparent; border: none; cursor: pointer; }
@@ -242,7 +246,7 @@
           <svg id="ppicon" viewBox="0 0 24 24"><use href="#ic-play"/></svg>
         </button>
         <div class="tm" id="tm">0:00 / 0:00</div>
-        <div class="skwrap"><input class="seek" id="seekbar" type="range" min="0" max="1000" value="0"></div>
+        <div class="skwrap"><input class="seek" id="seekbar" type="range" min="0" max="1000" value="0"><div class="sktip" id="seektth" hidden></div></div>
         <div class="sv">
           <svg id="vicon" viewBox="0 0 24 24"><use href="#ic-vol-hi"/></svg>
           <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
@@ -1247,6 +1251,22 @@ $('seekbar').addEventListener('change', () => {
   if (target < 0.1) { v.currentTime = 0; return; }
   seekTo(target);
 });
+
+/* Hover preview: show the media time under the cursor on the seek bar. */
+const sktip = $('seektth');
+function seekHover(e) {
+  const dur = fullDur || v.duration;
+  if (!dur || !isFinite(dur)) { sktip.hidden = true; return; }
+  const r = $('seekbar').getBoundingClientRect();
+  if (!r.width) return;
+  const x = Math.min(Math.max(e.clientX - r.left, 0), r.width);
+  sktip.textContent = fmtClock((x / r.width) * dur);
+  sktip.style.left = Math.min(Math.max(x, 26), r.width - 26) + 'px';
+  sktip.hidden = false;
+}
+$('seekbar').addEventListener('mouseenter', seekHover);
+$('seekbar').addEventListener('mousemove', seekHover);
+$('seekbar').addEventListener('mouseleave', () => { sktip.hidden = true; });
 
 /* ---------- buffering overlay ----------
  * MSE backpressure is driven natively by the SourceBuffer:
