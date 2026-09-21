@@ -279,17 +279,37 @@ pub fn ass_to_vtt(ass: &str) -> String {
     out
 }
 
+/// Lift rendered cues a bit above the very bottom edge of the video (keeps
+/// them clear of the player controls). Applied as a VTT cue setting.
+const CUE_LINE: &str = "line:88%";
+
+fn add_cue_line(vtt: String) -> String {
+    let mut out = String::with_capacity(vtt.len() + 32);
+    for line in vtt.split_inclusive('\n') {
+        if line.contains("-->") && !line.contains("line:") {
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            out.push_str(trimmed);
+            out.push(' ');
+            out.push_str(CUE_LINE);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 /// Convert subtitle bytes (any supported format/container) to WebVTT text.
 pub fn to_vtt(name: &str, bytes: &[u8]) -> anyhow::Result<String> {
     let bytes = decompress(name, bytes)?;
     let text = String::from_utf8_lossy(&bytes);
     let lower_name = name.to_lowercase();
     if lower_name.ends_with(".ass") || lower_name.ends_with(".ssa") || text.contains("[Events]") {
-        Ok(ass_to_vtt(&text))
+        Ok(add_cue_line(ass_to_vtt(&text)))
     } else if text.trim_start().starts_with("WEBVTT") {
-        Ok(text.to_string())
+        Ok(add_cue_line(text.to_string()))
     } else {
-        Ok(srt_to_vtt(&text))
+        Ok(add_cue_line(srt_to_vtt(&text)))
     }
 }
 
@@ -737,6 +757,13 @@ mod tests {
         assert!(vtt.contains("Hello there"));
         assert!(vtt.contains("00:00:03.500 --> 00:00:04.500"));
         assert!(!vtt.contains(','));
+    }
+
+    #[test]
+    fn vtt_cues_get_lifted_line_setting() {
+        let srt = "1\n00:00:01,000 --> 00:00:02,500\nHi\n\n";
+        let vtt = to_vtt("x.srt", srt.as_bytes()).unwrap();
+        assert!(vtt.contains("00:00:01.000 --> 00:00:02.500 line:88%"));
     }
 
     #[test]

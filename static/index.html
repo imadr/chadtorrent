@@ -217,6 +217,14 @@
   .subrow .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .subrow .dl { color: var(--muted); font-size: 11px; flex-shrink: 0; }
   .subpanel .empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
+  .substyle { display: flex; flex-direction: column; gap: 8px; padding: 2px 8px 10px; }
+  .substyle label { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  .substyle label span { width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
+  .substyle input[type=range] { flex: 1; height: 5px; appearance: none; -webkit-appearance: none;
+            background: linear-gradient(to right, #fff var(--val, 50%), #555 0); cursor: pointer;
+            border: none; outline: none; }
+  .substyle input[type=range]::-webkit-slider-thumb, .substyle input[type=range]::-moz-range-thumb {
+            appearance: none; -webkit-appearance: none; height: 0; width: 0; background: transparent; border: none; }
   .sv svg { width: 16px; height: 16px; stroke: #fff; stroke-width: 2; fill: none;
             stroke-linecap: round; stroke-linejoin: round; }
   .vl { width: 70px; height: 5px; appearance: none; -webkit-appearance: none;
@@ -945,8 +953,37 @@ const SEG_KEEP_BEHIND = 30;   // seconds of played media to keep buffered
 const SEG_AHEAD = 60;         // seconds to keep buffered ahead of the playhead
 let segAbort = null, segMs = null, segBlobUrl = null, segSb = null, segGen = 0;
 let segInfo = null;           // { mime, done, segs: Map(n -> t) }
-let segAppended = new Set();  // segment numbers appended this session
 let segEosDone = false;
+let appendsTotal = 0;
+let resumeAt = 0;
+let appendingSince = 0;
+/* diagnostics: rolling pump trace, dumped to the console ONLY when buffering */
+let pumpLog = [], lastAppendAt = 0, bufferingSince = 0;
+function bufDump(kind) {
+  const ranges = (b) => { const o = []; try { for (let i = 0; i < b.length; i++) o.push([+b.start(i).toFixed(2), +b.end(i).toFixed(2)]); } catch (e) {} return o; };
+  let sbRanges = [], sbErr = null;
+  try { sbRanges = ranges(segSb.buffered); sbErr = segSb && segSb.error ? segSb.error.name : null; } catch (e) {}
+  console.warn('[ct] ' + kind, JSON.parse(JSON.stringify({
+    at: new Date().toISOString(), time: +v.currentTime.toFixed(2), paused: v.paused,
+    readyState: v.readyState, networkState: v.networkState,
+    videoBuffered: ranges(v.buffered), sbBuffered: sbRanges, sbUpdating: segSb && segSb.updating, sbErr,
+    seekable: ranges(v.seekable),
+    msReady: segMs && segMs.readyState,
+    manifest: segInfo && { done: segInfo.done, segments: segInfo.segs.size },
+    appendsTotal,
+    segForCurrentTime: (function () {
+      if (!segInfo) return null;
+      let found = null;
+      for (const [n, t] of segInfo.segs) if (t <= v.currentTime + 0.3 && (!found || n > found.n)) found = { n, t };
+      return found && { n: found.n, t: found.t, appended: timeCovered(found.t + 0.05) };
+    })(),
+    lastAppendAgoMs: lastAppendAt ? Date.now() - lastAppendAt : null,
+    pump: window.__pump,
+    recentPump: pumpLog.slice(-14),
+    activeSub: activeSub,
+    tracks: [...v.textTracks].map(t => ({ label: t.label.slice(0, 30), mode: t.mode })),
+  })));
+}
 
 const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -971,8 +1008,8 @@ async function startSegSession() {
   segMs = new MediaSource();
   segBlobUrl = URL.createObjectURL(segMs);
   segAbort = new AbortController();
-  segAppended = new Set();
   segEosDone = false;
+  appendsTotal = 0;
 
   await new Promise((res, rej) => {
     const timer = setTimeout(() => rej(new Error('MediaSource timed out')), 5000);
@@ -1031,17 +1068,21 @@ async function startSegSession() {
   // invisibly at 'Loading…').
   manifestPoller(gen, id).catch(e => segFatal(e));
   pumpLoop(gen, id).catch(e => segFatal(e));
+  // restore the playhead after a session recovery
+  if (resumeAt > 0.5) { try { v.currentTime = resumeAt; } catch (e) {} resumeAt = 0; }
   // re-attach the active subtitle track for this item's new session
   if (activeSub && activeSub.id === currentId) applySubTrack();
 }
 
 // Debug hook: inspect live session state from the console.
 window.__seg = () => ({
-  gen: segGen, segInfo, appended: [...segAppended],
+  gen: segGen, segInfo, appendsTotal,
   sbUpdating: segSb && segSb.updating,
   sbErr: segSb && segSb.error && segSb.error.name,
   msReady: segMs && segMs.readyState,
   vErr: v.error && (v.error.code + ' ' + v.error.message),
+  pump: window.__pump,
+  sb: segSb,
   vBufLen: v.buffered && v.buffered.length,
   sbBufLen: segSb && segSb.buffered && segSb.buffered.length,
   sbBuf: (() => { try { const b = segSb && segSb.buffered; return b && b.length ? [b.start(0), b.end(b.length-1)] : null; } catch (e) { return 'err'; } })(),
@@ -1052,6 +1093,14 @@ async function manifestPoller(gen, id) {
   while (gen === segGen) {
     await segSleep(1000);
     if (gen !== segGen) return;
+    // stuck-append watchdog: setInterval survives background-tab throttling
+    // (unlike the 12s appendBuf timer), so recovery works even for a
+    // backgrounded player
+    if (appendingSince && segSb && segSb.updating && Date.now() - appendingSince > 12000) {
+      console.error('[ct] append stuck', Date.now() - appendingSince, 'ms — rebuilding session at playhead');
+      await recoverSession();
+      return;
+    }
     let info = null;
     try {
       info = await api('/api/library/' + id + '/stream');
@@ -1070,33 +1119,93 @@ async function manifestPoller(gen, id) {
   }
 }
 
+/* Is media time `t` actually covered by the SourceBuffer? The pump trusts
+ * ONLY this — browsers (Firefox) may silently evict buffered-ahead data, so
+ * "we appended it earlier" means nothing. */
+function timeCovered(t) {
+  try {
+    const b = segSb.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (t >= b.start(i) - 0.05 && t <= b.end(i) + 0.05) return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+/* Full session rebuild at the current playhead — used by the poller watchdog
+ * when an append never completes (Firefox can wedge SourceBuffer.updating).
+ * Capped at 3 attempts per minute; past that we stop trying and leave the
+ * diagnostics in the console. */
+let recoveries = [];
+async function recoverSession() {
+  const now = Date.now();
+  recoveries = recoveries.filter(r => now - r < 60000);
+  if (recoveries.length >= 3) {
+    console.error('[ct] recovery attempted 3x in the last minute — giving up (see [ct] dumps above)');
+    return;
+  }
+  recoveries.push(now);
+  const t = v.currentTime || 0;
+  showBuf('Recovering…');
+  segGen++;                 // invalidate old loops
+  teardownSeg();
+  resumeAt = t;
+  await startSegSession();
+}
+
 async function pumpLoop(gen, id) {
   let firstPlay = true;
+  window.__pump = { stage: 'start', n: 0, at: Date.now() };
+  const mark = (stage, n) => {
+    window.__pump.stage = stage; window.__pump.n = n || 0; window.__pump.at = Date.now();
+    pumpLog.push({ at: Date.now(), stage, n: n || 0 });
+    if (pumpLog.length > 14) pumpLog.shift();
+  };
   while (gen === segGen) {
     const anchor = v.currentTime || 0;
     const want = [];
     const arr = [...segInfo.segs.entries()].sort((a, b) => a[0] - b[0]);
     for (let i = 0; i < arr.length; i++) {
       const [n, t] = arr[i];
-      if (segAppended.has(n)) continue;
-      // A segment is wanted when it OVERLAPS the playhead window: it must
-      // start before anchor+SEG_AHEAD and end after anchor-2. Segment end =
-      // next segment's start (fragments are contiguous).
-      const end = i + 1 < arr.length ? arr[i + 1][1] : t + 30;
-      if (t < anchor + SEG_AHEAD && end > anchor - 2) want.push([n, t]);
+      const end = i + 1 < arr.length ? arr[i + 1][1] : (fullDur || t + 30);
+      // A segment is wanted when it OVERLAPS the playhead window AND the
+      // SourceBuffer does not actually cover it (evicted / never appended /
+      // partially dropped).
+      if (t >= anchor + SEG_AHEAD || end <= anchor - 2) continue;
+      const cEnd = Math.min(end, anchor + SEG_AHEAD);
+      if (timeCovered(t + 0.05) && timeCovered(cEnd - 0.05)) continue;
+      want.push([n, t]);
     }
 
     let appended = false;
     for (const [n] of want) {
       if (gen !== segGen) return;
+      mark('fetching', n);
       const buf = await fetchSegBuf(id, 'seg/' + n);
       if (gen !== segGen) return;
-      if (buf === null) break; // vanished? treat as frontier, poller refills
+      if (buf === null) { mark('404', n); break; } // vanished? treat as frontier, poller refills
+      mark('appending', n);
+      appendingSince = Date.now();
       try {
         await appendBuf(buf);
-      } catch (e) { return segFatal(e); }
-      segAppended.add(n);
+      } catch (e) { mark('append-error', n); return segFatal(e); }
+      appendingSince = 0;
+      mark('appended', n);
+      appendsTotal++;
+      lastAppendAt = Date.now();
       appended = true;
+    }
+    if (!appended) {
+      mark('idle', 0);
+      // starved silently? playhead at the buffered edge, nothing appended for
+      // 15s while we should be fetching -> dump context (no spinner logic here,
+      // just diagnostics)
+      const be = (() => { try { const b = sb.buffered; return b.length ? b.end(b.length - 1) : 0; } catch (e) { return 0; } })();
+      if (!v.paused && be - v.currentTime < 10 && Date.now() - lastAppendAt > 15000
+          && (!bufferingSince || Date.now() - bufferingSince > 15000)) {
+        bufferingSince = bufferingSince || Date.now();
+        bufDump('pump-starved');
+      }
     }
 
     if (appended) {
@@ -1108,8 +1217,8 @@ async function pumpLoop(gen, id) {
     await evictBehind();
     if (gen !== segGen) return;
     // End of movie: everything appended => close the stream.
-    if (segInfo.done && !segEosDone && segInfo.segs.size &&
-        [...segInfo.segs.keys()].every(n => segAppended.has(n))) {
+    if (segInfo.done && !segEosDone && segInfo.segs.size && fullDur &&
+        timeCovered(fullDur - 0.3)) {
       segEosDone = true;
       try { if (segMs.readyState === 'open') segMs.endOfStream(); } catch (e) {}
     }
@@ -1120,7 +1229,10 @@ async function pumpLoop(gen, id) {
 async function fetchSegBuf(id, name) {
   const r = await fetch('/mse/' + id + '/' + name, { signal: segAbort ? segAbort.signal : undefined });
   if (r.status === 404) return null;
-  if (!r.ok) throw new Error('Segment fetch failed (' + r.status + ')');
+  if (!r.ok) {
+    console.error('[ct] segment fetch failed:', name, 'HTTP', r.status);
+    throw new Error('Segment fetch failed (' + r.status + ')');
+  }
   return await r.arrayBuffer();
 }
 
@@ -1177,26 +1289,30 @@ function segFatal(e) {
   showBuf('Playback error: ' + (e.message || e));
 }
 
-function stopPlayback() {
-  segGen++;
+function teardownSeg() {
   if (segAbort) { segAbort.abort(); segAbort = null; }
   if (segSb) { try { segSb.abort(); } catch (e) {} segSb = null; }
   if (segBlobUrl) { URL.revokeObjectURL(segBlobUrl); segBlobUrl = null; }
   segMs = null;
   segInfo = null;
-  subPanelOpen = false;
-  const sp = $('subpanel'); if (sp) sp.classList.remove('open');
-  subsLoadedFor = null;
-  segAppended = new Set();
   segEosDone = false;
-  fullDur = 0;
-  currentId = null;
-  lastSkKey = null;
-  hideBuf();
-  $('seekbar').style.backgroundImage = '';
   v.pause();
   v.removeAttribute('src');
   v.load();
+}
+
+function stopPlayback() {
+  segGen++;
+  teardownSeg();
+  subPanelOpen = false;
+  const sp = $('subpanel'); if (sp) sp.classList.remove('open');
+  subsLoadedFor = null;
+  fullDur = 0;
+  currentId = null;
+  lastSkKey = null;
+  resumeAt = 0;
+  hideBuf();
+  $('seekbar').style.backgroundImage = '';
   $('ctrl').style.display = 'none';
 }
 $('pback').addEventListener('click', () => {
@@ -1328,8 +1444,23 @@ function showBufProgress() {
   if (segInfo && !segInfo.done && st && st.text) showBuf('Buffering… ' + st.text);
   else showBuf('Buffering…');
 }
-v.addEventListener('waiting',  showBufProgress);
-v.addEventListener('stalled',  showBufProgress);
+function onBufferingStart(ev) {
+  // log once per stall, with full context, only when buffering
+  if (!bufferingSince) {
+    bufferingSince = Date.now();
+    bufDump(ev.type);
+  }
+  showBufProgress();
+}
+v.addEventListener('waiting',  onBufferingStart);
+v.addEventListener('stalled',  onBufferingStart);
+v.addEventListener('playing', () => {
+  if (bufferingSince) {
+    console.warn('[ct] playback recovered after', Date.now() - bufferingSince, 'ms');
+    bufferingSince = 0;
+  }
+  hideBuf();
+});
 v.addEventListener('loadedmetadata', () => {
   if (v.duration && isFinite(v.duration) && (!fullDur || v.duration > fullDur)) fullDur = v.duration;
 });
@@ -1352,9 +1483,18 @@ let subsLoadedFor = null, activeSub = null, subBusy = false;
 const esc2 = esc;
 function flagSpan(f) { return '<span class="flag">' + esc2(f || '🏳') + '</span>'; }
 
+let subStyle = { size: 100, bottom: 12 };
+try { Object.assign(subStyle, JSON.parse(localStorage.getItem('chadtorrent.substyle') || '{}')); } catch (e) {}
+function saveSubStyle() { try { localStorage.setItem('chadtorrent.substyle', JSON.stringify(subStyle)); } catch (e) {} }
+
 function renderSubPanel() {
   const p = $('subpanel');
-  let html = '<h4>Subtitles</h4>';
+  let html = '<h4>Style</h4>'
+    + '<div class="substyle">'
+    + '<label>size<input type="range" id="subsize" min="50" max="250" step="5" value="' + subStyle.size + '"><span id="subsizeval">' + subStyle.size + '%</span></label>'
+    + '<label>bottom<input type="range" id="subbottom" min="0" max="60" step="1" value="' + subStyle.bottom + '"><span id="subbottomval">' + subStyle.bottom + '%</span></label>'
+    + '</div>'
+    + '<h4>Subtitles</h4>';
   if (!subsLocal.length) html += '<div class="empty">No subtitles in this torrent</div>';
   else for (const s of subsLocal) {
     html += '<div class="subrow' + (activeSub && activeSub.name === s.name ? ' active' : '') + '" data-name="' + esc2(s.name) + '" data-local="1">'
@@ -1375,6 +1515,43 @@ function renderSubPanel() {
   p.querySelectorAll('.subrow').forEach(row => {
     row.addEventListener('click', () => onSubRowClick(row));
   });
+  bindSubStyleInputs();
+}
+
+/* live-apply cue styling: font size via ::cue, position via each cue's line */
+function applySubStyle() {
+  let tag = document.getElementById('substyletag');
+  if (!tag) {
+    tag = document.createElement('style');
+    tag.id = 'substyletag';
+    document.head.appendChild(tag);
+  }
+  tag.textContent = 'video::cue { font-size: ' + subStyle.size + '%; }';
+  // Firefox only implements numeric line indexes: -1 = bottom-most line box
+  const linesUp = Math.max(0, Math.round(subStyle.bottom / 5)) + 1;
+  for (const t of v.textTracks) {
+    const cues = t.cues;
+    if (!cues) continue;
+    for (let i = 0; i < cues.length; i++) {
+      try { cues[i].snapToLines = true; cues[i].line = -linesUp; } catch (e) {}
+    }
+  }
+}
+
+function bindSubStyleInputs() {
+  const size = $('subsize'), bottom = $('subbottom');
+  const paint = (el) => el.style.setProperty('--val', ((el.value - el.min) / (el.max - el.min) * 100) + '%');
+  const sync = () => {
+    subStyle.size = +size.value; subStyle.bottom = +bottom.value;
+    $('subsizeval').textContent = subStyle.size + '%';
+    $('subbottomval').textContent = subStyle.bottom + '%';
+    paint(size); paint(bottom);
+    applySubStyle();
+    saveSubStyle();
+  };
+  size.addEventListener('input', sync);
+  bottom.addEventListener('input', sync);
+  paint(size); paint(bottom);
 }
 
 async function onSubRowClick(row) {
@@ -1415,7 +1592,10 @@ function applySubTrack() {
   track.src = '/sub/' + currentId + '/' + encodeURIComponent(activeSub.name);
   track.default = true;
   v.appendChild(track);
-  track.addEventListener('load', () => { if (track.track) track.track.mode = 'showing'; });
+  track.addEventListener('load', () => {
+    if (track.track) track.track.mode = 'showing';
+    applySubStyle();
+  });
   // mode may need setting once the browser processed the track
   setTimeout(() => { if (track.track) track.track.mode = 'showing'; }, 0);
   setTimeout(() => { if (track.track) track.track.mode = 'showing'; }, 300);
