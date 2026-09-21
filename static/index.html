@@ -1510,11 +1510,11 @@ function saveSubStyle() { try { localStorage.setItem('chadtorrent.substyle', JSO
 function renderSubPanel() {
   const p = $('subpanel');
   const sizePct = (subStyle.size - 50) / 200 * 100;
-  const bottomPct = Math.min(100, subStyle.bottom / 60 * 100);
+  const bottomPct = Math.max(0, Math.min(100, subStyle.bottom + 40));
   let html = '<h4>Style</h4>'
     + '<div class="substyle">'
     + '<label>size<input type="range" id="subsize" min="50" max="250" step="5" value="' + subStyle.size + '" style="--val:' + sizePct + '%"><span id="subsizeval">' + subStyle.size + '%</span></label>'
-    + '<label>bottom<input type="range" id="subbottom" min="0" max="60" step="0.5" value="' + subStyle.bottom + '" style="--val:' + bottomPct + '%"><span id="subbottomval">' + subStyle.bottom + '%</span></label>'
+    + '<label>bottom<input type="range" id="subbottom" min="-40" max="60" step="0.5" value="' + subStyle.bottom + '" style="--val:' + bottomPct + '%"><span id="subbottomval">' + subStyle.bottom + '%</span></label>'
     + '</div>'
     + '<h4>Subtitles</h4>';
   html += '<div class="subrow' + (!activeSub || activeSub.id !== currentId ? ' active' : '') + '" data-none="1">'
