@@ -966,6 +966,11 @@ let segInfo = null;           // { mime, done, segs: Map(n -> t) }
 let segEosDone = false;
 let appendsTotal = 0;
 let resumeAt = 0;
+// Uncovered seek target we must restore after the data lands. Browsers clamp
+// currentTime writes to the seekable range; when the manifest had no duration
+// (Infinity until endOfStream) the seekable range ends at the buffered edge,
+// so a frontier-past seek would silently snap back and be lost.
+let pendSeek = null;
 let appendingSince = 0;
 /* diagnostics: rolling pump trace, dumped to the console ONLY when buffering */
 let pumpLog = [], lastAppendAt = 0, bufferingSince = 0;
@@ -1174,12 +1179,20 @@ async function pumpLoop(gen, id) {
     if (pumpLog.length > 14) pumpLog.shift();
   };
   while (gen === segGen) {
-    const anchor = v.currentTime || 0;
+    const anchor = pendSeek != null ? pendSeek : (v.currentTime || 0);
     const want = [];
     const arr = [...segInfo.segs.entries()].sort((a, b) => a[0] - b[0]);
     for (let i = 0; i < arr.length; i++) {
       const [n, t] = arr[i];
-      const end = i + 1 < arr.length ? arr[i + 1][1] : (fullDur || t + 30);
+      // The last existing segment's true end is unknown until its successor
+      // is cut. NEVER let it span to fullDur: on a live torrent that phantom
+      // range "covers" any seek target past the frontier, so the pump would
+      // re-append the frontier segment forever (hammering hideBuf and killing
+      // the buffering overlay). Segments are cut at ~10-20s; 60s is a safe
+      // ceiling for the estimate.
+      const end = i + 1 < arr.length
+        ? arr[i + 1][1]
+        : (segInfo.done ? (fullDur || t + 60) : t + 60);
       // A segment is wanted when it OVERLAPS the playhead window AND the
       // SourceBuffer does not actually cover it (evicted / never appended /
       // partially dropped).
@@ -1221,7 +1234,14 @@ async function pumpLoop(gen, id) {
     }
 
     if (appended) {
-      hideBuf();
+      // Target of a clamped seek now buffered? Re-issue it — the original
+      // currentTime write snapped back to the buffered edge.
+      if (pendSeek != null && timeCovered(pendSeek + 0.05)) {
+        const t = pendSeek; pendSeek = null;
+        try { v.currentTime = t; } catch (e) {}
+      }
+      // Never clear the spinner while the seek target still has no data.
+      if (pendSeek == null) hideBuf();
       if (firstPlay) { firstPlay = false; if (v.paused) v.play().catch(() => {}); }
       continue;
     }
@@ -1289,9 +1309,21 @@ function evictBehind() {
 function seekTo(globalT) {
   if (fullDur && globalT > fullDur) globalT = fullDur;
   if (globalT < 0) globalT = 0;
-  // Native seek: instant when the target is buffered. Otherwise the video
-  // element waits and the pump fetches the segment containing the target —
-  // for live torrents that shows real download progress, never an error.
+  // Target buffered -> native seek, instant. Target NOT buffered (e.g. past
+  // the download frontier) -> show the spinner RIGHT HERE, synchronously.
+  // No browser event ever fires while a seek waits for data (pending seeks
+  // don't emit 'waiting'), so we must not rely on one. The pump clears it
+  // via hideBuf() once the data is appended and playback can continue.
+  // pendSeek remembers the target in case the browser clamps the
+  // currentTime write back to the buffered edge (unpinned duration); the
+  // pump re-issues the seek when the target becomes buffered.
+  if (timeCovered(globalT + 0.05)) {
+    pendSeek = null;
+    hideBuf();
+  } else {
+    pendSeek = globalT;
+    showBufProgress();
+  }
   v.currentTime = globalT;
 }
 
@@ -1302,6 +1334,7 @@ function segFatal(e) {
 }
 
 function teardownSeg() {
+  pendSeek = null;
   if (segAbort) { segAbort.abort(); segAbort = null; }
   if (segSb) { try { segSb.abort(); } catch (e) {} segSb = null; }
   if (segBlobUrl) { URL.revokeObjectURL(segBlobUrl); segBlobUrl = null; }
@@ -1450,15 +1483,13 @@ function showBuf(txt) {
 }
 function hideBuf() { $('buf').hidden = true; }
 
-v.addEventListener('seeking',  () => hideBuf());
+// NOTE: no 'seeking' listener. Showing/hiding the overlay on the seeking
+// event is unreliable (Firefox/Chrome clamp unbuffered seeks and the event
+// order differs per engine); seekTo() itself decides, synchronously.
 v.addEventListener('playing',  () => hideBuf());
 v.addEventListener('canplay',  () => hideBuf());
 function showBufProgress() {
-  // While the download frontier is the reason we're waiting, show real
-  // numbers instead of an endless fake spinner.
-  const st = currentId != null ? dlState[currentId] : null;
-  if (segInfo && !segInfo.done && st && st.text) showBuf('Buffering… ' + st.text);
-  else showBuf('Buffering…');
+  showBuf('Buffering…');
 }
 function onBufferingStart(ev) {
   // log once per stall, with full context, only when buffering

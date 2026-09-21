@@ -247,6 +247,7 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
         "-f", "mp4",
         "pipe:1",
     ])
+    .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
     .kill_on_drop(true);
