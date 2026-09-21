@@ -1694,7 +1694,7 @@ document.addEventListener('click', (e) => {
   if (subPanelOpen && !e.target.closest('.subwrap') && !e.target.closest('.subrow')) toggleSubsPanel(false);
 });
 $('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
-$('vicon').addEventListener('click', () => { v.muted = !v.muted; updVol(); });
+$('vicon').addEventListener('click', toggleMute);
 
 function fsIsOn() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
 function applyFs() {
@@ -1798,6 +1798,7 @@ const DEFAULT_KEYBIND = [
   { id: 'pl-back5',    ctx: KCTX_PLAYER, code: 'ArrowLeft',  label: 'Seek back 5s',           fn: () => seekBy(-5) },
   { id: 'pl-fwd5',     ctx: KCTX_PLAYER, code: 'ArrowRight', label: 'Seek forward 5s',        fn: () => seekBy(5) },
   { id: 'pl-fs',       ctx: KCTX_PLAYER, code: 'KeyF',       label: 'Toggle fullscreen',      fn: toggleFs },
+  { id: 'pl-mute',     ctx: KCTX_PLAYER, code: 'KeyM',       label: 'Toggle mute',            fn: toggleMute },
   { id: 'pl-exit',     ctx: KCTX_PLAYER, code: 'Escape',     label: 'Exit player',            fn: exitPlayer },
   { id: 'mv-back',     ctx: KCTX_MOVIE,  code: 'Escape',     label: 'Back to library',        fn: () => $('btn-back').click() },
   { id: 'mv-next',     ctx: KCTX_MOVIE,  code: 'ArrowDown',  label: 'Next item / torrent',    fn: selNext },
@@ -1899,6 +1900,7 @@ function activeKeyCtx() {
   return KCTX_LIBRARY;
 }
 function togglePlay() { v.paused ? v.play().catch(() => {}) : v.pause(); }
+function toggleMute() { v.muted = !v.muted; updVol(); }
 function seekBy(dt) { seekTo(v.currentTime + dt); }
 function exitPlayer() { if (!fsIsOn()) $('pback').click(); }
 
