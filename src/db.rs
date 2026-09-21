@@ -18,6 +18,8 @@ pub struct LibraryItem {
     pub tmdb_id: Option<i64>,
     pub media_type: Option<String>,
     pub sequential: bool,
+    /// Saved playback position in seconds (per torrent file, not per movie).
+    pub playhead: f64,
     #[serde(skip)]
     pub torrent_bytes: Option<Vec<u8>>,
 }
@@ -53,6 +55,7 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
         tmdb_id: row.get(10)?,
         media_type: row.get(11)?,
         sequential: row.get(12)?,
+        playhead: row.get(14)?,
         torrent_bytes: row.get(13)?,
     })
 }
@@ -104,6 +107,7 @@ impl Database {
             "ALTER TABLE library ADD COLUMN media_type TEXT",
             "ALTER TABLE library ADD COLUMN sequential INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE library ADD COLUMN torrent_bytes BLOB",
+            "ALTER TABLE library ADD COLUMN playhead REAL NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute_batch(stmt);
         }
@@ -142,7 +146,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead
              FROM library WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], item_from_row)?;
@@ -156,7 +160,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead
              FROM library ORDER BY added_at DESC",
         )?;
         let rows = stmt.query_map([], item_from_row)?;
@@ -225,7 +229,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead
              FROM library WHERE rqbit_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rqbit_id], item_from_row)?;
@@ -262,6 +266,16 @@ impl Database {
         conn.execute(
             "UPDATE library SET sequential = ?2 WHERE id = ?1",
             params![id, sequential],
+        )?;
+        Ok(())
+    }
+
+    /// Save the playback position (seconds) for a torrent item.
+    pub fn set_playhead(&self, id: i64, t: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE library SET playhead = ?2 WHERE id = ?1",
+            params![id, if t.is_finite() { t.max(0.0) } else { 0.0 }],
         )?;
         Ok(())
     }
@@ -442,6 +456,24 @@ mod tests {
         assert_eq!(db.get_pieces(hash).unwrap().unwrap(), vec![0x04]);
         db.delete_pieces(hash).unwrap();
         assert!(db.get_pieces(hash).unwrap().is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_playhead_roundtrip() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:ph").unwrap();
+        assert_eq!(db.get_item(id).unwrap().unwrap().playhead, 0.0);
+        db.set_playhead(id, 1234.5).unwrap();
+        assert_eq!(db.get_item(id).unwrap().unwrap().playhead, 1234.5);
+        db.set_playhead(id, -3.0).unwrap();
+        assert_eq!(db.get_item(id).unwrap().unwrap().playhead, 0.0);
+        db.set_playhead(id, 42.0).unwrap();
+        drop(db); // close the connection
+        // Re-open the same file: the column must exist via the migration and
+        // keep its value.
+        let db2 = Database::new(dir.join("test.db").to_str().unwrap()).unwrap();
+        assert_eq!(db2.get_item(id).unwrap().unwrap().playhead, 42.0);
         cleanup(&dir);
     }
 

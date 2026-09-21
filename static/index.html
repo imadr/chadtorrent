@@ -1005,6 +1005,8 @@ const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function playTorrent(item) {
   stopPlayback();
   currentId = item.id;
+  // Resume where this torrent file left off (per torrent, not per movie).
+  resumeAt = Math.max(0, item.playhead || 0);
   if (currentMovie) pushRoute(movieRoute() + '/' + torrentSlug(item));
   if (currentMovie) pushRoute(movieRoute() + '/' + torrentSlug(item));
   $('player-modal').hidden = false;
@@ -1086,7 +1088,9 @@ async function startSegSession() {
   manifestPoller(gen, id).catch(e => segFatal(e));
   pumpLoop(gen, id).catch(e => segFatal(e));
   // restore the playhead after a session recovery
-  if (resumeAt > 0.5) { try { v.currentTime = resumeAt; } catch (e) {} resumeAt = 0; }
+  // Restore the saved playhead (or the recovery point). Goes through seekTo
+  // so an undownloaded resume point shows the spinner and pendSeek kicks in.
+  if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
   // re-attach the active subtitle track for this item's new session
   if (activeSub && activeSub.id === currentId) applySubTrack();
 }
@@ -1324,7 +1328,19 @@ function seekTo(globalT) {
     pendSeek = globalT;
     showBufProgress();
   }
+  savePlayhead(globalT);
   v.currentTime = globalT;
+}
+
+/* Persist the playback position for the current torrent (per torrent file,
+ * not per movie). Fire-and-forget: called on every seek, on player close,
+ * and with 0 when the movie ends. */
+function savePlayhead(t) {
+  if (currentId == null) return;
+  const id = currentId;
+  const it = items.find(i => i.id === id);
+  if (it) it.playhead = t;
+  api('/api/library/' + id + '/playhead', { method: 'POST', body: JSON.stringify({ t }) }).catch(() => {});
 }
 
 function segFatal(e) {
@@ -1349,6 +1365,8 @@ function teardownSeg() {
 }
 
 function stopPlayback() {
+  // Save where we stopped for this torrent (0 if it played to the end).
+  savePlayhead(v.ended ? 0 : (v.currentTime || 0));
   segGen++;
   teardownSeg();
   subPanelOpen = false;
@@ -1488,6 +1506,8 @@ function hideBuf() { $('buf').hidden = true; }
 // order differs per engine); seekTo() itself decides, synchronously.
 v.addEventListener('playing',  () => hideBuf());
 v.addEventListener('canplay',  () => hideBuf());
+// Movie finished: reset the saved progress to 0 so the next open starts fresh.
+v.addEventListener('ended', () => savePlayhead(0));
 function showBufProgress() {
   showBuf('Buffering…');
 }

@@ -37,6 +37,11 @@ pub struct SetSequentialRequest {
     sequential: bool,
 }
 
+#[derive(Deserialize)]
+pub struct SetPlayheadRequest {
+    t: f64,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -78,6 +83,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/{id}/pause", post(pause_item))
         .route("/api/library/{id}/resume", post(resume_item))
         .route("/api/library/{id}/sequential", post(set_sequential))
+    .route("/api/library/{id}/playhead", post(set_playhead))
         .route("/api/library/{id}/stream", get(stream_info))
         .route("/api/library/{id}/subs", get(subs_list))
         .route("/api/library/{id}/subs/search", get(subs_search))
@@ -350,6 +356,23 @@ async fn set_sequential(
     Json(req): Json<SetSequentialRequest>,
 ) -> Result<impl IntoResponse> {
     state.library.set_sequential(id, req.sequential).await?;
+    Ok(Json(json!({ "success": true })))
+}
+
+/// Save the playback position for a torrent item (per torrent file, not per
+/// movie). Called by the player on every seek and when the player closes;
+/// the client resets it to 0 itself when a movie finishes.
+async fn set_playhead(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetPlayheadRequest>,
+) -> Result<impl IntoResponse> {
+    state
+        .library
+        .db
+        .get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+    state.library.db.set_playhead(id, req.t)?;
     Ok(Json(json!({ "success": true })))
 }
 
