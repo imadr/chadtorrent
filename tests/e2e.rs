@@ -73,11 +73,15 @@ async fn http_error_handling() {
     assert_eq!(resp.status(), 404);
 
     let resp = client
-        .get(format!("{http}/mse/999999"))
+        .get(format!("{http}/api/library/999999/stream"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+
+    // unknown paths fall through to the SPA shell, not an error
+    let resp = client.get(format!("{http}/mse/999999")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
 
     let resp = client
         .delete(format!("{http}/api/library/999999"))

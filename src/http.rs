@@ -87,6 +87,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mse/{id}/seg/{n}", get(seg_n))
         .route("/ws/torrent/{id}", get(ws_handler))
         .route("/__test", get(test_page))
+        .fallback(get(spa_fallback))
         .with_state(state)
 }
 
@@ -395,6 +396,29 @@ async fn stream_info(
         "state": state,
         "segments": snap.segments,
     })))
+}
+
+/// SPA fallback: client-side routes (/library/...) all serve the app shell —
+/// the frontend router picks the view from the path.
+async fn spa_fallback() -> Response {
+    match tokio::fs::read("static/index.html").await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => match tokio::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/static/index.html")).await {
+            Ok(bytes) => (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => StatusCode::NOT_FOUND.into_response(),
+        },
+    }
 }
 
 /// Dev-only: serve the browser test harness page (docs/browser-harness/) so

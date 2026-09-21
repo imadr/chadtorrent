@@ -540,6 +540,7 @@ async function refreshLibrary() {
     renderGrid();
     syncMovie();
     renderSearch();
+    if (!bootRouted) { bootRouted = true; handleRoute(); }
   }
   catch (e) { console.error('refresh failed', e); }
 }
@@ -562,12 +563,14 @@ function syncMovie() {
 }
 
 /* ---------- movie detail page ---------- */
-function openMovie(k) {
+function openMovie(k, push = true) {
   const rows = groupItems(items).get(k) || [];
   if (!rows.length) return;
   currentMovie = { key: k, rows };
   dlState = {};
   setView(true);
+  if (push) pushRoute(movieRoute());
+  if (push) pushRoute(movieRoute());
   mvSelIdx = -1;
   $('mv-results').innerHTML = '';
   window.scrollTo(0, 0);
@@ -763,6 +766,7 @@ $('mv-del').addEventListener('click', async () => {
 $('btn-back').addEventListener('click', () => {
   currentMovie = null;
   setView(false);
+  pushRoute('/library');
 });
 
 let findSeq = 0;
@@ -990,6 +994,8 @@ const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
 async function playTorrent(item) {
   stopPlayback();
   currentId = item.id;
+  if (currentMovie) pushRoute(movieRoute() + '/' + torrentSlug(item));
+  if (currentMovie) pushRoute(movieRoute() + '/' + torrentSlug(item));
   $('player-modal').hidden = false;
   $('ctrl').style.display = 'block';
   showBuf('Loading…');
@@ -1318,10 +1324,12 @@ function stopPlayback() {
 $('pback').addEventListener('click', () => {
   stopPlayback();
   $('player-modal').hidden = true;
+  pushRoute(movieRoute());
 });
 /* When the page is torn down (tab close, navigate away, bfcache) the segment
  * fetches must be destroyed too. pagehide also fires for bfcache, where
  * beforeunload may not. */
+window.addEventListener('popstate', handleRoute);
 window.addEventListener('pagehide', () => stopPlayback());
 window.addEventListener('beforeunload', () => stopPlayback());
 
@@ -1543,8 +1551,8 @@ function bindSubStyleInputs() {
   const paint = (el) => el.style.setProperty('--val', ((el.value - el.min) / (el.max - el.min) * 100) + '%');
   const sync = () => {
     subStyle.size = +size.value; subStyle.bottom = +bottom.value;
-    $('subsizeval').textContent = subStyle.size + '%';
-    $('subbottomval').textContent = subStyle.bottom + '%';
+    $('subsizeval').textContent = (Math.round(subStyle.size * 10) / 10) + '%';
+    $('subbottomval').textContent = (Math.round(subStyle.bottom * 10) / 10) + '%';
     paint(size); paint(bottom);
     applySubStyle();
     saveSubStyle();
@@ -1627,7 +1635,9 @@ async function toggleSubsPanel(show) {
 
 $('subsbtn').addEventListener('click', (e) => { e.stopPropagation(); toggleSubsPanel(); });
 document.addEventListener('click', (e) => {
-  if (subPanelOpen && !e.target.closest('.subwrap')) toggleSubsPanel(false);
+  // .subrow too: a click that re-renders the panel detaches the row before
+  // this handler runs, so closest('.subwrap') alone would miss it
+  if (subPanelOpen && !e.target.closest('.subwrap') && !e.target.closest('.subrow')) toggleSubsPanel(false);
 });
 $('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
 $('vicon').addEventListener('click', () => { v.muted = !v.muted; updVol(); });
@@ -1646,6 +1656,49 @@ document.addEventListener('webkitfullscreenchange', () => { fsIcon(); applyFs();
 fsIcon();
 applyFs();
 $('fsbtn').addEventListener('click', toggleFs);
+
+/* ---------- url routing ----------
+ * /library                      grid
+ * /library/<movie_slug>         movie detail
+ * /library/<movie>/<torrent>    movie detail + player on that torrent
+ * pushState on user actions; popstate + first load route accordingly. */
+let bootRouted = false;
+function slugify(x) { return String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, ''); }
+function pushRoute(path) { if (location.pathname !== path) history.pushState({}, '', path); }
+function movieRoute() {
+  if (!currentMovie) return '/library';
+  const rep = movieRep(currentMovie.rows) || currentMovie.rows[0];
+  return '/library/' + slugify(movieName(rep));
+}
+function torrentSlug(t) { return slugify(t.title || t.magnet || ('torrent_' + t.id)); }
+
+function handleRoute() {
+  const parts = location.pathname.split('/').filter(Boolean);
+  if (!parts.length || parts[0] !== 'library') { showLibraryRoute(); return; }
+  if (parts.length === 1) { showLibraryRoute(); return; }
+  const mslug = parts[1];
+  let mkey = null, mrows = null;
+  for (const [k, rows] of groupItems(items)) {
+    if (slugify(movieName(movieRep(rows))) === mslug) { mkey = k; mrows = rows; break; }
+  }
+  if (!mkey) { showLibraryRoute(); return; }
+  const playerOpen = currentId !== null;
+  openMovie(mkey, false);
+  if (parts.length < 3) {
+    if (playerOpen) { stopPlayback(); $('player-modal').hidden = true; }
+    return;
+  }
+  const tslug = parts.slice(2).join('_');
+  const t = mrows.filter(r => r.magnet && r.state !== '_pending' && r.state !== 'connecting' && r.state !== 'error')
+                 .find(r => torrentSlug(r) === tslug);
+  if (t && currentId !== t.id) playTorrent(t);
+}
+function showLibraryRoute() {
+  if (currentId !== null) stopPlayback();
+  $('player-modal').hidden = true;
+  currentMovie = null;
+  setView(false);
+}
 
 /* show controls only when cursor in bottom 10% of video; back button only near top-left corner.
  * While the subtitles panel is open the controls never hide (the panel lives inside the bar). */
