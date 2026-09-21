@@ -92,6 +92,13 @@ const LANG_FLAGS: &[(&str, &str)] = &[
     ("ko", "🇰🇷"), ("hi", "🇮🇳"), ("th", "🇹🇭"), ("vi", "🇻🇳"), ("id", "🇮🇩"),
     ("fa", "🇮🇷"), ("cs", "🇨🇿"), ("hu", "🇭🇺"), ("ro", "🇷🇴"), ("bg", "🇧🇬"),
     ("hr", "🇭🇷"), ("sr", "🇷🇸"), ("pt-br", "🇧🇷"),
+    ("sq", "🇦🇱"), ("mk", "🇲🇰"), ("sl", "🇸🇮"), ("sk", "🇸🇰"), ("lt", "🇱🇹"),
+    ("lv", "🇱🇻"), ("et", "🇪🇪"), ("is", "🇮🇸"), ("bn", "🇧🇩"), ("ur", "🇵🇰"),
+    ("ta", "🇮🇳"), ("te", "🇮🇳"), ("kn", "🇮🇳"), ("ml", "🇮🇳"), ("mr", "🇮🇳"),
+    ("gu", "🇮🇳"), ("pa", "🇮🇳"), ("si", "🇱🇰"), ("ne", "🇳🇵"), ("ms", "🇲🇾"),
+    ("tl", "🇵🇭"), ("ka", "🇬🇪"), ("hy", "🇦🇲"), ("az", "🇦🇿"), ("kk", "🇰🇿"),
+    ("uz", "🇺🇿"), ("mn", "🇲🇳"), ("ga", "🇮🇪"), ("bs", "🇧🇦"), ("af", "🇿🇦"),
+    ("sw", "🇰🇪"),
 ];
 
 /// ISO 639-1 → regional-indicator flag emoji.
@@ -103,25 +110,17 @@ pub fn flag_for(lang: Option<&str>) -> String {
             return flag.to_string();
         }
     }
-    let alpha2: String = if lower.len() == 2 {
-        lower
-    } else {
-        FILENAME_TAGS
-            .iter()
-            .find(|(tag, code)| code.len() == 2 && (*tag == lower || *code == lower))
-            .map(|(_, code)| code.to_string())
-            .unwrap_or(lower)
-    };
+    let alpha2: String = FILENAME_TAGS
+        .iter()
+        .find(|(tag, code)| code.len() == 2 && (*tag == lower || *code == lower))
+        .map(|(_, code)| code.to_string())
+        .unwrap_or_default();
     if let Some((_, flag)) = LANG_FLAGS.iter().find(|(code, _)| *code == alpha2) {
         return flag.to_string();
     }
-    let letters: Vec<char> = alpha2.chars().filter(|c| c.is_ascii_lowercase()).collect();
-    if letters.len() != 2 {
-        return "🏳".to_string();
-    }
-    letters.iter()
-        .map(|c| char::from_u32(0x1F1E6 + (*c as u32 - 'a' as u32)).unwrap_or('🏳'))
-        .collect()
+    // no fabrication: an unknown 2-letter language code is NOT a country code
+    // (e.g. "sq" would render as the bogus 🇸🇶), so just show the white flag.
+    "🏳".to_string()
 }
 
 /// Guess the language of a subtitle file from its name, then (as a fallback)
@@ -801,6 +800,9 @@ mod tests {
         assert_eq!(flag_for(Some("sv")), "🇸🇪");
         assert_eq!(flag_for(None), "🏳");
         assert_eq!(flag_for(Some("eng")), "🇬🇧");
+        assert_eq!(flag_for(Some("sq")), "🇦🇱");
+        // unknown codes must not fabricate a bogus regional-indicator flag
+        assert_eq!(flag_for(Some("zz")), "🏳");
     }
 
     #[test]

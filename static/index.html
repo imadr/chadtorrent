@@ -8,9 +8,10 @@
 <body>
 <style>
   :root {
-    --bg: #0c0c0c; --panel: #151515; --panel2: #1d1d1d; --line: #2d2d2d;
-    --text: #e2e2e2; --muted: #999999; --accent: #c4c4c4; --danger: #ff5f6d;
-    --ok: #3ddc84;
+    --bg: #000000; --panel: #0e0e0e; --panel2: #181818; --line: #3a3a3a;
+    --line-hi: #636363; --text: #d4d4d4; --muted: #8a8a8a;
+    --accent: #272727; --accent-ink: #e0e0e0;
+    --danger: #ff6b6b; --ok: #4ade80; --warn: #f5b544;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; }
@@ -18,12 +19,12 @@
                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   .floats { position: fixed; top: 14px; right: 18px; z-index: 40; display: flex; gap: 10px; }
   button { font: inherit; color: var(--text); cursor: pointer; }
-  .btn { background: var(--panel2); border: 1px solid var(--line);
+  .btn { background: var(--panel2); border: 0.5px solid var(--line);
          padding: 8px 14px; display: inline-flex; align-items: center; gap: 6px; }
   .btn svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none;
              stroke-linecap: round; stroke-linejoin: round; }
-  .btn:hover { border-color: var(--accent); }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #0c0c0c; font-weight: 600; }
+  .btn:hover { border-color: var(--line-hi); }
+  .btn.primary { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); font-weight: 600; }
   .btn.primary:hover { filter: brightness(1.1); }
   .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
   main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; }
@@ -32,8 +33,8 @@
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px; }
   .card { position: relative; background: var(--panel); border: 1px solid var(--line);
  overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s; }
-  .card:hover { transform: translateY(-3px); border-color: var(--accent); }
-  .card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(220,220,220,.30); }
+  .card:hover { transform: translateY(-3px); border-color: var(--line-hi); }
+  .card.sel { border-color: var(--line-hi); box-shadow: 0 0 0 2px rgba(216,216,216,.28); }
   .poster { width: 100%; aspect-ratio: 2/3; background: var(--panel2); display: flex;
             align-items: center; justify-content: center; overflow: hidden; }
   .card .poster img, .bigposter img { width: 100%; height: 100%; object-fit: cover; }
@@ -41,7 +42,7 @@
   .card .meta { padding: 9px 11px; }
   .card .meta .t { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .card .meta .y { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .badge { position: absolute; top: 8px; right: 8px; background: var(--accent); color: #0c0c0c;
+  .badge { position: absolute; top: 8px; right: 8px; background: var(--accent); color: var(--accent-ink);
            font-size: 11px; font-weight: 700; padding: 2px 8px; }
   .empty { color: var(--muted); text-align: center; padding: 60px 0; }
 
@@ -59,10 +60,10 @@
   section h3 { font-size: 14px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 12px; }
   .rows { display: flex; flex-direction: column; gap: 8px; }
   .row { display: flex; align-items: center; gap: 12px; background: var(--panel);
-         border: 1px solid var(--line); padding: 10px 14px; }
+         border: 0.5px solid var(--line); padding: 10px 14px; }
   #mv-torrents .row { min-height: 68px; }
-  .row:hover { background: var(--panel2); border-color: var(--accent); }
-  .row.sel { background: var(--panel2); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+  .row:hover { background: var(--panel2); border-color: var(--line-hi); }
+  .row.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
   .row .nm { flex: 1; min-width: 0; }
   .row .nm .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .nm .s { color: var(--muted); font-size: 12px; }
@@ -75,17 +76,17 @@
   .dl .txt { font-size: 12px; color: var(--muted); margin-top: 5px; }
   .chip { font-size: 11px; padding: 2px 8px; border: 1px solid var(--line); color: var(--muted); }
   .chip.ready { color: var(--ok); border-color: var(--ok); }
-  .chip.wait { color: #f0b429; border-color: #f0b429; }
+  .chip.wait { color: var(--warn); border-color: var(--warn); }
   .row .btn { padding: 6px 12px; font-size: 13px; }
   .row label.seq { display: inline-flex; align-items: center; gap: 5px; color: var(--muted);
                    font-size: 12px; font-weight: 600; cursor: pointer; flex-shrink: 0;
                    user-select: none; }
-  .row label.seq input { accent-color: var(--accent); cursor: pointer; }
+  .row label.seq input { accent-color: var(--line-hi); cursor: pointer; }
   .row .ibtn { width: 30px; height: 30px; padding: 0; flex-shrink: 0; display: inline-flex;
               align-items: center; justify-content: center; background: var(--panel2);
-              border: 1px solid var(--line); color: var(--text); }
-  .row .ibtn:hover { border-color: var(--accent); }
-  .row .ibtn.primary { background: var(--accent); border-color: var(--accent); color: #0c0c0c; }
+              border: 0.5px solid var(--line); color: var(--text); }
+  .row .ibtn:hover { border-color: var(--line-hi); }
+  .row .ibtn.primary { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
   .row .ibtn.primary:hover { filter: brightness(1.1); }
   .row .ibtn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
   .row .ibtn svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none;
@@ -93,14 +94,14 @@
   .formline { display: flex; gap: 8px; margin-top: 12px; }
   input[type=text], input[type=url] { flex: 1; background: var(--panel); color: var(--text);
          border: 1px solid var(--line); padding: 9px 12px; font: inherit; outline: none; }
-  input:focus { border-color: var(--accent); }
+  input:focus { border-color: var(--line-hi); }
   #am-search { width: 100%; display: block; flex: none; }
   label.k { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; white-space: nowrap; }
   .panel.confirm { max-width: 380px; }
   .cf-msg { color: var(--text); margin: 0 0 20px; line-height: 1.5; white-space: pre-line; }
   .cf-actions { display: flex; gap: 10px; justify-content: flex-end; }
 
-  .modal { position: fixed; inset: 0; z-index: 50; background: rgba(8,8,8,.8);
+  .modal { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,.72);
            display: flex; align-items: center; justify-content: center; padding: 20px; }
   .modal[hidden] { display: none; }
   .panel { background: var(--panel); border: 1px solid var(--line);
@@ -111,7 +112,7 @@
   .x:hover { color: var(--text); }
   .srow { display: flex; gap: 12px; padding: 10px; align-items: center; }
   .srow:hover { background: var(--panel2); }
-  .srow.sel { background: var(--panel2); box-shadow: inset 0 0 0 1px var(--accent); }
+  .srow.sel { background: var(--panel2); box-shadow: inset 0 0 0 1px var(--line-hi); }
   .srow .poster { width: 46px; height: 69px; aspect-ratio: 2/3; flex-shrink: 0; }
   .srow .poster img, .srow .poster .ph { width: 100%; height: 100%; object-fit: cover; }
   .srow .poster .ph { display: flex; align-items: center; justify-content: center; font-size: 16px; }
@@ -134,8 +135,8 @@
   .kb-key { width: 150px; padding: 5px 10px; border: 1px solid var(--line);
             background: var(--panel2); color: var(--text); font: inherit; font-size: 13px;
             text-align: center; outline: none; cursor: pointer; flex-shrink: 0; }
-  .kb-key:hover { border-color: var(--accent); }
-  .kb-key.rec { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); background: rgba(220,220,220,.12); }
+  .kb-key:hover { border-color: var(--line-hi); }
+  .kb-key.rec { border-color: var(--line-hi); box-shadow: 0 0 0 1px var(--line-hi); background: rgba(216,216,216,.10); }
   .kb-ctx { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
   .kb-label { font-size: 14px; min-width: 0; }
   .kb-table select { width: 100%; box-sizing: border-box; background: var(--panel2); color: var(--text);
@@ -153,7 +154,7 @@
                     justify-content: center; background: transparent; border: 1px solid var(--line);
  color: var(--muted); }
   .kb-table .ibtn:hover { color: var(--danger); border-color: var(--danger); }
-  .kb-table .ibtn#nb-add:hover { color: var(--accent); border-color: var(--accent); }
+  .kb-table .ibtn#nb-add:hover { color: var(--line-hi); border-color: var(--line-hi); }
   .kb-table .ibtn svg { width: 14px; height: 14px; stroke: currentColor; stroke-width: 2; fill: none;
                         stroke-linecap: round; stroke-linejoin: round; }
   .kb-actions { display: flex; justify-content: flex-start; gap: 10px; margin-top: 2px; }
@@ -175,6 +176,10 @@
   .buf .spin { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2);
                border-top-color: #fff; animation: spin .8s linear infinite; }
   .buf span { color: #fff; font-size: 14px; letter-spacing: .4px; }
+  .suboverlay { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
+                display: flex; justify-content: center; padding: 0 2%; pointer-events: none; }
+  .suboverlay span { max-width: 100%; text-align: center; white-space: pre-line; color: #fff;
+                     line-height: 1.3; text-shadow: 0 1px 3px rgba(0,0,0,.9), 0 0 6px rgba(0,0,0,.7); }
   @keyframes spin { to { transform: rotate(360deg); } }
   .pback { position: absolute; top: 10px; left: 10px; z-index: 6; background: rgba(0,0,0,.6);
            border: 1px solid rgba(255,255,255,.25); color: #fff; padding: 6px 14px; font-size: 14px;
@@ -203,7 +208,7 @@
   .sv { display: flex; align-items: center; gap: 8px; margin-left: auto; }
   .subwrap { position: relative; }
   .subpanel { position: absolute; bottom: calc(100% + 12px); right: -10px; width: 400px; max-width: 82vw;
-              max-height: 55vh; overflow: auto; background: rgba(8,8,8,.95); border: 1px solid rgba(255,255,255,.25);
+              max-height: 55vh; overflow: auto; background: rgba(10,10,10,.96); border: 1px solid rgba(255,255,255,.25);
               padding: 10px 12px; display: none; z-index: 20; }
   .subpanel.open { display: block; }
   .subpanel h4 { margin: 8px 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .8px;
@@ -212,7 +217,7 @@
   .subrow { display: flex; align-items: center; gap: 10px; padding: 6px 8px; cursor: pointer; font-size: 13px;
             color: var(--text); border: 1px solid transparent; }
   .subrow:hover { background: var(--panel2); }
-  .subrow.active { border-color: var(--accent); background: var(--panel2); }
+  .subrow.active { border-color: var(--line-hi); background: var(--panel2); }
   .subrow .flag { font-size: 16px; flex-shrink: 0; }
   .subrow .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .subrow .dl { color: var(--muted); font-size: 11px; flex-shrink: 0; }
@@ -270,6 +275,7 @@
 <div class="modal" id="player-modal" hidden>
   <div class="pwrap" id="videowrap">
     <video id="player"></video>
+    <div class="suboverlay" id="suboverlay" hidden><span></span></div>
     <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span></div>
     <button class="pback" id="pback" title="Back">← Back</button>
     <div class="ctrl" id="ctrl">
@@ -484,7 +490,7 @@ function renderPieceBar(bar, have, total) {
     let c = 0;
     for (let i = start; i < end; i++) if (have[i]) c++;
     const f = (end - start) ? c / (end - start) : 0;
-    html += '<b style="background:' + (f > 0 ? (f >= 1 ? '#3ddc84' : 'rgba(61,220,132,' + (0.15 + f * 0.8).toFixed(2) + ')') : 'transparent') + '"></b>';
+    html += '<b style="background:' + (f > 0 ? (f >= 1 ? '#3ddc97' : 'rgba(61,220,151,' + (0.15 + f * 0.8).toFixed(2) + ')') : 'transparent') + '"></b>';
   }
   bar.innerHTML = html;
 }
@@ -1305,6 +1311,8 @@ function teardownSeg() {
   v.pause();
   v.removeAttribute('src');
   v.load();
+  const ov = $('suboverlay');
+  if (ov) { ov.hidden = true; ov.firstElementChild.textContent = ''; }
 }
 
 function stopPlayback() {
@@ -1491,18 +1499,26 @@ let subsLoadedFor = null, activeSub = null, subBusy = false;
 const esc2 = esc;
 function flagSpan(f) { return '<span class="flag">' + esc2(f || '🏳') + '</span>'; }
 
-let subStyle = { size: 100, bottom: 12 };
-try { Object.assign(subStyle, JSON.parse(localStorage.getItem('chadtorrent.substyle') || '{}')); } catch (e) {}
-function saveSubStyle() { try { localStorage.setItem('chadtorrent.substyle', JSON.stringify(subStyle)); } catch (e) {} }
+let subStyle = { size: 100, bottom: 0 };
+try {
+  const saved = JSON.parse(localStorage.getItem('chadtorrent.substyle') || '{}');
+  if (saved.size != null) subStyle.size = +saved.size;
+  if (saved.bottom != null) subStyle.bottom = +saved.bottom;
+} catch (e) {}
+function saveSubStyle() { try { localStorage.setItem('chadtorrent.substyle', JSON.stringify({ size: subStyle.size, bottom: subStyle.bottom })); } catch (e) {} }
 
 function renderSubPanel() {
   const p = $('subpanel');
+  const sizePct = (subStyle.size - 50) / 200 * 100;
+  const bottomPct = Math.min(100, subStyle.bottom / 60 * 100);
   let html = '<h4>Style</h4>'
     + '<div class="substyle">'
-    + '<label>size<input type="range" id="subsize" min="50" max="250" step="5" value="' + subStyle.size + '"><span id="subsizeval">' + subStyle.size + '%</span></label>'
-    + '<label>bottom<input type="range" id="subbottom" min="0" max="60" step="1" value="' + subStyle.bottom + '"><span id="subbottomval">' + subStyle.bottom + '%</span></label>'
+    + '<label>size<input type="range" id="subsize" min="50" max="250" step="5" value="' + subStyle.size + '" style="--val:' + sizePct + '%"><span id="subsizeval">' + subStyle.size + '%</span></label>'
+    + '<label>bottom<input type="range" id="subbottom" min="0" max="60" step="0.5" value="' + subStyle.bottom + '" style="--val:' + bottomPct + '%"><span id="subbottomval">' + subStyle.bottom + '%</span></label>'
     + '</div>'
     + '<h4>Subtitles</h4>';
+  html += '<div class="subrow' + (!activeSub || activeSub.id !== currentId ? ' active' : '') + '" data-none="1">'
+    + '<span class="name">None</span></div>';
   if (!subsLocal.length) html += '<div class="empty">No subtitles in this torrent</div>';
   else for (const s of subsLocal) {
     html += '<div class="subrow' + (activeSub && activeSub.name === s.name ? ' active' : '') + '" data-name="' + esc2(s.name) + '" data-local="1">'
@@ -1526,25 +1542,51 @@ function renderSubPanel() {
   bindSubStyleInputs();
 }
 
-/* live-apply cue styling: font size via ::cue, position via each cue's line */
-function applySubStyle() {
-  let tag = document.getElementById('substyletag');
-  if (!tag) {
-    tag = document.createElement('style');
-    tag.id = 'substyletag';
-    document.head.appendChild(tag);
-  }
-  tag.textContent = 'video::cue { font-size: ' + subStyle.size + '%; }';
-  // Firefox only implements numeric line indexes: -1 = bottom-most line box
-  const linesUp = Math.max(0, Math.round(subStyle.bottom / 5)) + 1;
-  for (const t of v.textTracks) {
-    const cues = t.cues;
-    if (!cues) continue;
-    for (let i = 0; i < cues.length; i++) {
-      try { cues[i].snapToLines = true; cues[i].line = -linesUp; } catch (e) {}
-    }
-  }
+/* Subtitles are drawn by us (not the browser) so the bottom offset can move in
+ * pixels and continuously in every browser. The track stays "hidden" and we
+ * mirror its active cues into an absolutely-positioned overlay. */
+function subTrack() {
+  for (const t of v.textTracks) if (t.kind === 'subtitles') return t;
+  return null;
 }
+function applySubPosition() {
+  const ov = $('suboverlay');
+  if (!ov) return;
+  const ew = v.clientWidth, eh = v.clientHeight;
+  const vw = v.videoWidth, vh = v.videoHeight;
+  let left = 0, width = ew, letterbox = 0, height = eh;
+  if (vw && vh) {
+    const s = Math.min(ew / vw, eh / vh);
+    width = vw * s; height = vh * s; left = (ew - width) / 2; letterbox = (eh - height) / 2;
+  }
+  ov.style.right = 'auto';
+  ov.style.left = left + 'px';
+  ov.style.width = width + 'px';
+  ov.style.bottom = (letterbox + subStyle.bottom / 100 * height) + 'px';
+  const span = ov.firstElementChild;
+  if (span) span.style.fontSize = Math.max(8, height * 0.05 * subStyle.size / 100) + 'px';
+}
+function renderActiveCues() {
+  const ov = $('suboverlay');
+  if (!ov) return;
+  const span = ov.firstElementChild;
+  const t = subTrack();
+  const cues = t && t.activeCues;
+  if (!cues || !cues.length) { ov.hidden = true; span.textContent = ''; return; }
+  span.textContent = '';
+  for (let i = 0; i < cues.length; i++) {
+    if (i) span.appendChild(document.createElement('br'));
+    try { span.appendChild(cues[i].getCueAsHTML()); }
+    catch (e) { span.appendChild(document.createTextNode(cues[i].text)); }
+  }
+  ov.hidden = false;
+  applySubPosition();
+}
+function applySubStyle() { applySubPosition(); renderActiveCues(); }
+v.addEventListener('timeupdate', renderActiveCues);
+v.addEventListener('seeked', renderActiveCues);
+v.addEventListener('loadedmetadata', applySubPosition);
+window.addEventListener('resize', applySubPosition);
 
 function bindSubStyleInputs() {
   const size = $('subsize'), bottom = $('subbottom');
@@ -1563,6 +1605,11 @@ function bindSubStyleInputs() {
 }
 
 async function onSubRowClick(row) {
+  if (row.dataset.none) {
+    disableSub();
+    renderSubPanel();
+    return;
+  }
   if (subBusy) return;
   if (row.dataset.local) {
     const name = row.dataset.name;
@@ -1592,7 +1639,7 @@ function disableSub() { activeSub = null; applySubTrack(); }
 function applySubTrack() {
   // drop existing subtitle tracks
   v.querySelectorAll('track').forEach(t => t.remove());
-  if (!activeSub || activeSub.id !== currentId) return;
+  if (!activeSub || activeSub.id !== currentId) { renderActiveCues(); return; }
   const track = document.createElement('track');
   track.kind = 'subtitles';
   track.label = activeSub.name;
@@ -1600,13 +1647,20 @@ function applySubTrack() {
   track.src = '/sub/' + currentId + '/' + encodeURIComponent(activeSub.name);
   track.default = true;
   v.appendChild(track);
-  track.addEventListener('load', () => {
-    if (track.track) track.track.mode = 'showing';
-    applySubStyle();
-  });
+  // keep the browser from painting native cues; we render them ourselves
+  const hook = (tr) => {
+    if (!tr) return;
+    tr.mode = 'hidden';
+    if (!tr.__subHooked) {
+      tr.__subHooked = true;
+      tr.addEventListener('cuechange', renderActiveCues);
+    }
+    renderActiveCues();
+  };
+  track.addEventListener('load', () => { hook(track.track); applySubPosition(); });
   // mode may need setting once the browser processed the track
-  setTimeout(() => { if (track.track) track.track.mode = 'showing'; }, 0);
-  setTimeout(() => { if (track.track) track.track.mode = 'showing'; }, 300);
+  setTimeout(() => hook(track.track), 0);
+  setTimeout(() => hook(track.track), 300);
 }
 
 async function toggleSubsPanel(show) {
@@ -1647,6 +1701,7 @@ function applyFs() {
   const on = fsIsOn();
   wrap.style.cssText = on ? 'position: fixed; inset: 0; width: 100vw; height: 100vh; max-width: none; margin: 0; background: rgb(0,0,0);' : '';
   v.style.cssText = on ? 'position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;' : '';
+  applySubPosition();
 }
 function fsIcon() {
   $('fsicon').innerHTML = fsIsOn() ? '<use href="#ic-minimize"/>' : '<use href="#ic-maximize"/>';
