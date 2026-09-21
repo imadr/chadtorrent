@@ -230,6 +230,43 @@
             border: none; outline: none; }
   .substyle input[type=range]::-webkit-slider-thumb, .substyle input[type=range]::-moz-range-thumb {
             appearance: none; -webkit-appearance: none; height: 0; width: 0; background: transparent; border: none; }
+
+  /* subtitle sync overlay: time-scaled subtitle timeline on the right edge */
+  .subsync { position: absolute; top: 0; right: 0; bottom: 48px; width: min(420px, 86vw); z-index: 8;
+             display: flex; flex-direction: column;
+             background: linear-gradient(to left, rgba(10,10,10,.94), rgba(10,10,10,.8));
+             border-left: 1px solid rgba(255,255,255,.16); }
+  .ss-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px 10px; }
+  .ss-title { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); font-weight: 600; }
+  .ss-delay { margin-left: auto; color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .ss-mini { background: none; border: 1px solid rgba(255,255,255,.25); color: var(--text);
+             font-size: 11px; padding: 3px 10px; flex-shrink: 0; }
+  .ss-mini:hover { border-color: #fff; color: #fff; }
+  .ss-scrollwrap { position: relative; flex: 1; min-height: 0; }
+  .ss-list { position: absolute; inset: 0; overflow-y: auto; touch-action: none;
+             user-select: none; -webkit-user-select: none;
+             scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.28) transparent; }
+  .ss-list::-webkit-scrollbar { width: 8px; }
+  .ss-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,.24); border-radius: 4px; }
+  .ss-list::-webkit-scrollbar-track { background: transparent; }
+  .ss-track { position: relative; }
+  .ss-empty { color: var(--muted); font-size: 12px; padding: 24px 18px; }
+  .ss-line { position: absolute; left: 8px; right: 26px; display: flex; gap: 9px; align-items: flex-start;
+             padding: 4px 8px; font-size: 12.5px; line-height: 1.35; color: #fff; opacity: .35;
+             cursor: grab; transition: opacity .18s ease; border-radius: 3px; }
+  .ss-line:hover { opacity: .7; }
+  .ss-line.near { opacity: .55; }
+  .ss-line.on { opacity: 1; background: rgba(255,255,255,.09); }
+  .ss-t { flex-shrink: 0; width: 46px; color: var(--muted); font-size: 10px; padding-top: 2.5px;
+          font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+  .ss-line.on .ss-t { color: rgba(255,255,255,.85); }
+  .ss-x { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+          overflow: hidden; min-width: 0; }
+  .ss-cursor { position: absolute; left: 6px; right: 18px; height: 0; border-top: 2px solid #fff;
+               z-index: 3; pointer-events: none; box-shadow: 0 1px 5px rgba(0,0,0,.65); }
+  .ss-pill { position: absolute; right: 0; top: -12px; background: #fff; color: #000; font-size: 10.5px;
+             font-weight: 700; padding: 3px 7px; border-radius: 3px; font-variant-numeric: tabular-nums;
+             letter-spacing: .4px; user-select: none; -webkit-user-select: none; }
   .sv svg { width: 16px; height: 16px; stroke: #fff; stroke-width: 2; fill: none;
             stroke-linecap: round; stroke-linejoin: round; }
   .vl { width: 70px; height: 5px; appearance: none; -webkit-appearance: none;
@@ -277,6 +314,19 @@
     <video id="player"></video>
     <div class="suboverlay" id="suboverlay" hidden><span></span></div>
     <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span></div>
+    <div class="subsync" id="subsync" hidden>
+      <div class="ss-head">
+        <span class="ss-title">Sync subtitles</span>
+        <span class="ss-delay" id="ss-delay"></span>
+        <button class="ss-mini" id="ss-reset" title="Remove the offset">Reset</button>
+        <button class="ss-mini" id="ss-close" title="Close (the sync is kept)">Done</button>
+      </div>
+      <div class="ss-scrollwrap">
+        <div class="ss-list" id="ss-list">
+          <div class="ss-cursor" id="ss-cursor" hidden><span class="ss-pill" id="ss-pill">0:00</span></div>
+        </div>
+      </div>
+    </div>
     <button class="pback" id="pback" title="Back">← Back</button>
     <div class="ctrl" id="ctrl">
       <div class="strip">
@@ -1362,6 +1412,7 @@ function teardownSeg() {
   v.load();
   const ov = $('suboverlay');
   if (ov) { ov.hidden = true; ov.firstElementChild.textContent = ''; }
+  subRenderStop();
 }
 
 function stopPlayback() {
@@ -1371,6 +1422,7 @@ function stopPlayback() {
   teardownSeg();
   subPanelOpen = false;
   const sp = $('subpanel'); if (sp) sp.classList.remove('open');
+  ssToggle(false);
   subsLoadedFor = null;
   fullDur = 0;
   currentId = null;
@@ -1566,8 +1618,16 @@ function renderSubPanel() {
     + '<div class="substyle">'
     + '<label>size<input type="range" id="subsize" min="50" max="250" step="5" value="' + subStyle.size + '" style="--val:' + sizePct + '%"><span id="subsizeval">' + subStyle.size + '%</span></label>'
     + '<label>bottom<input type="range" id="subbottom" min="-40" max="60" step="0.5" value="' + subStyle.bottom + '" style="--val:' + bottomPct + '%"><span id="subbottomval">' + subStyle.bottom + '%</span></label>'
-    + '</div>'
-    + '<h4>Subtitles</h4>';
+    + '</div>';
+  if (activeSub && activeSub.id === currentId) {
+    const d = ssLoadDelay();
+    html += '<h4>Sync</h4>'
+      + '<div class="subrow" id="ssopen" title="Align subtitles with what you hear">'
+      + '<span class="name">Sync subtitles to the audio</span>'
+      + (Math.abs(d) > 0.05 ? '<span class="dl">' + ssFmtDelay(d) + '</span>' : '')
+      + '</div>';
+  }
+  html += '<h4>Subtitles</h4>';
   html += '<div class="subrow' + (!activeSub || activeSub.id !== currentId ? ' active' : '') + '" data-none="1">'
     + '<span class="name">None</span></div>';
   if (!subsLocal.length) html += '<div class="empty">No subtitles in this torrent</div>';
@@ -1587,9 +1647,11 @@ function renderSubPanel() {
       + '<span class="dl">↓ ' + (s.downloads || 0) + '</span></div>';
   }
   p.innerHTML = html;
-  p.querySelectorAll('.subrow').forEach(row => {
+  p.querySelectorAll('.subrow:not(#ssopen)').forEach(row => {
     row.addEventListener('click', () => onSubRowClick(row));
   });
+  const ssopen = p.querySelector('#ssopen');
+  if (ssopen) ssopen.addEventListener('click', () => { toggleSubsPanel(false); ssToggle(); });
   bindSubStyleInputs();
 }
 
@@ -1617,22 +1679,48 @@ function applySubPosition() {
   const span = ov.firstElementChild;
   if (span) span.style.fontSize = Math.max(8, height * 0.05 * subStyle.size / 100) + 'px';
 }
+/* Subtitle rendering is fully ours: the track's cue times stay ORIGINAL,
+ * the sync offset lives only in ssDelay, and the active set is recomputed
+ * from (original times + ssDelay) on every call. Never shift VTTCue
+ * startTime/endTime in place — engines re-sort the cue list when times
+ * change, so a pass over the list skips cues and leaves them stuck at an
+ * older offset (stale lines piling up under the current one). A key gate
+ * keeps the rAF path DOM-free when nothing changed. */
+let subLastKey = '', subRaf = 0;
 function renderActiveCues() {
   const ov = $('suboverlay');
   if (!ov) return;
   const span = ov.firstElementChild;
-  const t = subTrack();
-  const cues = t && t.activeCues;
-  if (!cues || !cues.length) { ov.hidden = true; span.textContent = ''; return; }
-  span.textContent = '';
-  for (let i = 0; i < cues.length; i++) {
-    if (i) span.appendChild(document.createElement('br'));
-    try { span.appendChild(cues[i].getCueAsHTML()); }
-    catch (e) { span.appendChild(document.createTextNode(cues[i].text)); }
+  const tr = subTrack();
+  const cues = tr && tr.cues;
+  if (!cues || !cues.length) {
+    if (subLastKey !== '') { ov.hidden = true; span.textContent = ''; subLastKey = ''; }
+    return;
   }
-  ov.hidden = false;
-  applySubPosition();
+  const t = v.currentTime || 0;
+  const active = [];
+  let key = '';
+  for (let i = 0; i < cues.length; i++) {
+    const c = cues[i];
+    if (c.startTime + ssDelay <= t && t < c.endTime + ssDelay) { active.push(c); key += i + ';'; }
+  }
+  if (key === subLastKey) return;
+  subLastKey = key;
+  span.textContent = '';
+  for (let i = 0; i < active.length; i++) {
+    if (i) span.appendChild(document.createElement('br'));
+    try { span.appendChild(active[i].getCueAsHTML()); }
+    catch (e) { span.appendChild(document.createTextNode(active[i].text)); }
+  }
+  ov.hidden = !active.length;
+  if (active.length) applySubPosition();
 }
+function subRenderStart() {
+  if (subRaf) return;
+  const tick = () => { subRaf = requestAnimationFrame(tick); renderActiveCues(); };
+  subRaf = requestAnimationFrame(tick);
+}
+function subRenderStop() { cancelAnimationFrame(subRaf); subRaf = 0; subLastKey = ''; }
 function applySubStyle() { applySubPosition(); renderActiveCues(); }
 v.addEventListener('timeupdate', renderActiveCues);
 v.addEventListener('seeked', renderActiveCues);
@@ -1690,7 +1778,13 @@ function disableSub() { activeSub = null; applySubTrack(); }
 function applySubTrack() {
   // drop existing subtitle tracks
   v.querySelectorAll('track').forEach(t => t.remove());
-  if (!activeSub || activeSub.id !== currentId) { renderActiveCues(); return; }
+  if (!activeSub || activeSub.id !== currentId) {
+    if (ssVisible()) ssToggle(false);
+    subRenderStop();
+    renderActiveCues();
+    return;
+  }
+  ssDelay = ssLoadDelay();
   const track = document.createElement('track');
   track.kind = 'subtitles';
   track.label = activeSub.name;
@@ -1706,6 +1800,8 @@ function applySubTrack() {
       tr.__subHooked = true;
       tr.addEventListener('cuechange', renderActiveCues);
     }
+    ssTrackReady(tr);
+    subRenderStart();
     renderActiveCues();
   };
   track.addEventListener('load', () => { hook(track.track); applySubPosition(); });
@@ -1746,6 +1842,244 @@ document.addEventListener('click', (e) => {
 });
 $('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
 $('vicon').addEventListener('click', toggleMute);
+
+/* ---------- subtitle sync ----------
+ * A time-scaled subtitle timeline (rows sit at cue start × SS_SCALE px, so
+ * vertical distance IS time distance). The white NOW cursor sits at
+ * (movie time − delay) and is glued to the MIDDLE of the panel: as the
+ * movie plays the timeline scrolls up past it continuously. Scrolling /
+ * dragging the timeline slides it under the cursor — while scrubbing, the
+ * delay follows continuously (subtitles re-time live); releasing / idling
+ * commits. Tapping a line pegs "now" onto that line. The offset lives ONLY
+ * in ssDelay — track cue times are never modified — and is persisted per
+ * (item, subtitle file) in localStorage. */
+const SS_SCALE = 48, SS_PAD = 80, SS_ROW = 44;   // px/sec, head room, min row pitch
+let ssDelay = 0, ssRaf = 0, ssIdleTimer = 0, ssLastIdx = -2;
+let ssCues = [], ssPainted = [], ssDrag = null, ssManual = false;
+let ssLastLabel = '', ssLastBadge = null, ssFollowScroll = null;
+const ssList = $('ss-list'), ssCur = $('ss-cursor'), ssPill = $('ss-pill');
+
+function ssVisible() { return !$('subsync').hidden; }
+function ssDelayKey() { return activeSub ? currentId + '|' + activeSub.name : null; }
+function ssDelayStore() {
+  try { return JSON.parse(localStorage.getItem('chadtorrent.subdelay') || '{}'); } catch (e) { return {}; }
+}
+function ssLoadDelay() {
+  const k = ssDelayKey(); if (!k) return 0;
+  const d = +ssDelayStore()[k];
+  return isFinite(d) ? d : 0;
+}
+function ssSaveDelay() {
+  const k = ssDelayKey(); if (!k) return;
+  const m = ssDelayStore();
+  if (Math.abs(ssDelay) < 0.05) delete m[k]; else m[k] = ssDelay;
+  try { localStorage.setItem('chadtorrent.subdelay', JSON.stringify(m)); } catch (e) {}
+}
+function ssFmtDelay(d) { return (d >= 0 ? '+' : '−') + Math.abs(d).toFixed(1) + 's'; }
+function ssCursorY() { return ((v.currentTime || 0) - ssDelay) * SS_SCALE + SS_PAD; }
+
+/* Round, persist, refresh; called on scrub end / tap / reset. */
+function ssCommitDelay(d) {
+  ssDelay = Math.round(d * 10) / 10;
+  ssSaveDelay();
+  ssLastIdx = -2;
+  ssBadge();
+  renderActiveCues();
+}
+
+/* Called from applySubTrack's hook: cues (re)loaded -> rebuild the timeline
+ * if the overlay is open. Nothing to re-apply: cue times stay original,
+ * ssDelay is reloaded in applySubTrack. */
+function ssTrackReady(tr) {
+  if (!tr || !tr.cues || !tr.cues.length) return;
+  if (ssVisible()) ssBuild();
+}
+
+function ssCueText(c) {
+  try {
+    const d = document.createElement('div');
+    d.appendChild(c.getCueAsHTML());
+    return d.textContent.replace(/\s+/g, ' ').trim();
+  } catch (e) {
+    return String(c.text || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+}
+
+function ssBuild() {
+  const tr = subTrack();
+  const cues = tr && tr.cues;
+  if (!cues || !cues.length) {
+    ssCues = [];
+    ssCur.hidden = true;               // keep the node alive (detached), just out of the way
+    ssCur.remove();
+    ssList.innerHTML = '<div class="ss-empty">Waiting for subtitle lines…</div>';
+    return;
+  }
+  const track = document.createElement('div');
+  track.className = 'ss-track';
+  ssCur.hidden = false;
+  track.appendChild(ssCur);            // move the persistent cursor in before wiping
+  ssCues = [];
+  let prevTop = -1e9, lastEnd = 0;
+  for (let i = 0; i < cues.length; i++) {
+    const c = cues[i];
+    // ideal time-proportional position; only nudged down when rows would
+    // collide (rapid-fire cues) so the mapping stays honest
+    let top = c.startTime * SS_SCALE + SS_PAD;
+    if (top < prevTop + SS_ROW) top = prevTop + SS_ROW;
+    prevTop = top;
+    if (c.endTime > lastEnd) lastEnd = c.endTime;
+    const el = document.createElement('div');
+    el.className = 'ss-line';
+    el.dataset.i = i;
+    el.style.top = top + 'px';
+    el.innerHTML = '<span class="ss-t">' + fmtClock(c.startTime) + '</span>'
+      + '<span class="ss-x">' + esc2(ssCueText(c)) + '</span>';
+    track.appendChild(el);
+    ssCues.push({ start: c.startTime, end: c.endTime, el });
+  }
+  track.style.height = (SS_PAD + lastEnd * SS_SCALE + SS_PAD) + 'px';
+  ssList.innerHTML = '';
+  ssList.appendChild(track);
+  ssLastIdx = -2;
+  // jump the view so the cursor sits mid-view (instant, no animation)
+  ssList.scrollTop = Math.max(0, ssCursorY() - ssList.clientHeight * 0.5);
+  ssFollowScroll = ssList.scrollTop;
+}
+
+/* Cue matching the playhead (ORIGINAL times + delay). Between cues the next
+ * line is current, like lyrics. */
+function ssActiveIdx() {
+  const t = (v.currentTime || 0) - ssDelay;
+  let cover = -1, next = ssCues.length;
+  for (let i = 0; i < ssCues.length; i++) {
+    const c = ssCues[i];
+    if (c.start <= t && t < c.end) cover = i;
+    else if (c.start > t) { next = i; break; }
+  }
+  return cover >= 0 ? cover : next;
+}
+
+function ssPaint(idx) {
+  for (const el of ssPainted) el.classList.remove('on', 'near');
+  ssPainted = [];
+  const add = (i, cls) => {
+    const c = ssCues[i];
+    if (c) { c.el.classList.add(cls); ssPainted.push(c.el); }
+  };
+  add(idx, 'on');
+  add(idx - 1, 'near');
+  add(idx + 1, 'near');
+}
+
+function ssBadge() {
+  const s = ssFmtDelay(ssDelay);
+  if (s === ssLastBadge) return;
+  ssLastBadge = s;
+  $('ss-delay').textContent = s;
+}
+
+function ssTick() {
+  if (!ssVisible()) return;
+  if (ssCues.length) {
+    const vh = ssList.clientHeight;
+    // scrubbing: the timeline is under the user's finger; the cursor stays
+    // at mid-view and the delay follows it continuously
+    if (ssManual) {
+      ssDelay = (v.currentTime || 0) - (ssList.scrollTop + vh / 2 - SS_PAD) / SS_SCALE;
+      ssBadge();
+    }
+    // cursor position + live movie-time label
+    const y = ssCursorY();
+    ssCur.style.top = y + 'px';
+    const label = fmtClock(v.currentTime || 0);
+    if (label !== ssLastLabel) { ssLastLabel = label; ssPill.textContent = label; }
+    // highlight the cue the cursor is in
+    const idx = ssActiveIdx();
+    if (idx !== ssLastIdx) { ssLastIdx = idx; ssPaint(idx); }
+    // follow: glue the cursor to mid-view. Instant writes every frame — the
+    // cursor's own 48px/s glide IS the motion, so no smooth scrolling and
+    // no time-window guards to misread animation frames as user input.
+    if (!ssManual) {
+      const want = y - vh / 2;
+      if (Math.abs(ssList.scrollTop - want) > 0.25) {
+        ssList.scrollTop = want;
+        ssFollowScroll = ssList.scrollTop;
+      }
+    }
+  }
+  ssRaf = requestAnimationFrame(ssTick);
+}
+
+/* The user took over the timeline (wheel / drag / scrollbar): derive the
+ * delay from their scroll position and commit shortly after the last
+ * move. */
+function ssUserScroll() {
+  if (!ssCues.length) return;
+  ssManual = true;
+  clearTimeout(ssIdleTimer);
+  ssIdleTimer = setTimeout(() => { if (!ssDrag) { ssManual = false; ssCommitDelay(ssDelay); } }, 700);
+}
+
+function ssToggle(force) {
+  const show = force === undefined ? !ssVisible() : force;
+  const p = $('subsync');
+  clearTimeout(ssIdleTimer);
+  ssManual = false; ssDrag = null;
+  if (show) {
+    if (!activeSub || activeSub.id !== currentId) return;
+    ssLastIdx = -2;
+    p.hidden = false;
+    ssBuild();
+    ssBadge();
+    cancelAnimationFrame(ssRaf);
+    ssRaf = requestAnimationFrame(ssTick);
+  } else {
+    p.hidden = true;
+    cancelAnimationFrame(ssRaf);
+    ssRaf = 0;
+  }
+}
+
+$('ss-close').addEventListener('click', () => ssToggle(false));
+$('ss-reset').addEventListener('click', () => ssCommitDelay(0));
+
+ssList.addEventListener('pointerdown', (e) => {
+  if (!ssCues.length || e.button !== 0) return;
+  // ignore the right-edge zone: Firefox targets the element for scrollbar
+  // drags and our capture logic would fight the native scrollbar
+  if (e.offsetX && e.offsetX >= ssList.clientWidth - 12) return;
+  e.preventDefault();
+  ssUserScroll();
+  ssDrag = { y: e.clientY, top: ssList.scrollTop, moved: 0, line: e.target.closest('.ss-line') };
+  try { ssList.setPointerCapture(e.pointerId); } catch (err) {}
+});
+ssList.addEventListener('pointermove', (e) => {
+  if (!ssDrag) return;
+  const dy = e.clientY - ssDrag.y;
+  ssDrag.moved = Math.max(ssDrag.moved, Math.abs(dy));
+  ssList.scrollTop = ssDrag.top - dy;
+});
+ssList.addEventListener('pointerup', () => {
+  if (!ssDrag) return;
+  const d = ssDrag;
+  ssDrag = null;
+  ssManual = false;
+  clearTimeout(ssIdleTimer);
+  // a tap on a line pegs "now" onto it; a drag commits the scrub as-is
+  if (d.moved < 5 && d.line) ssCommitDelay((v.currentTime || 0) - ssCues[+d.line.dataset.i].start);
+  else ssCommitDelay(ssDelay);
+});
+ssList.addEventListener('pointercancel', () => { ssDrag = null; ssUserScroll(); });
+ssList.addEventListener('wheel', () => ssUserScroll(), { passive: true });
+ssList.addEventListener('scroll', () => {
+  if (!ssVisible() || !ssCues.length) return;
+  // our own follow / build writes match ssFollowScroll exactly; anything
+  // else is the user scrolling (wheel / scrollbar / touch) — no time-window
+  // guessing, so our writes can never be misread as user input
+  if (ssFollowScroll != null && Math.abs(ssList.scrollTop - ssFollowScroll) < 2) return;
+  ssUserScroll();
+});
 
 function fsIsOn() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
 function applyFs() {
