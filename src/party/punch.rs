@@ -44,8 +44,11 @@ const PUNCH_GIVE_UP: Duration = Duration::from_secs(12);
 const RETRANSMIT_EVERY: Duration = Duration::from_millis(400);
 const SEND_WINDOW: usize = 64;
 const PING_EVERY: Duration = Duration::from_secs(8);
-/// No frames from a punched peer for this long => dead => relay fallback.
-const DEAD_AFTER: Duration = Duration::from_secs(15);
+/// No frames from a punched peer for this long => dead => re-punch. Generous:
+/// a still-downloading peer hammers CPU (ffmpeg segmenting, FFmpeg reads),
+/// which can stall the async runtime for a while. Pings fly every 8s, so a
+/// live peer is never hit by this.
+const DEAD_AFTER: Duration = Duration::from_secs(35);
 const REBIND_EVERY: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
@@ -217,6 +220,10 @@ pub(crate) async fn run_transport(
     let mut hub_alive = false;
     let punch_started = Instant::now();
     let mut known_targets = 0usize;
+    // Actions/state are NOT dropped while unpunched: they queue here and
+    // flush in order once (re)punched, so a seek during a re-punch moment
+    // still lands on the other side.
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut active = false;
     let mut buf = [0u8; 2048];
     let mut tick = tokio::time::interval(TICK);
@@ -247,11 +254,16 @@ pub(crate) async fn run_transport(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(super::ClientCmd::Send(m)) => {
+                        let env = protocol::encode_message(&key, &m);
                         if active {
-                            broadcast(&socket, &mut conns, protocol::encode_message(&key, &m)).await;
+                            broadcast(&socket, &mut conns, env).await;
+                        } else {
+                            // Queue rather than drop: a seek made during the
+                            // brief unpunched/re-punch window must still land.
+                            if pending.len() < 256 {
+                                pending.push_back(env);
+                            }
                         }
-                        // Not fully punched yet: dropped. Nothing flows
-                        // until every member is reachable anyway.
                     }
                     Some(super::ClientCmd::Stop) | None => return,
                 }
@@ -324,6 +336,10 @@ pub(crate) async fn run_transport(
                         )
                         .await;
                     }
+                    // Deliver everything that was queued while unpunched.
+                    while let Some(env) = pending.pop_front() {
+                        broadcast(&socket, &mut conns, env).await;
+                    }
                 } else if !targets.is_empty()
                     && !active
                     && !punch_warned
@@ -349,6 +365,16 @@ pub(crate) async fn run_transport(
                         active = false;
                         mgr.set_conn(my_gen, "reconnecting");
                         mgr.clear_peers(my_gen);
+                        // Re-question the hub RIGHT NOW: if the peer's address
+                        // changed (they re-joined), the next Bound push tells
+                        // us instead of punching a stale addr for REBIND_EVERY.
+                        last_bind = now;
+                        let bind = serde_json::to_vec(&Bind {
+                            room: room.clone(),
+                            peer_id: my_peer_id.clone(),
+                        })
+                        .unwrap_or_default();
+                        let _ = socket.send_to(&bind, server).await;
                         for addr in dead {
                             if let Some(c) = conns.get_mut(&addr) {
                                 let peer_id = c.peer_id.clone();

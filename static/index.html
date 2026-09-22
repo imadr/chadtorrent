@@ -2671,7 +2671,7 @@ function partyWsConnect() {
   partyWs.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.type === 'party') partySetSnapshot(m.party);
-    else if (m.type === 'action') partyApplyAction(m.kind, m.t, m.by);
+    else if (m.type === 'action') partyApplyAction(m.kind, m.t, m.by, m.playing);
   };
   partyWs.onopen = () => { partyRetry = 0; };
   partyWs.onclose = () => {
@@ -2696,9 +2696,20 @@ function partySetSnapshot(p) {
     if (was) closePartyModal();
   }
   if (p && !partyAnchor) {
-    // Late joiner: adopt the playing party's position as the anchor.
-    const playing = p.peers.find(x => x.playing);
-    if (playing) partyAnchor = { t: playing.pos, playing: true, at: Date.now() };
+    // Late joiner: adopt the party's position (a playing member first,
+    // otherwise wherever the party is parked) and jump there right away.
+    const src = p.peers.find(x => x.playing) || p.peers.find(x => (x.pos || 0) > 1);
+    if (src) {
+      partyAnchor = { t: src.pos || 0, playing: !!src.playing, at: Date.now() };
+      if (partyPlayerActive()) {
+        partyApply++;
+        try {
+          if (partyAnchor.t > 0.5) seekTo(partyAnchor.t);
+          partyHoldPlay = !partyAnchor.playing;
+          if (partyAnchor.playing && v.paused) v.play().catch(() => {});
+        } finally { setTimeout(() => partyApply--, 300); }
+      }
+    }
   }
   if (p) partyApplyRoster();
   renderPartyBtn();
@@ -2853,7 +2864,7 @@ $('pt-close').addEventListener('click', closePartyModal);
 $('party-modal').addEventListener('click', (e) => { if (e.target === $('party-modal')) closePartyModal(); });
 
 /* ----- actions: remote → player ----- */
-function partyApplyAction(kind, t, by) {
+function partyApplyAction(kind, t, by, playing) {
   if (!party) return;
   t = Math.max(0, isFinite(t) ? t : 0);
   partyAnchor = { t, playing: kind === 'play', at: Date.now() };
@@ -2863,6 +2874,11 @@ function partyApplyAction(kind, t, by) {
   try {
     if (kind === 'seek') {
       seekTo(t);
+      // Following a playing member's seek: keep watching with them.
+      if (playing && v.paused && !partyAutoPaused) {
+        partyHoldPlay = false;
+        v.play().catch(() => {});
+      }
     } else if (kind === 'play') {
       partyAutoPaused = false;
       if (Math.abs((v.currentTime || 0) - t) > 1.5) seekTo(t);

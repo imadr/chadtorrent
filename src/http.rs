@@ -516,7 +516,13 @@ async fn video_info(state: &AppState, id: i64) -> Option<(PathBuf, String)> {
         }
     }
     let item = state.library.db.get_item(id).ok().flatten()?;
-    let dir = PathBuf::from(item.file_path?);
+    let item_dir = state.library.config.library_dir.join(id.to_string());
+    let dir = item
+        .file_path
+        .as_ref()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .unwrap_or(item_dir);
     let full = crate::library::find_largest_video_in(&dir)?;
     let stem = full
         .file_stem()

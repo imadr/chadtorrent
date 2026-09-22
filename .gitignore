@@ -1,9 +1,5 @@
 /target
-/temp
-/library
-*.db
-*.db-shm
-*.db-wal
+/local
 .DS_Store
 /vendor
 chadtorrent.json

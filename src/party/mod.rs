@@ -194,6 +194,42 @@ impl PartyManager {
     }
 
     fn activate(self: &Arc<Self>, invite: Invite, item_id: i64, name: String, lan_only: bool) {
+        // Re-joining the SAME party (same room) must not restart the
+        // transport: the punch socket would change ports and the other
+        // members would see this member silently vanish and re-appear.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(p) = inner.party.as_mut() {
+                if p.invite.room == invite.room && p.invite.relay == invite.relay {
+                    info!("Watch party already active — keeping transport");
+                    p.me.name = name.clone();
+                    p.item_id = item_id;
+                    let me = p.me.clone();
+                    drop(inner);
+                    let row = PartyRow {
+                        relay: invite.relay.clone(),
+                        room: invite.room.clone(),
+                        room_key: invite.key.clone(),
+                        magnet: invite.magnet.clone(),
+                        tmdb_id: invite.tmdb_id,
+                        media_type: invite.media_type.clone(),
+                        title: invite.title.clone(),
+                        year: invite.year,
+                        poster_path: invite.poster_path.clone(),
+                        item_id,
+                        name,
+                    };
+                    if let Err(e) = self.library.db.set_party(&row) {
+                        warn!("Failed to persist party: {e}");
+                    }
+                    // Push the refreshed roster (name change etc.) over the
+                    // already-running transport.
+                    self.send_raw(self.gen.load(Ordering::SeqCst), Message::Presence { peer: me });
+                    self.emit_snapshot();
+                    return;
+                }
+            }
+        }
         let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(p) = self.inner.lock().unwrap().party.as_ref() {
             let _ = p.out.send(ClientCmd::Stop);
@@ -309,8 +345,16 @@ impl PartyManager {
         let mut inner = self.inner.lock().unwrap();
         let Some(p) = inner.party.as_mut() else { return };
         p.me.pos = t;
-        p.me.playing = kind == "play";
         p.me.buffering = false;
+        // Only play/pause change the playing flag; a seek must not flip it
+        // to false (the local player's state is the authority via
+        // set_local_state, and clobbering here showed us as paused after
+        // every seek).
+        if kind == "play" {
+            p.me.playing = true;
+        } else if kind == "pause" {
+            p.me.playing = false;
+        }
         let msg = match kind {
             "play" => Message::Play {
                 from: p.me.id.clone(),
@@ -432,6 +476,19 @@ impl PartyManager {
         id.chars().take(6).collect()
     }
 
+    fn peer_playing(&self, id: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        if let Some(p) = inner.party.as_ref() {
+            if p.me.id == id {
+                return p.me.playing;
+            }
+            if let Some(peer) = p.peers.get(id) {
+                return peer.state.playing;
+            }
+        }
+        false
+    }
+
     /// Fold a remote action into the roster so positions stay fresh.
     fn apply_remote_action(&self, from: &str, kind: &str, t: f64) {
         let mut inner = self.inner.lock().unwrap();
@@ -481,8 +538,11 @@ async fn run_inbound(mgr: Arc<PartyManager>, my_gen: u64, mut rx: UnboundedRecei
         } else if let Some((kind, from, t)) = msg.action() {
             let by = mgr.peer_name(from);
             mgr.apply_remote_action(from, kind, t);
+            let playing = mgr.peer_playing(from);
             mgr.emit_snapshot();
-            let ev = serde_json::json!({ "type": "action", "kind": kind, "t": t, "by": by });
+            let ev = serde_json::json!({
+                "type": "action", "kind": kind, "t": t, "by": by, "playing": playing
+            });
             let _ = mgr.events.send(ev.to_string());
         }
     }

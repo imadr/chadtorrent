@@ -165,16 +165,33 @@ impl SegmenterManager {
     async fn resolve_input(&self, seg: &Arc<Segmenter>) -> Option<Input> {
         let item = self.db.get_item(seg.id).ok().flatten()?;
 
-        // 1) Finished file on disk: read the path directly.
+        // 1) Finished file on disk: read the path directly. `file_path` may be
+        // stale (library dir moved, DB copied to a new machine) or NULL for
+        // items marked ready before path recording existed — fall back to the
+        // canonical `library_dir/{id}` and heal the DB when we find it there.
         if item.state == "ready" {
-            if let Some(path) = item.file_path.as_ref() {
-                let dir = PathBuf::from(path);
-                if let Some(full) = find_largest_video_in(&dir) {
-                    let mut info = seg.info.lock().unwrap();
-                    info.running = true;
-                    info.probe_path = Some(full.clone());
-                    return Some(Input::File(full));
+            if let Some(full) = item
+                .file_path
+                .as_ref()
+                .and_then(|p| find_largest_video_in(Path::new(p)))
+            {
+                let mut info = seg.info.lock().unwrap();
+                info.running = true;
+                info.probe_path = Some(full.clone());
+                return Some(Input::File(full));
+            }
+            let canonical = self.library_dir.join(seg.id.to_string());
+            if let Some(full) = find_largest_video_in(&canonical) {
+                if let Err(e) = self
+                    .db
+                    .update_file_path(seg.id, &canonical.to_string_lossy())
+                {
+                    warn!("failed to heal stale path for item {}: {e}", seg.id);
                 }
+                let mut info = seg.info.lock().unwrap();
+                info.running = true;
+                info.probe_path = Some(full.clone());
+                return Some(Input::File(full));
             }
         }
 
