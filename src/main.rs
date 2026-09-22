@@ -18,7 +18,7 @@ use http::AppState;
 use library::LibraryManager;
 use party::PartyManager;
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 async fn shutdown_signal() {
@@ -115,6 +115,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // UDP punch hub on the same port (TCP+UDP are separate namespaces):
+    // LAN watch parties coordinate through this instance directly.
+    match tokio::net::UdpSocket::bind(&addr).await {
+        Ok(udp) => {
+            tokio::spawn(party::punch::run_punch_server(udp));
+        }
+        Err(e) => warn!("UDP punch hub bind failed ({e}) — LAN parties won't sync"),
+    }
 
     info!("Listening on http://{addr}");
 

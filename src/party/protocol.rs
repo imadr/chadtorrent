@@ -221,15 +221,6 @@ pub fn parse_invite(s: &str) -> Option<Invite> {
     Some(invite)
 }
 
-/// Build the full WebSocket URL for a room on a relay base URL.
-pub fn room_ws_url(relay_base: &str, room: &str) -> String {
-    format!(
-        "{}/ws/party/relay/{}",
-        relay_base.trim_end_matches('/'),
-        room
-    )
-}
-
 /// Extract the `xt=urn:btih:<infohash>` from a magnet link, lowercased —
 /// used to dedupe on join so the same torrent is never added twice.
 pub fn magnet_infohash(magnet: &str) -> Option<String> {
@@ -336,18 +327,6 @@ mod tests {
         assert!(j.contains(r#""type":"seek""#));
         let back: Message = serde_json::from_str(&j).unwrap();
         assert!(matches!(back, Message::Seek { ref from, t } if from == "p1" && t == 9.0));
-    }
-
-    #[test]
-    fn room_ws_url_joins_paths() {
-        assert_eq!(
-            room_ws_url("wss://relay.example.com/", "abc123"),
-            "wss://relay.example.com/ws/party/relay/abc123"
-        );
-        assert_eq!(
-            room_ws_url("ws://10.0.0.2:3000", "abc123"),
-            "ws://10.0.0.2:3000/ws/party/relay/abc123"
-        );
     }
 
     #[test]

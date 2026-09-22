@@ -1,20 +1,22 @@
-//! chadtorrent-relay: the standalone watch-party relay.
+//! chadtorrent-relay: the watch-party coordination hub.
 //!
-//! Deploy once on any host with a public address (free-tier VPS, a
-//! port-forwarded box, ...) and every chadtorrent instance can then run
-//! internet-wide watch parties through it — invites carry this relay's
-//! URL, joiners configure nothing. The process is stateless: it only
-//! broadcasts opaque encrypted frames between members of a room and keeps
-//! no data on disk.
+//! Deploy once on any host with a public address (free-tier VPS, your own
+//! home server with one UDP port forwarded, ...) and chadtorrent
+//! instances can run watch parties through it — invites carry this hub's
+//! address, joiners configure nothing.
+//!
+//! The hub is a pure UDP "mailroom": members bind, learn each other's
+//! public endpoints, punch directly, and the hub steps out. It never
+//! carries party traffic, stores nothing, and speaks no WebSocket.
 //!
 //!     chadtorrent-relay [--port 3001] [--addr 0.0.0.0]
 
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "chadtorrent-relay", version, about = "Stateless watch-party message relay")]
+#[command(name = "chadtorrent-relay", version, about = "Watch-party NAT-punch hub (UDP introducer)")]
 struct Args {
-    /// Listen port
+    /// UDP listen port
     #[arg(long, short, default_value_t = 3001)]
     port: u16,
     /// Listen address
@@ -34,25 +36,14 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("init tracing");
 
     let args = Args::parse();
-    let router = chadtorrent::party::relay::relay_router();
     let addr = format!("{}:{}", args.addr, args.port);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
+    let udp = match tokio::net::UdpSocket::bind(&addr).await {
+        Ok(u) => u,
         Err(e) => {
-            eprintln!("failed to bind {addr}: {e}");
+            eprintln!("failed to bind udp://{addr}: {e}");
             std::process::exit(1);
         }
     };
-    // NAT punch hub on the same port over UDP (forward both TCP and UDP
-    // for this port when running behind a router).
-    match tokio::net::UdpSocket::bind(&addr).await {
-        Ok(udp) => {
-            tokio::spawn(chadtorrent::party::punch::run_punch_server(udp));
-        }
-        Err(e) => tracing::warn!("UDP bind failed ({e}) — running without the punch hub"),
-    };
-    tracing::info!("chadtorrent-relay listening on ws://{addr}/ws/party/relay/<room>");
-    if let Err(e) = axum::serve(listener, router).await {
-        tracing::error!("server error: {e}");
-    }
+    tracing::info!("chadtorrent-relay punch hub on udp://{addr}");
+    chadtorrent::party::punch::run_punch_server(udp).await;
 }

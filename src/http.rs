@@ -100,11 +100,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/__test", get(test_page))
         .fallback(get(spa_fallback))
         .with_state(state)
-        // The relay is mounted on every instance AFTER state is applied
-        // (it is fully self-contained): an instance reachable on a LAN (or
-        // port-forwarded) can serve as the relay for its own invites
-        // without any extra process.
-        .merge(crate::party::relay::relay_router())
 }
 
 async fn add_item(

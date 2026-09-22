@@ -16,13 +16,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
 
 use super::protocol::{self, Message};
@@ -151,84 +151,7 @@ pub async fn run_punch_server(socket: UdpSocket) {
 }
 
 // ---------------------------------------------------------------------------
-// Client: punch task + UDP transport with reliability
-
-/// Shared transport state the PartyManager reads.
-#[derive(Debug)]
-pub struct PunchActive {
-    /// True when every known peer is punched and UDP is the live transport.
-    pub active: AtomicBool,
-}
-
-/// Handle held by the party connection. Cheap to create: the bind probe
-/// happens in the background task, so a relay without punch support costs
-/// nothing (the task exits after `BIND_TIMEOUT`).
-pub struct PunchTask {
-    active: Arc<PunchActive>,
-    /// Encrypted envelopes to broadcast to all punched peers.
-    send: UnboundedSender<Vec<u8>>,
-    cancel: Arc<AtomicBool>,
-}
-
-impl PunchTask {
-    /// Returns immediately; all network probing happens in the spawned
-    /// task so a punch-less relay never delays the WS connection.
-    pub async fn spawn(
-        relay_base: &str,
-        room: &str,
-        key: [u8; 32],
-        my_peer_id: String,
-        inbound: UnboundedSender<Message>,
-    ) -> Option<Self> {
-        let host_port = relay_base
-            .trim()
-            .trim_start_matches("wss://")
-            .trim_start_matches("ws://")
-            .trim_end_matches('/');
-        let server: SocketAddr = tokio::net::lookup_host(host_port).await.ok()?.next()?;
-        let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-
-        let active = Arc::new(PunchActive {
-            active: AtomicBool::new(false),
-        });
-        let (send, recv) = mpsc::unbounded_channel::<Vec<u8>>();
-        let cancel = Arc::new(AtomicBool::new(false));
-        tokio::spawn(run_client(
-            socket,
-            server,
-            room.to_string(),
-            key,
-            my_peer_id,
-            inbound,
-            recv,
-            active.clone(),
-            cancel.clone(),
-        ));
-        Some(Self {
-            active,
-            send,
-            cancel,
-        })
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active.active.load(Ordering::SeqCst)
-    }
-
-    pub fn active_handle(&self) -> Arc<PunchActive> {
-        self.active.clone()
-    }
-
-    pub fn broadcast(&self, envelope: Vec<u8>) {
-        let _ = self.send.send(envelope);
-    }
-}
-
-impl Drop for PunchTask {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-    }
-}
+// Client: punched peer-to-peer transport (the only transport)
 
 struct PeerConn {
     peer_id: String,
@@ -239,37 +162,67 @@ struct PeerConn {
     unacked: VecDeque<(u32, Vec<u8>, Instant, Instant)>,
     /// Next in-order seq we expect (seqs start at 1).
     recv_next: u32,
-    /// Out-of-order frames awaiting their predecessor.
-    hold: HashMap<u32, Vec<u8>>,
+    /// Out-of-order messages awaiting their predecessor.
+    hold: HashMap<u32, Message>,
     last_seen: Instant,
     last_ping: Instant,
     last_req: Instant,
 }
 
+/// The party's transport task. Punches every member of the room, then
+/// carries ALL party traffic peer-to-peer. There is deliberately no
+/// server relay: until every member has punched, messages don't flow
+/// (the manager reports connecting/reconnecting during that time), and a
+/// silent peer drops the party back into re-punching.
 #[allow(clippy::too_many_arguments)]
-async fn run_client(
-    socket: UdpSocket,
-    server: SocketAddr,
+pub(crate) async fn run_transport(
+    mgr: Arc<super::PartyManager>,
+    my_gen: u64,
+    gen: Arc<AtomicU64>,
+    relay_base: String,
     room: String,
     key: [u8; 32],
     my_peer_id: String,
+    mut cmd_rx: UnboundedReceiver<super::ClientCmd>,
     inbound: UnboundedSender<Message>,
-    mut outbox: UnboundedReceiver<Vec<u8>>,
-    active: Arc<PunchActive>,
-    cancel: Arc<AtomicBool>,
 ) {
+    mgr.set_conn(my_gen, "connecting");
+    // Resolve the coordination hub (the invite's relay URL, host:port).
+    let server: SocketAddr = loop {
+        let host_port = relay_base
+            .trim()
+            .trim_start_matches("wss://")
+            .trim_start_matches("ws://")
+            .trim_end_matches('/');
+        if let Ok(mut addrs) = tokio::net::lookup_host(host_port).await {
+            if let Some(addr) = addrs.next() {
+                break addr;
+            }
+        }
+        if gen.load(Ordering::SeqCst) != my_gen {
+            return;
+        }
+        warn!("Punch hub {host_port} unresolved — retrying");
+        mgr.set_conn(my_gen, "reconnecting");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+        return;
+    };
+
     let mut targets: Vec<BoundPeer> = Vec::new();
     let mut conns: HashMap<SocketAddr, PeerConn> = HashMap::new();
     let mut last_bind = Instant::now() - REBIND_EVERY;
-    let punch_started = Instant::now();
     let mut punch_warned = false;
+    let punch_started = Instant::now();
     let mut known_targets = 0usize;
+    let mut active = false;
     let mut buf = [0u8; 2048];
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if gen.load(Ordering::SeqCst) != my_gen {
             return;
         }
         tokio::select! {
@@ -277,7 +230,7 @@ async fn run_client(
                 let Ok((n, from)) = r else { continue };
                 let frame = &buf[..n];
                 if frame.first() == Some(&b'{') {
-                    // Server push (JSON Bound).
+                    // Hub push (JSON Bound).
                     if let Ok(b) = serde_json::from_slice::<Bound>(frame) {
                         apply_bound(&mut targets, &mut conns, b);
                     }
@@ -289,14 +242,21 @@ async fn run_client(
                 )
                 .await;
             }
-            Some(env) = outbox.recv() => {
-                if active.active.load(Ordering::SeqCst) {
-                    broadcast(&socket, &mut conns, env).await;
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(super::ClientCmd::Send(m)) => {
+                        if active {
+                            broadcast(&socket, &mut conns, protocol::encode_message(&key, &m)).await;
+                        }
+                        // Not fully punched yet: dropped. Nothing flows
+                        // until every member is reachable anyway.
+                    }
+                    Some(super::ClientCmd::Stop) | None => return,
                 }
             }
             _ = tick.tick() => {
                 let now = Instant::now();
-                if cancel.load(Ordering::SeqCst) {
+                if gen.load(Ordering::SeqCst) != my_gen {
                     return;
                 }
                 if last_bind.elapsed() >= REBIND_EVERY {
@@ -329,40 +289,64 @@ async fn run_client(
                     }
                 }
 
-                // New member mid-party: back to the relay for everyone
-                // until the newcomer has punched too (the completion check
-                // below re-activates UDP).
+                // Membership change: re-punch before anything flows again.
                 if targets.len() != known_targets {
                     known_targets = targets.len();
-                    if active.active.load(Ordering::SeqCst) {
-                        warn!("new party member — re-punching, on the relay meanwhile");
-                        active.active.store(false, Ordering::SeqCst);
+                    if active {
+                        active = false;
+                        mgr.set_conn(my_gen, "reconnecting");
+                        mgr.clear_peers(my_gen);
                     }
                 }
 
-                // Punch outcome.
-                if !targets.is_empty() && !active.active.load(Ordering::SeqCst) {
-                    let punched = conns.values().filter(|c| c.punched).count();
-                    if punched == targets.len() {
-                        info!("punched {punched} peer(s) — peer-to-peer sync");
-                        active.active.store(true, Ordering::SeqCst);
-                    } else if punch_started.elapsed() > PUNCH_GIVE_UP && !punch_warned {
-                        punch_warned = true;
-                        warn!(
-                            "punch incomplete ({punched}/{} peers) — staying on the relay",
-                            targets.len()
-                        );
+                // Fully punched => live. Announce and rebuild the roster.
+                if !targets.is_empty()
+                    && !active
+                    && conns.values().filter(|c| c.punched).count() == targets.len()
+                {
+                    info!("punched all {} peer(s) — peer-to-peer sync", targets.len());
+                    active = true;
+                    mgr.clear_peers(my_gen);
+                    mgr.set_conn(my_gen, "online");
+                    if let Some(me) = mgr.me_snapshot(my_gen) {
+                        broadcast(
+                            &socket,
+                            &mut conns,
+                            protocol::encode_message(&key, &Message::Hello { peer: me }),
+                        )
+                        .await;
                     }
+                } else if !targets.is_empty()
+                    && !active
+                    && !punch_warned
+                    && punch_started.elapsed() > PUNCH_GIVE_UP
+                {
+                    punch_warned = true;
+                    warn!(
+                        "punch incomplete ({}/{} peers) — some members may be unreachable",
+                        conns.values().filter(|c| c.punched).count(),
+                        targets.len()
+                    );
                 }
 
-                // Liveness: a dead punched peer drops everyone back to the relay.
-                if active.active.load(Ordering::SeqCst) {
-                    let dead = conns
-                        .values()
-                        .any(|c| c.punched && now - c.last_seen > DEAD_AFTER);
-                    if dead {
-                        warn!("punch peer lost — falling back to the relay");
-                        active.active.store(false, Ordering::SeqCst);
+                // Liveness: a silent peer stops the party until re-punched.
+                if active {
+                    let dead: Vec<SocketAddr> = conns
+                        .iter()
+                        .filter(|(_, c)| c.punched && now - c.last_seen > DEAD_AFTER)
+                        .map(|(a, _)| *a)
+                        .collect();
+                    if !dead.is_empty() {
+                        warn!("party peer lost — re-punching");
+                        active = false;
+                        mgr.set_conn(my_gen, "reconnecting");
+                        mgr.clear_peers(my_gen);
+                        for addr in dead {
+                            if let Some(c) = conns.get_mut(&addr) {
+                                let peer_id = c.peer_id.clone();
+                                *c = new_conn(peer_id, addr, now);
+                            }
+                        }
                     }
                 }
             }
@@ -392,7 +376,11 @@ fn apply_bound(
 ) {
     *targets = b.peers;
     let listed: HashSet<String> = targets.iter().map(|p| p.id.clone()).collect();
-    conns.retain(|_, c| listed.contains(&c.peer_id));
+    let addrs: HashSet<SocketAddr> = targets
+        .iter()
+        .filter_map(|p| p.addr.parse::<SocketAddr>().ok())
+        .collect();
+    conns.retain(|addr, c| addrs.contains(addr) && listed.contains(&c.peer_id));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -458,18 +446,18 @@ async fn handle_frame(
                 return;
             }
             // Authenticate before touching reliability state.
-            let Some(plain) = protocol::open(key, payload) else {
+            let Some(msg) = protocol::decode_message(key, payload) else {
                 return;
             };
             conn.last_seen = now;
             if seq >= conn.recv_next {
                 if seq > conn.recv_next {
-                    conn.hold.insert(seq, plain);
+                    conn.hold.insert(seq, msg);
                 } else {
-                    deliver(inbound, plain);
+                    let _ = inbound.send(msg);
                     conn.recv_next = conn.recv_next.wrapping_add(1);
                     while let Some(next) = conn.hold.remove(&conn.recv_next) {
-                        deliver(inbound, next);
+                        let _ = inbound.send(next);
                         conn.recv_next = conn.recv_next.wrapping_add(1);
                     }
                 }
@@ -500,13 +488,6 @@ async fn handle_frame(
             }
         }
         _ => {}
-    }
-}
-
-fn deliver(inbound: &UnboundedSender<Message>, plain: Vec<u8>) {
-    // `plain` is the AEAD-verified JSON of a party Message.
-    if let Ok(msg) = serde_json::from_slice::<Message>(&plain) {
-        let _ = inbound.send(msg);
     }
 }
 

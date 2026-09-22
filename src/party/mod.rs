@@ -10,7 +10,6 @@
 
 pub mod punch;
 pub mod protocol;
-pub mod relay;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +21,7 @@ use base64::Engine;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{info, warn};
+
 
 use crate::config;
 use crate::db::PartyRow;
@@ -35,8 +35,8 @@ const HEARTBEAT: Duration = Duration::from_secs(4);
 /// Drop remote peers we haven't heard from for this long.
 const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Command from the manager to the connection task.
-enum ClientCmd {
+/// Command from the manager to the party transport task.
+pub(crate) enum ClientCmd {
     Send(Message),
     Stop,
 }
@@ -56,9 +56,6 @@ struct ActiveParty {
     peers: HashMap<String, Peer>,
     out: UnboundedSender<ClientCmd>,
     conn: String,
-    /// NAT-punch transport state, set by the connection task once the
-    /// punch probe against the relay completes (or not).
-    punch: std::sync::Mutex<Option<Arc<punch::PunchActive>>>,
 }
 
 #[derive(Default)]
@@ -75,6 +72,9 @@ pub struct PartyManager {
     gen: Arc<AtomicU64>,
     /// Roster name for this instance, generated once at startup.
     default_name: String,
+    /// Roster identity for this instance, stable across re-joins so the
+    /// punch hub's room table never accumulates dead identities.
+    me_id: String,
 }
 
 impl PartyManager {
@@ -86,6 +86,7 @@ impl PartyManager {
             inner: Arc::new(Mutex::new(Inner::default())),
             gen: Arc::new(AtomicU64::new(0)),
             default_name: protocol::random_member_name(),
+            me_id: protocol::random_peer_id(),
         });
         mgr.recover_persisted_party();
         mgr
@@ -199,7 +200,7 @@ impl PartyManager {
         }
 
         let me = PeerState {
-            id: protocol::random_peer_id(),
+            id: self.me_id.clone(),
             name: name.clone(),
             ready: false,
             pos: 0.0,
@@ -216,7 +217,6 @@ impl PartyManager {
             peers: HashMap::new(),
             out: tx,
             conn: "connecting".to_string(),
-            punch: std::sync::Mutex::new(None),
         });
 
         let row = PartyRow {
@@ -237,11 +237,20 @@ impl PartyManager {
         }
 
         info!("Watch party activated for item {item_id} (gen {gen})");
-        tokio::spawn(run_client(
+        let key = match invite.key_bytes() {
+            Some(k) => k,
+            None => {
+                warn!("Invalid party key — transport not started");
+                return;
+            }
+        };
+        tokio::spawn(punch::run_transport(
             self.clone(),
             gen,
             self.gen.clone(),
-            invite,
+            invite.relay.clone(),
+            invite.room,
+            key,
             me.id,
             rx,
             in_tx,
@@ -360,12 +369,6 @@ impl PartyManager {
             .values()
             .map(|peer| peer_json(&peer.state))
             .collect();
-        let udp_punched = p
-            .punch
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|a| a.active.load(Ordering::SeqCst));
         serde_json::json!({
             "type": "party",
             "party": {
@@ -374,7 +377,6 @@ impl PartyManager {
                 "relay": p.invite.relay,
                 "lan_only": p.lan_only,
                 "conn": p.conn,
-                "transport": if udp_punched { "udp" } else { "relay" },
                 "title": p.invite.title,
                 "me": peer_json(&p.me),
                 "peers": peers,
@@ -452,124 +454,6 @@ fn peer_json(p: &PeerState) -> serde_json::Value {
         "playing": p.playing,
         "buffering": p.buffering,
     })
-}
-
-/// The relay connection: one outbound WebSocket, auto-reconnecting with
-/// backoff. Encrypts outgoing frames, decrypts incoming ones, and shuttles
-/// both ways between the manager and the wire.
-async fn run_client(
-    mgr: Arc<PartyManager>,
-    my_gen: u64,
-    gen: Arc<AtomicU64>,
-    invite: Invite,
-    peer_id: String,
-    mut cmd_rx: UnboundedReceiver<ClientCmd>,
-    inbound: UnboundedSender<Message>,
-) {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-    let url = protocol::room_ws_url(&invite.relay, &invite.room);
-    let key = match invite.key_bytes() {
-        Some(k) => k,
-        None => return,
-    };
-    // NAT punch probe against the same host, in parallel with the WS
-    // relay connection. Pure optimization: while it hasn't succeeded,
-    // all traffic keeps flowing through the WS.
-    let punch_task = punch::PunchTask::spawn(
-        &invite.relay,
-        &invite.room,
-        key,
-        peer_id.clone(),
-        inbound.clone(),
-    )
-    .await;
-    if let Some(t) = &punch_task {
-        let active = t.active_handle();
-        mgr.with_party(my_gen, |p| {
-            *p.punch.lock().unwrap() = Some(active);
-        });
-    }
-    let mut backoff: u64 = 1;
-
-    loop {
-        if gen.load(Ordering::SeqCst) != my_gen {
-            return;
-        }
-        mgr.set_conn(my_gen, if backoff == 1 { "connecting" } else { "reconnecting" });
-        let connected = tokio_tungstenite::connect_async(url.as_str()).await;
-        let ws = match connected {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                warn!("Party relay connect failed ({url}): {e}");
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(30);
-                continue;
-            }
-        };
-        backoff = 1;
-        mgr.set_conn(my_gen, "online");
-        mgr.clear_peers(my_gen);
-
-        let (mut sink, mut stream) = ws.split();
-        // Announce ourselves; members reply with Presence so the roster
-        // populates immediately.
-        if let Some(me) = mgr.me_snapshot(my_gen) {
-            let hello = Message::Hello { peer: me };
-            let frame = protocol::encode_message(&key, &hello);
-            if sink.send(WsMessage::Binary(frame)).await.is_err() {
-                continue;
-            }
-        }
-        let _ = peer_id;
-
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(ClientCmd::Send(m)) => {
-                            if gen.load(Ordering::SeqCst) != my_gen {
-                                let _ = sink.close().await;
-                                return;
-                            }
-                            let frame = protocol::encode_message(&key, &m);
-                            // Punched peers get frames peer-to-peer; the WS
-                            // relay is the fallback (and the pre-punch path).
-                            if punch_task
-                                .as_ref()
-                                .is_some_and(|t| t.is_active())
-                            {
-                                punch_task.as_ref().unwrap().broadcast(frame);
-                            } else if sink.send(WsMessage::Binary(frame)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(ClientCmd::Stop) | None => {
-                            let _ = sink.close().await;
-                            return;
-                        }
-                    }
-                }
-                msg = stream.next() => {
-                    match msg {
-                        Some(Ok(WsMessage::Binary(b))) => {
-                            if let Some(m) = protocol::decode_message(&key, &b) {
-                                if inbound.send(m).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        Some(Ok(_)) => {}
-                        Some(Err(_)) | None => break,
-                    }
-                }
-            }
-        }
-        // Connection lost — the outer loop reconnects.
-        mgr.set_conn(my_gen, "reconnecting");
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
 }
 
 /// Process decrypted messages from the party: maintain the roster, reply

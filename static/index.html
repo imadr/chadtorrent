@@ -2639,10 +2639,10 @@ $('kb-restore').addEventListener('click', () => {
 
 /* ---------- watch party ----------
  * One party per instance. The server ferries encrypted presence/action
- * messages to the other members (relay or LAN host — the invite decides);
- * this side owns the <video> element: local actions are broadcast, remote
- * actions are applied, and every member downloads the movie from the
- * torrent swarm itself. */
+ * messages to the other members over punched peer-to-peer UDP (the invite's
+ * hub only makes introductions); this side owns the <video> element: local
+ * actions are broadcast, remote actions are applied, and every member
+ * downloads the movie from the torrent swarm itself. */
 let party = null;               // active party snapshot from the server
 let partyWs = null, partyRetry = 0;
 let partyApply = 0;             // >0 while applying remote actions → suppress echo
@@ -2804,7 +2804,7 @@ function renderPartyModal() {
   body.innerHTML =
     '<div class="pt-head"><div class="t">' + esc(p.title || 'Watch party') + '</div>' +
     '<div class="pt-conn ' + connCls + '">' + connLbl +
-    (p.transport === 'udp' ? ' · peer-to-peer' : '') +
+    (p.conn === 'online' ? ' · peer-to-peer' : '') +
     (p.lan_only ? ' · same network only' : '') + '</div></div>' +
     '<div class="pt-invite"><input readonly spellcheck="false" id="pt-invite-str" value="' + esc(p.invite) + '">' +
     '<button class="btn" id="pt-copy">Copy invite</button></div>' +

@@ -28,7 +28,6 @@ flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 bytes = "1"
 async-trait = "0.1"
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 chacha20poly1305 = "0.10"
 base64 = "0.22"
 
