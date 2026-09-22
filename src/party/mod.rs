@@ -331,20 +331,22 @@ impl PartyManager {
         let _ = out.send(ClientCmd::Send(msg));
     }
 
-    /// Local browser reported its player state. Changes worth showing in
-    /// the roster (ready/buffering/playing) trigger an immediate presence
-    /// broadcast so peers react without waiting for the heartbeat.
+    /// Local browser reported its player state. Visible roster changes
+    /// (ready/buffering/playing) also trigger an immediate presence
+    /// broadcast so peers react without waiting for the heartbeat;
+    /// position movement refreshes the local roster only.
     pub fn set_local_state(&self, ready: bool, pos: f64, playing: bool, buffering: bool) {
-        let notify = {
+        let changed = {
             let mut inner = self.inner.lock().unwrap();
             let Some(p) = inner.party.as_mut() else { return };
-            let changed =
+            let visible_changed =
                 p.me.ready != ready || p.me.buffering != buffering || p.me.playing != playing;
+            let moved = (p.me.pos - pos).abs() > 0.25;
             p.me.ready = ready;
             p.me.pos = pos;
             p.me.playing = playing;
             p.me.buffering = buffering;
-            if changed {
+            if visible_changed {
                 let msg = Message::Presence {
                     peer: p.me.clone(),
                 };
@@ -352,9 +354,9 @@ impl PartyManager {
                 drop(inner);
                 let _ = out.send(ClientCmd::Send(msg));
             }
-            changed
+            visible_changed || moved
         };
-        if notify {
+        if changed {
             self.emit_snapshot();
         }
     }

@@ -308,6 +308,10 @@
   .pt-row .nm .you { color: var(--muted); font-weight: 400; }
   .pt-row .pt-pos { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
   .pt-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .ppwrap .subpanel { width: 380px; }
+  .ppwrap .subpanel.open { display: flex; flex-direction: column; gap: 8px; }
+  .ppwrap .pt-invite input { font-size: 10px; }
+  .ppwrap .pt-conn { font-size: 11px; }
 </style>
 
 <div class="floats">
@@ -369,9 +373,12 @@
         <div class="sv">
           <svg id="vicon" viewBox="0 0 24 24"><use href="#ic-vol-hi"/></svg>
           <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
-          <button class="pb" id="partybtn" title="Watch party">
-            <svg viewBox="0 0 24 24"><use href="#ic-users"/></svg>
-          </button>
+          <div class="subwrap ppwrap">
+            <button class="pb" id="partybtn" title="Watch party">
+              <svg viewBox="0 0 24 24"><use href="#ic-users"/></svg>
+            </button>
+            <div class="subpanel" id="partypop"></div>
+          </div>
           <div class="subwrap">
             <button class="pb" id="subsbtn" title="Subtitles">
               <svg viewBox="0 0 24 24"><use href="#ic-subs"/></svg>
@@ -1872,6 +1879,7 @@ function applySubTrack() {
 async function toggleSubsPanel(show) {
   const p = $('subpanel');
   subPanelOpen = show === undefined ? !subPanelOpen : show;
+  if (subPanelOpen && partyPopOpen) togglePartyPop(false);
   p.classList.toggle('open', subPanelOpen);
   if (!subPanelOpen) syncCtrlVis(); // back to bottom-10% hide rule right away
   if (!subPanelOpen || currentId == null) return;
@@ -2200,12 +2208,12 @@ function showLibraryRoute() {
 }
 
 /* show controls only when cursor in bottom 10% of video; back button only near top-left corner.
- * While the subtitles panel is open the controls never hide (the panel lives inside the bar). */
+ * While a popover is open the controls never hide (popovers live inside the bar). */
 let lastMouse = { x: innerWidth / 2, y: innerHeight };
 function syncCtrlVis() {
   if ($('player-modal').hidden) return;
   const r = v.getBoundingClientRect();
-  const show = subPanelOpen || (r.width > 0 && lastMouse.y >= r.top + r.height * 0.9);
+  const show = subPanelOpen || partyPopOpen || (r.width > 0 && lastMouse.y >= r.top + r.height * 0.9);
   $('ctrl').style.display = show ? 'block' : 'none';
 }
 document.addEventListener('mousemove', (e) => {
@@ -2695,6 +2703,7 @@ function partySetSnapshot(p) {
   if (p) partyApplyRoster();
   renderPartyBtn();
   renderPartyModal();
+  renderPartyPop();
   if ((was == null) !== (p == null)) refreshLibrary();
 }
 
@@ -2720,6 +2729,7 @@ async function partyJoin(inviteStr) {
     party = r.party || party;
     ptMode = null;
     openPartyModal();
+    renderPartyPop();
     // Navigate to the movie so the torrent row is visible right away.
     if (r.item_id != null) {
       const it = items.find(i => i.id === r.item_id);
@@ -2754,6 +2764,7 @@ async function partyLeave() {
   party = null; partyAnchor = null; partyAutoPaused = false; partyHoldPlay = false;
   renderPartyBtn();
   closePartyModal();
+  togglePartyPop(false);
 }
 
 /* ----- modal / roster UI ----- */
@@ -2838,7 +2849,6 @@ function renderPartyModal() {
   $('pt-leave').onclick = partyLeave;
 }
 $('btn-party').addEventListener('click', openPartyModal);
-$('partybtn').addEventListener('click', openPartyModal);
 $('pt-close').addEventListener('click', closePartyModal);
 $('party-modal').addEventListener('click', (e) => { if (e.target === $('party-modal')) closePartyModal(); });
 
@@ -2929,6 +2939,61 @@ function partyTick() {
   }
 }
 setInterval(partyTick, 1000);
+
+let partyPopOpen = false;
+function togglePartyPop(show) {
+  partyPopOpen = show === undefined ? !partyPopOpen : show;
+  if (partyPopOpen && subPanelOpen) toggleSubsPanel(false);
+  $('partypop').classList.toggle('open', partyPopOpen);
+  renderPartyPop();
+}
+function renderPartyPop() {
+  if (!partyPopOpen) return;
+  const p = $('partypop');
+  if (!party) {
+    p.innerHTML =
+      '<h4>Watch party</h4>' +
+      '<div class="pt-join"><input type="text" id="pp-invite" placeholder="Paste an invite…">' +
+      '<button class="btn primary" id="pp-join">Join</button></div>' +
+      '<div class="pt-hint">To start one, use the party button on a torrent row.</div>';
+    const inp = $('pp-invite');
+    const go = () => { if (inp.value.trim()) partyJoin(inp.value); };
+    $('pp-join').onclick = go;
+    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+    return;
+  }
+  const connLbl = { connecting: 'connecting…', online: 'connected', reconnecting: 'reconnecting…' }[party.conn]
+    || party.conn || 'unknown';
+  const roster = [Object.assign({ me: true }, party.me)]
+    .concat((party.peers || []).map(x => Object.assign({ me: false }, x)))
+    .map(x =>
+      '<div class="row pt-row' + (x.buffering ? ' wait' : '') + '">' +
+      '<span class="dot' + (x.ready ? ' ok' : '') + '" title="' + (x.ready ? 'ready' : 'not ready yet') + '"></span>' +
+      '<div class="nm"><div class="t">' + esc(x.name || 'member') + (x.me ? ' <span class="you">(you)</span>' : '') + '</div>' +
+      '<div class="s">' + (x.buffering ? 'buffering…' : x.playing ? 'watching' : 'paused') + '</div></div>' +
+      '<div class="pt-pos">' + fmtClock(x.pos || 0) + '</div></div>').join('');
+  p.innerHTML =
+    '<h4>Watch party</h4>' +
+    '<div class="pt-conn' + (party.conn === 'online' ? ' ok' : '') + '">' + connLbl +
+    (party.conn === 'online' ? ' · peer-to-peer' : '') + '</div>' +
+    '<div class="pt-invite"><input readonly spellcheck="false" id="pp-invite-str" value="' + esc(party.invite) + '">' +
+    '<button class="btn" id="pp-copy">Copy</button></div>' +
+    '<div class="rows pt-roster">' + roster + '</div>' +
+    '<div class="pt-actions"><button class="btn danger" id="pp-leave">' +
+    (ptLeaveArmed ? 'Confirm?' : 'Leave') + '</button></div>';
+  $('pp-copy').onclick = async () => {
+    const btn = $('pp-copy');
+    try { await navigator.clipboard.writeText(party.invite); }
+    catch (e) { const i = $('pp-invite-str'); i.select(); try { document.execCommand('copy'); } catch (e2) {} }
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+  };
+  $('pp-leave').onclick = partyLeave;
+}
+$('partybtn').addEventListener('click', (e) => { e.stopPropagation(); togglePartyPop(); });
+document.addEventListener('click', (e) => {
+  if (partyPopOpen && !e.target.closest('.ppwrap')) togglePartyPop(false);
+});
 
 /* Invite pasted into the Add box joins the party instead of searching. */
 $('am-search').addEventListener('keydown', (e) => {
