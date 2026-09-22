@@ -190,6 +190,7 @@
   .strip { display: flex; align-items: center; gap: 10px; }
   .pb { cursor: pointer; padding: 0; width: 32px; height: 32px; background: none; border: none;
         flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; }
+  .pb.on svg { stroke: var(--ok); }
   .pb svg { width: 16px; height: 16px; stroke: #fff; stroke-width: 2; fill: none;
             stroke-linecap: round; stroke-linejoin: round; }
   .tm { color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -368,6 +369,9 @@
         <div class="sv">
           <svg id="vicon" viewBox="0 0 24 24"><use href="#ic-vol-hi"/></svg>
           <input class="vl" id="volbar" type="range" min="0" max="100" value="100">
+          <button class="pb" id="partybtn" title="Watch party">
+            <svg viewBox="0 0 24 24"><use href="#ic-users"/></svg>
+          </button>
           <div class="subwrap">
             <button class="pb" id="subsbtn" title="Subtitles">
               <svg viewBox="0 0 24 24"><use href="#ic-subs"/></svg>
@@ -2332,6 +2336,7 @@ function saveKeybinds() {
   } catch (e) {}
 }
 function activeKeyCtx() {
+  if (!$('party-modal').hidden) return KCTX_MODAL;
   if (!$('player-modal').hidden) return KCTX_PLAYER;
   if (!$('party-modal').hidden) return KCTX_MODAL;
   if (!$('settings-modal').hidden) return KCTX_MODAL;
@@ -2768,6 +2773,11 @@ function renderPartyBtn() {
   const b = $('btn-party');
   b.classList.toggle('on', !!party);
   b.title = party ? 'Watch party — active' : 'Watch party';
+  const pb = $('partybtn');
+  if (pb) {
+    pb.classList.toggle('on', !!party);
+    pb.title = party ? 'Watch party — active' : 'Watch party';
+  }
 }
 function renderPartyModal() {
   if ($('party-modal').hidden && !party) return;
@@ -2828,6 +2838,7 @@ function renderPartyModal() {
   $('pt-leave').onclick = partyLeave;
 }
 $('btn-party').addEventListener('click', openPartyModal);
+$('partybtn').addEventListener('click', openPartyModal);
 $('pt-close').addEventListener('click', closePartyModal);
 $('party-modal').addEventListener('click', (e) => { if (e.target === $('party-modal')) closePartyModal(); });
 
