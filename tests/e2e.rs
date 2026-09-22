@@ -367,6 +367,9 @@ async fn watch_party_join_and_action_sync() {
         .unwrap();
     assert!(invite.starts_with("CTPARTY1:"));
 
+    // Alone in the room but hub reachable: already online.
+    wait_for(&party_a, |s| s["party"]["conn"] == serde_json::json!("online")).await;
+
     // Joiner: its own instance, its own library.
     let library_b = setup_app(&tmp_b.path().join("app")).await;
     let (http_b, _ws_b, party_b, srv_b) = start_http(library_b.clone()).await;

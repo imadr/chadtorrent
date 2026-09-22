@@ -214,6 +214,7 @@ pub(crate) async fn run_transport(
     let mut conns: HashMap<SocketAddr, PeerConn> = HashMap::new();
     let mut last_bind = Instant::now() - REBIND_EVERY;
     let mut punch_warned = false;
+    let mut hub_alive = false;
     let punch_started = Instant::now();
     let mut known_targets = 0usize;
     let mut active = false;
@@ -230,8 +231,9 @@ pub(crate) async fn run_transport(
                 let Ok((n, from)) = r else { continue };
                 let frame = &buf[..n];
                 if frame.first() == Some(&b'{') {
-                    // Hub push (JSON Bound).
+                    // Hub push (JSON Bound) — proof the hub is reachable.
                     if let Ok(b) = serde_json::from_slice::<Bound>(frame) {
+                        hub_alive = true;
                         apply_bound(&mut targets, &mut conns, b);
                     }
                     continue;
@@ -299,12 +301,18 @@ pub(crate) async fn run_transport(
                     }
                 }
 
-                // Fully punched => live. Announce and rebuild the roster.
-                if !targets.is_empty()
-                    && !active
-                    && conns.values().filter(|c| c.punched).count() == targets.len()
-                {
-                    info!("punched all {} peer(s) — peer-to-peer sync", targets.len());
+                // Fully punched (or alone in the room) => live. Announce
+                // and rebuild the roster.
+                let alone = hub_alive && targets.is_empty();
+                let targets_len = targets.len();
+                let all_punched = targets_len > 0
+                    && conns.values().filter(|c| c.punched).count() == targets_len;
+                if !active && (alone || all_punched) {
+                    if alone {
+                        info!("party hub reached — waiting for other members");
+                    } else {
+                        info!("punched all {targets_len} peer(s) — peer-to-peer sync");
+                    }
                     active = true;
                     mgr.clear_peers(my_gen);
                     mgr.set_conn(my_gen, "online");
