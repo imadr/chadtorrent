@@ -4,6 +4,7 @@ mod error;
 mod http;
 mod library;
 mod metadata;
+mod party;
 mod remux;
 mod segmenter;
 mod subtitles;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use config::Config;
 use http::AppState;
 use library::LibraryManager;
+use party::PartyManager;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -94,11 +96,14 @@ async fn main() {
 
     let index_html = include_str!("../static/index.html").to_string();
 
+    let party = PartyManager::new(library.clone());
+
     let state = AppState {
         library: library.clone(),
         index_html,
         tmdb,
         subs,
+        party,
     };
 
     let router = http::build_router(state);

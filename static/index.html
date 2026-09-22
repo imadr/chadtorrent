@@ -278,10 +278,40 @@
 
   .spin { animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------- watch party ---------- */
+  #btn-party.on { border-color: var(--ok); }
+  #btn-party.on svg { stroke: var(--ok); }
+  .pt-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-width: 420px; max-width: 560px; }
+  .pt-join { display: flex; gap: 8px; }
+  .pt-join input { flex: 1; min-width: 0; background: var(--panel2); border: 0.5px solid var(--line);
+                    color: var(--text); padding: 8px 10px; font: inherit; font-size: 13px; }
+  .pt-hint { color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+  .pt-head { display: flex; flex-direction: column; gap: 2px; }
+  .pt-head .t { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pt-conn { color: var(--muted); font-size: 12px; }
+  .pt-conn.ok { color: var(--ok); }
+  .pt-conn.err { color: var(--warn); }
+  .pt-invite { display: flex; gap: 8px; }
+  .pt-invite input { flex: 1; min-width: 0; background: var(--panel2); border: 0.5px solid var(--line);
+                     color: var(--muted); padding: 8px 10px; font: 12px ui-monospace, monospace; }
+  .pt-roster { gap: 6px; }
+  .pt-roster .row { padding: 7px 12px; min-height: 0; }
+  .pt-row .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line-hi); flex-shrink: 0; }
+  .pt-row .dot.ok { background: var(--ok); }
+  .pt-row.wait .dot { background: var(--warn); animation: blink 1.2s ease-in-out infinite; }
+  @keyframes blink { 50% { opacity: .3; } }
+  .pt-row .nm { flex: 1; min-width: 0; }
+  .pt-row .nm .t { font-size: 13.5px; }
+  .pt-row .nm .s { color: var(--muted); font-size: 11.5px; }
+  .pt-row .nm .you { color: var(--muted); font-weight: 400; }
+  .pt-row .pt-pos { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .pt-actions { display: flex; gap: 8px; justify-content: flex-end; }
 </style>
 
 <div class="floats">
   <button class="btn primary" id="btn-add"><svg viewBox="0 0 24 24"><use href="#ic-plus"/></svg>Add</button>
+  <button class="btn" id="btn-party" title="Watch party"><svg viewBox="0 0 24 24"><use href="#ic-users"/></svg>Party</button>
   <button class="btn" id="btn-settings" title="Settings"><svg viewBox="0 0 24 24"><use href="#ic-settings"/></svg>Settings</button>
 </div>
 
@@ -361,6 +391,13 @@
   </div>
 </div>
 
+<div class="modal" id="party-modal" hidden>
+  <div class="panel">
+    <div class="phead"><span>Watch party</span><button class="x" id="pt-close">✕</button></div>
+    <div id="pt-body" class="pt-body"></div>
+  </div>
+</div>
+
 <div class="modal" id="confirm-modal" hidden>
   <div class="panel confirm">
     <div class="phead"><span>Confirm</span><button class="x" id="cf-cancel">✕</button></div>
@@ -425,6 +462,8 @@
   <symbol id="ic-bin" viewBox="0 0 24 24"><path d="M4 7l16 0"/><path d="M10 11l0 6"/><path d="M14 11l0 6"/><path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12"/><path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3"/></symbol>
   <symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14"/><path d="M5 12h14"/></symbol>
   <symbol id="ic-settings" viewBox="0 0 24 24"><path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 0 0-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 0 0-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 0 0-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 0 0-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 0 0 1.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path d="M15 12a3 3 0 1 0-6 0a3 3 0 0 0 6 0"/></symbol>
+  <symbol id="ic-users" viewBox="0 0 24 24"><path d="M9 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0"/><path d="M3 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/><path d="M21 21v-2a4 4 0 0 0 -3 -3.85"/></symbol>
+  <symbol id="ic-copy" viewBox="0 0 24 24"><path d="M8 8h10a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-10a2 2 0 0 1 2 -2z"/><path d="M16 8v-2a2 2 0 0 0 -2 -2h-8a2 2 0 0 0 -2 2v8a2 2 0 0 0 2 2h2"/></symbol>
 </svg>
 
 <script>
@@ -755,6 +794,16 @@ function renderTorrentRow(el, t) {
   del.className = 'ibtn danger'; del.innerHTML = IC_BIN;
   del.onclick = () => delItem(t);
   el.appendChild(del);
+  const ptBtn = document.createElement('button');
+  ptBtn.className = 'ibtn';
+  ptBtn.innerHTML = '<svg viewBox="0 0 24 24" style="width:15px;height:15px;stroke:currentColor;stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round"><use href="#ic-users"/></svg>';
+  ptBtn.title = 'Watch party';
+  ptBtn.onclick = (e) => {
+    e.stopPropagation();
+    if (party && party.item_id === t.id) openPartyModal();
+    else partyCreate(t.id);
+  };
+  el.appendChild(ptBtn);
   if (t.state !== '_pending' && t.state !== 'connecting') {
     const seq = document.createElement('label');
     seq.className = 'seq'; seq.title = 'Download pieces in order';
@@ -1140,7 +1189,13 @@ async function startSegSession() {
   // restore the playhead after a session recovery
   // Restore the saved playhead (or the recovery point). Goes through seekTo
   // so an undownloaded resume point shows the spinner and pendSeek kicks in.
-  if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
+  // In a watch party the party position wins: start where everyone is
+  // (anchor), and if the party is paused don't auto-play on data arrival.
+  if (partyPlayerActive() && partyAnchor) {
+    partyHoldPlay = !partyAnchor.playing;
+    if (partyAnchor.t > 0.5) seekTo(partyAnchor.t);
+    resumeAt = 0;
+  } else if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
   // re-attach the active subtitle track for this item's new session
   if (activeSub && activeSub.id === currentId) applySubTrack();
 }
@@ -1296,7 +1351,7 @@ async function pumpLoop(gen, id) {
       }
       // Never clear the spinner while the seek target still has no data.
       if (pendSeek == null) hideBuf();
-      if (firstPlay) { firstPlay = false; if (v.paused) v.play().catch(() => {}); }
+      if (firstPlay) { firstPlay = false; if (v.paused && !partyHoldPlay) v.play().catch(() => {}); }
       continue;
     }
 
@@ -1446,8 +1501,8 @@ window.addEventListener('beforeunload', () => stopPlayback());
 
 /* ---------- player controls ---------- */
 const ppic = () => $('ppicon');
-v.addEventListener('play',  () => { ppic().innerHTML = '<use href="#ic-pause"/>'; });
-v.addEventListener('pause', () => { ppic().innerHTML = '<use href="#ic-play"/>'; });
+v.addEventListener('play',  () => { ppic().innerHTML = '<use href="#ic-pause"/>'; partyLocalAction('play'); });
+v.addEventListener('pause', () => { ppic().innerHTML = '<use href="#ic-play"/>'; partyLocalAction('pause'); });
 $('ppbtn').addEventListener('click', () => { v.paused ? v.play().catch(()=>{}) : v.pause(); });
 
 function updSeek() {
@@ -2278,6 +2333,7 @@ function saveKeybinds() {
 }
 function activeKeyCtx() {
   if (!$('player-modal').hidden) return KCTX_PLAYER;
+  if (!$('party-modal').hidden) return KCTX_MODAL;
   if (!$('settings-modal').hidden) return KCTX_MODAL;
   if (!$('add-modal').hidden) return KCTX_MODAL;
   if (!$('confirm-modal').hidden) return KCTX_MODAL;
@@ -2550,6 +2606,7 @@ function closeSettings() {
  * single action (label 'Close'), so e.g. Escape closes the confirm-delete
  * dialog instead of letting the movie/library binding underneath fire. */
 function closeModal() {
+  if (!$('party-modal').hidden) { closePartyModal(); return; }
   if (!$('settings-modal').hidden) { closeSettings(); return; }
   if (!$('add-modal').hidden) { closeAdd(); return; }
   if (!$('confirm-modal').hidden) { $('cf-cancel').click(); return; }
@@ -2580,8 +2637,301 @@ $('kb-restore').addEventListener('click', () => {
   renderKbSettings();
 });
 
+/* ---------- watch party ----------
+ * One party per instance. The server ferries encrypted presence/action
+ * messages to the other members (relay or LAN host — the invite decides);
+ * this side owns the <video> element: local actions are broadcast, remote
+ * actions are applied, and every member downloads the movie from the
+ * torrent swarm itself. */
+let party = null;               // active party snapshot from the server
+let partyWs = null, partyRetry = 0;
+let partyApply = 0;             // >0 while applying remote actions → suppress echo
+let partyAnchor = null;         // {t, playing, at}: party position from the last action
+let partyAutoPaused = false;    // we paused because a member is buffering
+let partyHoldPlay = false;      // party is paused → block the pump's auto-play
+let ptMode = null;              // current party modal render mode
+
+function partyWsConnect() {
+  if (partyWs) { try { partyWs.close(); } catch (e) {} partyWs = null; }
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  try { partyWs = new WebSocket(proto + location.host + '/ws/party'); } catch (e) { return; }
+  partyWs.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'party') partySetSnapshot(m.party);
+    else if (m.type === 'action') partyApplyAction(m.kind, m.t, m.by);
+  };
+  partyWs.onopen = () => { partyRetry = 0; };
+  partyWs.onclose = () => {
+    partyWs = null;
+    setTimeout(partyWsConnect, Math.min(10000, 1500 * Math.max(1, ++partyRetry)));
+  };
+}
+function partySend(o) {
+  if (partyWs && partyWs.readyState === 1) { try { partyWs.send(JSON.stringify(o)); } catch (e) {} }
+}
+function partyPlayerActive() {
+  return !!(party && currentId === party.item_id && !$('player-modal').hidden);
+}
+
+function partySetSnapshot(p) {
+  const was = party;
+  party = p;
+  if (!p) {
+    partyAnchor = null; partyAutoPaused = false; partyHoldPlay = false;
+    // Party ended (left or item deleted): never fall through to the join
+    // form — close the panel.
+    if (was) closePartyModal();
+  }
+  if (p && !partyAnchor) {
+    // Late joiner: adopt the playing party's position as the anchor.
+    const playing = p.peers.find(x => x.playing);
+    if (playing) partyAnchor = { t: playing.pos, playing: true, at: Date.now() };
+  }
+  if (p) partyApplyRoster();
+  renderPartyBtn();
+  renderPartyModal();
+  if ((was == null) !== (p == null)) refreshLibrary();
+}
+
+/* ----- create / join -----
+ * Roster names are auto-generated by each instance at startup (the server
+ * falls back to its own name when none is sent). */
+async function partyCreate(itemId) {
+  try {
+    await api('/api/party', { method: 'POST', body: JSON.stringify({ item_id: itemId }) });
+    partyWsConnect();
+    openPartyModal();
+  } catch (e) { console.error('party create failed', e); }
+}
+async function partyJoin(inviteStr) {
+  const s = inviteStr.trim();
+  if (!s.toUpperCase().startsWith('CTPARTY1:')) return false;
+  const body = $('pt-body');
+  body.innerHTML = '<div class="empty" style="padding:12px 0">Joining…</div>';
+  try {
+    const r = await api('/api/party/join', { method: 'POST', body: JSON.stringify({ invite: s }) });
+    partyWsConnect();
+    refreshLibrary();
+    party = r.party || party;
+    ptMode = null;
+    openPartyModal();
+    // Navigate to the movie so the torrent row is visible right away.
+    if (r.item_id != null) {
+      const it = items.find(i => i.id === r.item_id);
+      if (it) { const k = groupKey(it); if (k && k !== (currentMovie && currentMovie.key)) openMovie(k); }
+    }
+    return true;
+  } catch (e) {
+    ptMode = null;
+    openPartyModal();
+    const box = $('pt-body');
+    box.insertAdjacentHTML('afterbegin',
+      '<div style="color:var(--danger);font-size:13px">' + esc(String(e.message || e).slice(0, 120)) + '</div>');
+    return false;
+  }
+}
+/* Two-step leave: first click arms the button ("Confirm?"), second click
+ * leaves. No stacked confirm dialog. Armed state survives the periodic
+ * roster re-renders via the flag; it decays after 4s. */
+let ptLeaveArmed = false, ptLeaveTimer = 0;
+async function partyLeave() {
+  if (!ptLeaveArmed) {
+    ptLeaveArmed = true;
+    const btn = $('pt-leave');
+    if (btn) btn.textContent = 'Confirm?';
+    clearTimeout(ptLeaveTimer);
+    ptLeaveTimer = setTimeout(() => { ptLeaveArmed = false; renderPartyModal(); }, 4000);
+    return;
+  }
+  clearTimeout(ptLeaveTimer);
+  ptLeaveArmed = false;
+  try { await api('/api/party/leave', { method: 'POST' }); } catch (e) {}
+  party = null; partyAnchor = null; partyAutoPaused = false; partyHoldPlay = false;
+  renderPartyBtn();
+  closePartyModal();
+}
+
+/* ----- modal / roster UI ----- */
+function openPartyModal() {
+  clearTimeout(ptLeaveTimer);
+  ptLeaveArmed = false;
+  $('party-modal').hidden = false;
+  ptMode = null;
+  renderPartyModal();
+}
+function closePartyModal() {
+  clearTimeout(ptLeaveTimer);
+  ptLeaveArmed = false;
+  $('party-modal').hidden = true;
+}
+function renderPartyBtn() {
+  const b = $('btn-party');
+  b.classList.toggle('on', !!party);
+  b.title = party ? 'Watch party — active' : 'Watch party';
+}
+function renderPartyModal() {
+  if ($('party-modal').hidden && !party) return;
+  const mode = party ? 'active' : 'join';
+  if (mode === 'join' && ptMode === 'join') return;  // don't clobber typing
+  ptMode = mode;
+  const body = $('pt-body');
+  if (!party) {
+    body.innerHTML =
+      '<div class="pt-join"><input type="text" id="pt-invite" placeholder="Paste a watch party invite…">' +
+      '<button class="btn primary" id="pt-joinbtn">Join</button></div>' +
+      '<div class="pt-hint">To start a watch party, open a movie and press the party button on a torrent row. ' +
+      'Send the invite to your friends — they paste it here. Everyone downloads the movie with their own ' +
+      'BitTorrent swarm and playback stays in sync.</div>';
+    const inp = $('pt-invite');
+    const go = () => { if (inp.value.trim()) partyJoin(inp.value); };
+    $('pt-joinbtn').onclick = go;
+    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+    setTimeout(() => inp.focus(), 50);
+    return;
+  }
+  const p = party;
+  const connLbl = { connecting: 'connecting…', online: 'connected', reconnecting: 'reconnecting…' }[p.conn]
+    || p.conn || 'unknown';
+  const connCls = p.conn === 'online' ? 'ok' : (p.conn === 'reconnecting' || p.conn === 'connecting' ? 'err' : '');
+  const roster = [Object.assign({ me: true }, p.me)]
+    .concat((p.peers || []).map(x => Object.assign({ me: false }, x)))
+    .map(x =>
+      '<div class="row pt-row' + (x.buffering ? ' wait' : '') + '">' +
+      '<span class="dot' + (x.ready ? ' ok' : '') + '" title="' + (x.ready ? 'ready' : 'not ready yet') + '"></span>' +
+      '<div class="nm"><div class="t">' + esc(x.name || 'member') + (x.me ? ' <span class="you">(you)</span>' : '') + '</div>' +
+      '<div class="s">' + (x.buffering ? 'buffering…' : x.playing ? 'watching' : 'paused') + '</div></div>' +
+      '<div class="pt-pos">' + fmtClock(x.pos || 0) + '</div></div>').join('');
+  body.innerHTML =
+    '<div class="pt-head"><div class="t">' + esc(p.title || 'Watch party') + '</div>' +
+    '<div class="pt-conn ' + connCls + '">' + connLbl +
+    (p.transport === 'udp' ? ' · peer-to-peer' : '') +
+    (p.lan_only ? ' · same network only' : '') + '</div></div>' +
+    '<div class="pt-invite"><input readonly spellcheck="false" id="pt-invite-str" value="' + esc(p.invite) + '">' +
+    '<button class="btn" id="pt-copy">Copy invite</button></div>' +
+    '<div class="rows pt-roster">' + roster + '</div>' +
+    '<div class="pt-actions"><button class="btn primary" id="pt-watch">Watch</button>' +
+    '<button class="btn danger" id="pt-leave">' + (ptLeaveArmed ? 'Confirm?' : 'Leave') + '</button></div>';
+  $('pt-copy').onclick = async () => {
+    const btn = $('pt-copy');
+    try { await navigator.clipboard.writeText(p.invite); }
+    catch (e) { const i = $('pt-invite-str'); i.select(); try { document.execCommand('copy'); } catch (e2) {} }
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = 'Copy invite'; }, 1500);
+  };
+  $('pt-watch').onclick = () => {
+    const it = items.find(i => i.id === p.item_id);
+    if (!it) return;
+    const canPlay = it.state !== '_pending' && it.state !== 'connecting' && it.state !== 'error';
+    closePartyModal();
+    if (canPlay) playTorrent(it);
+  };
+  $('pt-leave').onclick = partyLeave;
+}
+$('btn-party').addEventListener('click', openPartyModal);
+$('pt-close').addEventListener('click', closePartyModal);
+$('party-modal').addEventListener('click', (e) => { if (e.target === $('party-modal')) closePartyModal(); });
+
+/* ----- actions: remote → player ----- */
+function partyApplyAction(kind, t, by) {
+  if (!party) return;
+  t = Math.max(0, isFinite(t) ? t : 0);
+  partyAnchor = { t, playing: kind === 'play', at: Date.now() };
+  partyHoldPlay = kind === 'pause';
+  if (!partyPlayerActive()) return;
+  partyApply++;
+  try {
+    if (kind === 'seek') {
+      seekTo(t);
+    } else if (kind === 'play') {
+      partyAutoPaused = false;
+      if (Math.abs((v.currentTime || 0) - t) > 1.5) seekTo(t);
+      v.play().catch(() => {});
+      hideBuf();
+    } else if (kind === 'pause') {
+      v.pause();
+      hideBuf();
+    }
+  } finally { setTimeout(() => partyApply--, 300); }
+}
+
+/* ----- actions: player → remote ----- */
+function partyLocalAction(kind) {
+  if (partyApply || !partyPlayerActive()) return;
+  const t = v.currentTime || 0;
+  partyAnchor = { t, playing: kind === 'play', at: Date.now() };
+  partyHoldPlay = kind === 'pause';
+  partySend({ type: 'action', kind, t });
+}
+v.addEventListener('seeked', () => partyLocalAction('seek'));
+
+/* ----- strict sync: pause everyone while a member buffers ----- */
+function partyApplyRoster() {
+  if (!party) return;
+  const waiting = (party.peers || []).filter(x => x.buffering);
+  if (partyPlayerActive() && !partyApply) {
+    if (waiting.length && !v.paused) {
+      partyAutoPaused = true;
+      partyHoldPlay = true;
+      partyApply++;
+      try { v.pause(); } finally { setTimeout(() => partyApply--, 300); }
+      showBuf('Waiting for ' + waiting.map(w => w.name || 'someone').join(', ') + '…');
+    } else if (!waiting.length && partyAutoPaused) {
+      partyAutoPaused = false;
+      partyHoldPlay = false;
+      partyApply++;
+      try { v.play().catch(() => {}); } finally { setTimeout(() => partyApply--, 300); }
+      hideBuf();
+    }
+  }
+}
+
+/* ----- state reporting + drift correction (1s) ----- */
+function partyReady() {
+  if (!partyPlayerActive()) return false;
+  const target = partyAnchor ? partyAnchor.t : (v.currentTime || 0);
+  try {
+    const b = v.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (target >= b.start(i) - 0.5 && target <= b.end(i) + 0.5 && b.end(i) - target >= 60) return true;
+    }
+  } catch (e) {}
+  if (segInfo && segInfo.done && fullDur && target + 60 >= fullDur) return true;
+  return false;
+}
+function partyTick() {
+  if (!party || !partyWs || partyWs.readyState !== 1) return;
+  const active = partyPlayerActive();
+  const playing = active && !v.paused;
+  const pos = active ? (v.currentTime || 0) : ((party.me && party.me.pos) || 0);
+  // "Buffering" for the party means: trying to play but starved for >2s,
+  // or waiting on a seek past the download frontier.
+  let buffering = false;
+  if (playing && bufferingSince && Date.now() - bufferingSince > 2000) buffering = true;
+  if (playing && pendSeek != null) buffering = true;
+  partySend({ type: 'state', ready: partyReady(), pos, playing, buffering });
+  if (playing && partyAnchor && partyAnchor.playing) {
+    const est = partyAnchor.t + (Date.now() - partyAnchor.at) / 1000;
+    if (est > 2 && Math.abs((v.currentTime || 0) - est) > 2.5) {
+      partyApply++;
+      try { seekTo(est); } finally { setTimeout(() => partyApply--, 300); }
+    }
+  }
+}
+setInterval(partyTick, 1000);
+
+/* Invite pasted into the Add box joins the party instead of searching. */
+$('am-search').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && amSel < 0 && $('am-search').value.trim().toUpperCase().startsWith('CTPARTY1:')) {
+    e.preventDefault();
+    const s = $('am-search').value.trim();
+    closeAdd();
+    partyJoin(s);
+  }
+}, true);  // capture: run before the arrow-nav handler below
+
 /* ---------- misc ---------- */
 function fmtClock(sec) {
+
   if (!isFinite(sec) || sec < 0) sec = 0;
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
@@ -2638,6 +2988,8 @@ async function pollDownloads() {
 
 updVol();
 refreshLibrary();
+partyWsConnect();
+renderPartyBtn();
 setInterval(pollDownloads, 1000);
 setInterval(refreshLibrary, 3000);
 </script>

@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use chadtorrent::config::Config;
 use chadtorrent::http::{AppState, build_router};
 use chadtorrent::library::LibraryManager;
+use chadtorrent::party::PartyManager;
 
 fn make_pattern(size: usize) -> Vec<u8> {
     let mut state: u64 = 0x9E3779B97F4A7C15;
@@ -26,6 +27,7 @@ fn config_for(tmp: &Path) -> Config {
         library_dir: tmp.join("library"),
         temp_dir: tmp.join("temp"),
         db_path: tmp.join("test.db"),
+        party_relay: None,
     }
 }
 
@@ -35,9 +37,10 @@ async fn setup_app(tmp: &Path) -> Arc<LibraryManager> {
 
 async fn start_http(
     library: Arc<LibraryManager>,
-) -> (String, String, tokio::task::AbortHandle) {
+) -> (String, String, Arc<PartyManager>, tokio::task::AbortHandle) {
     let index_html = include_str!("../static/index.html").to_string();
-    let router = build_router(AppState { library, index_html, tmdb: None, subs: None });
+    let party = PartyManager::new(library.clone());
+    let router = build_router(AppState { library, index_html, tmdb: None, subs: None, party: party.clone() });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -47,14 +50,14 @@ async fn start_http(
     });
     let http = format!("http://{addr}");
     let ws = format!("ws://{addr}");
-    (http, ws, handle.abort_handle())
+    (http, ws, party, handle.abort_handle())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_error_handling() {
     let tmp = TempDir::new().unwrap();
     let library = setup_app(&tmp.path().join("app")).await;
-    let (http, _ws, srv) = start_http(library.clone()).await;
+    let (http, _ws, _party, srv) = start_http(library.clone()).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -89,6 +92,23 @@ async fn http_error_handling() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+
+    // watch-party surface: no party yet, and garbage invites are rejected
+    let resp = client.get(format!("{http}/api/party")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.json::<serde_json::Value>().await.unwrap()["party"].is_null());
+    let resp = client
+        .post(format!("{http}/api/party/join"))
+        .json(&serde_json::json!({ "invite": "CTPARTY1:garbage!" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // relay health endpoint is mounted on every instance
+    let resp = client.get(format!("{http}/health")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
     drop(srv);
 }
 
@@ -242,7 +262,7 @@ async fn segment_stream_pipeline() {
     }
     let tmp = TempDir::new().unwrap();
     let library = setup_app(&tmp.path().join("app")).await;
-    let (http, _ws, _srv) = start_http(library.clone()).await;
+    let (http, _ws, _party, _srv) = start_http(library.clone()).await;
     let client = reqwest::Client::new();
 
     // 6s 64x64 test clip (video+audio) so at least one media segment exists.
@@ -317,4 +337,283 @@ fn which_ffmpeg() -> Option<std::path::PathBuf> {
             .map(|p| p.join("ffmpeg"))
             .find(|p| p.is_file())
     })
+}
+
+/* ---------- watch party ---------- */
+
+/// The relay broadcasts frames between members of a room and never echoes
+/// a frame back to its sender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_broadcasts_between_members() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(&tmp.path().join("app")).await;
+    let (_http, ws, _party, srv) = start_http(library.clone()).await;
+
+    let (mut a, _) = tokio_tungstenite::connect_async(format!("{ws}/ws/party/relay/room1"))
+        .await
+        .unwrap();
+    let (mut b, _) = tokio_tungstenite::connect_async(format!("{ws}/ws/party/relay/room1"))
+        .await
+        .unwrap();
+    // Let both upgrade handlers register in the room.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    a.send(WsMessage::Binary(vec![1, 2, 3])).await.unwrap();
+
+    // b receives exactly that frame
+    let got = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match b.next().await.unwrap().unwrap() {
+                WsMessage::Binary(data) => break data,
+                _ => continue,
+            }
+        }
+    })
+    .await
+    .expect("member b should receive the frame");
+    assert_eq!(&got[..], &[1, 2, 3]);
+
+    // a must NOT receive its own frame back
+    if let Ok(Some(Ok(_))) = tokio::time::timeout(std::time::Duration::from_millis(300), a.next()).await {
+        panic!("relay must not echo frames to the sender");
+    }
+
+    drop(srv);
+    library.stop().await;
+}
+
+/// Full two-instance party: A creates (its own instance doubles as relay),
+/// B joins via the invite — torrent added + deduped by infohash — and B's
+/// action reaches A's roster through the encrypted relay pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_party_join_and_action_sync() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let library_a = setup_app(&tmp_a.path().join("app")).await;
+    let (_http_a, ws_a, party_a, srv_a) = start_http(library_a.clone()).await;
+
+    // Creator's item: any state works for party creation (magnet is enough).
+    let ida = library_a
+        .db
+        .insert_item("magnet:?xt=urn:btih:FEEDCAFEBABE0000000000000000000000000000&dn=test")
+        .unwrap();
+    library_a
+        .db
+        .update_metadata(ida, Some("Party Movie"), Some(1999), None, Some(777), Some("movie"))
+        .unwrap();
+
+    let (invite, _lan_only) = party_a
+        .create(ida, "alice", Some(ws_a.clone()))
+        .unwrap();
+    assert!(invite.starts_with("CTPARTY1:"));
+
+    // Joiner: its own instance, its own library.
+    let library_b = setup_app(&tmp_b.path().join("app")).await;
+    let (http_b, _ws_b, party_b, srv_b) = start_http(library_b.clone()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{http_b}/api/party/join"))
+        .json(&serde_json::json!({ "invite": invite, "name": "bob" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = resp.json().await.unwrap();
+    let item_b = v["item_id"].as_i64().unwrap();
+
+    // The torrent was added exactly once with the invite's metadata.
+    let items = library_b.db.list_items().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, item_b);
+    assert_eq!(items[0].tmdb_id, Some(777));
+    assert_eq!(items[0].title.as_deref(), Some("Party Movie"));
+
+    // Joining twice with the same invite dedupes by infohash.
+    let resp = client
+        .post(format!("{http_b}/api/party/join"))
+        .json(&serde_json::json!({ "invite": invite, "name": "bob" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(library_b.db.list_items().unwrap().len(), 1);
+
+    // B connects to A's relay; rosters converge on both sides.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snap = party_b.snapshot_json();
+        let conn = snap["party"]["conn"].as_str().unwrap_or("");
+        if conn == "online" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "B should connect to the relay");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    wait_for(&party_a, |snap| {
+        snap["party"]["peers"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x["name"] == serde_json::json!("bob")))
+    })
+    .await;
+    wait_for(&party_b, |snap| {
+        snap["party"]["peers"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|x| x["name"] == serde_json::json!("alice")))
+    })
+    .await;
+
+    // B plays: the action must land in A's roster (server-side ferry).
+    party_b.send_action("play", 42.0);
+    wait_for(&party_a, |snap| {
+        snap["party"]["peers"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|x| x["name"] == serde_json::json!("bob") && x["pos"].as_f64() == Some(42.0))
+    })
+    .await;
+
+    // Leave cleans up: snapshot nulls out and the DB row is gone.
+    party_b.leave().unwrap();
+    assert!(library_b.db.get_party().unwrap().is_none());
+    assert!(party_b.snapshot_json()["party"].is_null());
+
+    drop(srv_a);
+    drop(srv_b);
+    library_a.stop().await;
+    library_b.stop().await;
+}
+
+/// Poll a manager's snapshot until `pred` holds (or panic after ~10s).
+async fn wait_for(
+    party: &Arc<PartyManager>,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snap = party.snapshot_json();
+        if pred(&snap) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition not met, last snapshot: {snap}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Start the NAT-punch UDP hub on the same port as the instance's HTTP
+/// server (clients derive the UDP endpoint from the invite's relay URL).
+async fn start_punch_hub(ws_base: &str) {
+    let port: u16 = ws_base
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("ws base with port");
+    let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    tokio::spawn(chadtorrent::party::punch::run_punch_server(udp));
+}
+
+/// With a punch-capable relay, two members punch over loopback and sync
+/// messages flow peer-to-peer (transport flips from "relay" to "udp").
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_party_punches_into_peer_to_peer() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("debug"))
+        .with_test_writer()
+        .try_init();
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let library_a = setup_app(&tmp_a.path().join("app")).await;
+    let (_http_a, ws_a, party_a, srv_a) = start_http(library_a.clone()).await;
+    start_punch_hub(&ws_a).await;
+
+    let ida = library_a
+        .db
+        .insert_item("magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=punch")
+        .unwrap();
+    let (invite, _lan) = party_a.create(ida, "alice", Some(ws_a.clone())).unwrap();
+
+    let library_b = setup_app(&tmp_b.path().join("app")).await;
+    let (http_b, _ws_b, party_b, srv_b) = start_http(library_b.clone()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{http_b}/api/party/join"))
+        .json(&serde_json::json!({ "invite": invite, "name": "bob" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Both sides punch and switch transport to UDP.
+    wait_for(&party_a, |s| s["party"]["transport"] == serde_json::json!("udp")).await;
+    wait_for(&party_b, |s| s["party"]["transport"] == serde_json::json!("udp")).await;
+
+    // An action now travels the punched UDP path end-to-end.
+    party_b.send_action("play", 7.5);
+    wait_for(&party_a, |snap| {
+        snap["party"]["peers"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|x| x["name"] == serde_json::json!("bob") && x["pos"].as_f64() == Some(7.5))
+    })
+    .await;
+
+    drop(srv_a);
+    drop(srv_b);
+    library_a.stop().await;
+    library_b.stop().await;
+}
+
+/// Without a punch hub (plain relay), transport stays "relay" and the
+/// party still works — the fallback is the default, not an afterthought.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_party_relay_fallback_without_punch_hub() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+    let library_a = setup_app(&tmp_a.path().join("app")).await;
+    let (_http_a, ws_a, party_a, srv_a) = start_http(library_a.clone()).await;
+
+    let ida = library_a
+        .db
+        .insert_item("magnet:?xt=urn:btih:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB&dn=relay")
+        .unwrap();
+    let (invite, _lan) = party_a.create(ida, "alice", Some(ws_a.clone())).unwrap();
+
+    let library_b = setup_app(&tmp_b.path().join("app")).await;
+    let (http_b, _ws_b, party_b, srv_b) = start_http(library_b.clone()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{http_b}/api/party/join"))
+        .json(&serde_json::json!({ "invite": invite, "name": "bob" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    wait_for(&party_a, |s| s["party"]["transport"] == serde_json::json!("relay")).await;
+    wait_for(&party_b, |s| s["party"]["transport"] == serde_json::json!("relay")).await;
+
+    party_b.send_action("pause", 3.25);
+    wait_for(&party_a, |snap| {
+        snap["party"]["peers"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|x| x["name"] == serde_json::json!("bob") && x["pos"].as_f64() == Some(3.25))
+    })
+    .await;
+
+    drop(srv_a);
+    drop(srv_b);
+    library_a.stop().await;
+    library_b.stop().await;
 }

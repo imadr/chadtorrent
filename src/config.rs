@@ -22,6 +22,26 @@ pub struct Config {
     /// SQLite database path
     #[arg(short, long, default_value = "./chadtorrent.db")]
     pub db_path: PathBuf,
+
+    /// Base URL of the watch-party relay used when creating parties (e.g.
+    /// wss://relay.example.com). When unset, invites point at this
+    /// instance's LAN address instead (same-network parties only).
+    #[arg(long)]
+    pub party_relay: Option<String>,
+}
+
+/// Best-effort LAN address of this machine as a ws:// base URL, used as
+/// the invite relay when no external relay is configured. The UDP-connect
+/// trick picks the default-route interface without sending any packet.
+pub fn lan_ws_base_url(port: u16) -> String {
+    use std::net::{IpAddr, UdpSocket};
+    let ip = (|| {
+        let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect("8.8.8.8:80").ok()?;
+        s.local_addr().ok().map(|a| a.ip())
+    })()
+    .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    format!("ws://{ip}:{port}")
 }
 
 /// API keys live in `chadtorrent.json` next to the working directory — no env

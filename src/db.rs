@@ -40,6 +40,22 @@ pub struct Database {
     conn: Mutex<Connection>,
 }
 
+/// The persisted active watch party (at most one per instance).
+#[derive(Debug, Clone)]
+pub struct PartyRow {
+    pub relay: String,
+    pub room: String,
+    pub room_key: String,
+    pub magnet: String,
+    pub tmdb_id: Option<i64>,
+    pub media_type: Option<String>,
+    pub title: Option<String>,
+    pub year: Option<i32>,
+    pub poster_path: Option<String>,
+    pub item_id: i64,
+    pub name: String,
+}
+
 fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
     Ok(LibraryItem {
         id: row.get(0)?,
@@ -87,6 +103,20 @@ impl Database {
             CREATE TABLE IF NOT EXISTS pieces (
                 info_hash TEXT PRIMARY KEY,
                 haves BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS party (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                relay TEXT NOT NULL,
+                room TEXT NOT NULL,
+                room_key TEXT NOT NULL,
+                magnet TEXT NOT NULL,
+                tmdb_id INTEGER,
+                media_type TEXT,
+                title TEXT,
+                year INTEGER,
+                poster_path TEXT,
+                item_id INTEGER NOT NULL,
+                name TEXT NOT NULL
             );",
         )?;
         // Migrate: drop the obsolete "keep" column if a pre-removal database
@@ -319,6 +349,71 @@ impl Database {
         conn.execute("DELETE FROM pieces WHERE info_hash = ?1", params![info_hash])?;
         Ok(())
     }
+
+    // ---- watch party (single active party per instance) ----
+
+    /// Persist the active watch party so it is rejoined after a restart.
+    pub fn set_party(&self, p: &PartyRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO party (id, relay, room, room_key, magnet, tmdb_id, media_type, title,
+                                year, poster_path, item_id, name)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(id) DO UPDATE SET
+                relay = excluded.relay, room = excluded.room, room_key = excluded.room_key,
+                magnet = excluded.magnet, tmdb_id = excluded.tmdb_id, media_type = excluded.media_type,
+                title = excluded.title, year = excluded.year, poster_path = excluded.poster_path,
+                item_id = excluded.item_id, name = excluded.name",
+            params![
+                p.relay,
+                p.room,
+                p.room_key,
+                p.magnet,
+                p.tmdb_id,
+                p.media_type,
+                p.title,
+                p.year,
+                p.poster_path,
+                p.item_id,
+                p.name
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_party(&self) -> Result<Option<PartyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT relay, room, room_key, magnet, tmdb_id, media_type, title, year,
+                    poster_path, item_id, name
+             FROM party WHERE id = 1",
+        )?;
+        let mut rows = stmt.query_map([], |row| {
+            Ok(PartyRow {
+                relay: row.get(0)?,
+                room: row.get(1)?,
+                room_key: row.get(2)?,
+                magnet: row.get(3)?,
+                tmdb_id: row.get(4)?,
+                media_type: row.get(5)?,
+                title: row.get(6)?,
+                year: row.get(7)?,
+                poster_path: row.get(8)?,
+                item_id: row.get(9)?,
+                name: row.get(10)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn clear_party(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM party WHERE id = 1", [])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +582,42 @@ mod tests {
             db.get_item(id).unwrap().unwrap().torrent_bytes.unwrap(),
             vec![9, 8, 7]
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_party_row_roundtrip() {
+        let (db, dir) = temp_db();
+        assert!(db.get_party().unwrap().is_none());
+        let row = PartyRow {
+            relay: "ws://192.168.1.4:3000".into(),
+            room: "cm9vbQ".into(),
+            room_key: "a2V5".into(),
+            magnet: "magnet:?xt=urn:btih:abc".into(),
+            tmdb_id: Some(7),
+            media_type: Some("movie".into()),
+            title: Some("Title".into()),
+            year: Some(2001),
+            poster_path: Some("/p.jpg".into()),
+            item_id: 3,
+            name: "alice".into(),
+        };
+        db.set_party(&row).unwrap();
+        let back = db.get_party().unwrap().unwrap();
+        assert_eq!(back.relay, row.relay);
+        assert_eq!(back.room, row.room);
+        assert_eq!(back.room_key, row.room_key);
+        assert_eq!(back.magnet, row.magnet);
+        assert_eq!(back.tmdb_id, Some(7));
+        assert_eq!(back.item_id, 3);
+        assert_eq!(back.name, "alice");
+        // Upsert path
+        let mut row2 = row.clone();
+        row2.name = "bob".into();
+        db.set_party(&row2).unwrap();
+        assert_eq!(db.get_party().unwrap().unwrap().name, "bob");
+        db.clear_party().unwrap();
+        assert!(db.get_party().unwrap().is_none());
         cleanup(&dir);
     }
 

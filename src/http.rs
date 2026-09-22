@@ -61,6 +61,7 @@ pub struct AppState {
     pub index_html: String,
     pub tmdb: Option<Arc<TmdbClient>>,
     pub subs: Option<Arc<SubtitlesClient>>,
+    pub party: Arc<crate::party::PartyManager>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -92,9 +93,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mse/{id}/init", get(seg_init))
         .route("/mse/{id}/seg/{n}", get(seg_n))
         .route("/ws/torrent/{id}", get(ws_handler))
+        .route("/api/party", post(create_party).get(get_party))
+        .route("/api/party/join", post(join_party))
+        .route("/api/party/leave", post(leave_party))
+        .route("/ws/party", get(party_ws_handler))
         .route("/__test", get(test_page))
         .fallback(get(spa_fallback))
         .with_state(state)
+        // The relay is mounted on every instance AFTER state is applied
+        // (it is fully self-contained): an instance reachable on a LAN (or
+        // port-forwarded) can serve as the relay for its own invites
+        // without any extra process.
+        .merge(crate::party::relay::relay_router())
 }
 
 async fn add_item(
@@ -677,6 +687,179 @@ async fn ws_handler(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state, id))
+}
+
+// ---- watch party ----
+
+#[derive(Deserialize)]
+pub struct CreatePartyRequest {
+    item_id: i64,
+    name: Option<String>,
+    relay: Option<String>,
+}
+
+/// Create a watch party around a library item. Returns the paste-able
+/// invite (which also stays available via GET /api/party and the panel).
+async fn create_party(
+    State(state): State<AppState>,
+    Json(req): Json<CreatePartyRequest>,
+) -> Result<impl IntoResponse> {
+    let name = req
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| state.party.default_name().to_string());
+    let (invite, lan_only) = state.party.create(req.item_id, &name, req.relay)?;
+    let party = state.party.snapshot_json()["party"].clone();
+    Ok(Json(json!({ "invite": invite, "lan_only": lan_only, "party": party })))
+}
+
+#[derive(Deserialize)]
+pub struct JoinPartyRequest {
+    invite: String,
+    name: Option<String>,
+}
+
+/// Join a watch party from an invite string. The invite's torrent is added
+/// to the library first (deduped by infohash — same torrent, same swarm)
+/// so the joiner downloads alongside everyone else.
+async fn join_party(
+    State(state): State<AppState>,
+    Json(req): Json<JoinPartyRequest>,
+) -> Result<impl IntoResponse> {
+    let invite = crate::party::parse_invite(&req.invite)
+        .ok_or_else(|| Error::BadRequest("invalid watch party invite".into()))?;
+
+    let want = crate::party::magnet_infohash(&invite.magnet);
+    let mut existing = None;
+    if let Some(want) = want.as_deref() {
+        for it in state.library.list_items().await? {
+            if crate::party::magnet_infohash(&it.magnet).as_deref() == Some(want) {
+                existing = Some(it);
+                break;
+            }
+        }
+    }
+
+    let item_id = match existing {
+        Some(it) => {
+            // Already in the library: only fill in missing metadata.
+            if it.tmdb_id.is_none() && invite.tmdb_id.is_some() {
+                state.library.db.update_metadata(
+                    it.id,
+                    invite.title.as_deref(),
+                    invite.year,
+                    invite.poster_path.as_deref(),
+                    invite.tmdb_id,
+                    invite.media_type.as_deref(),
+                )?;
+            }
+            it.id
+        }
+        None => {
+            let id = state
+                .library
+                .add_item_with_sequential(&invite.magnet, true)
+                .await?;
+            state.library.db.update_metadata(
+                id,
+                invite.title.as_deref(),
+                invite.year,
+                invite.poster_path.as_deref(),
+                invite.tmdb_id,
+                invite.media_type.as_deref(),
+            )?;
+            id
+        }
+    };
+
+    let name = req
+        .name
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| state.party.default_name().to_string());
+    state.party.join(invite, &name, item_id)?;
+    let party = state.party.snapshot_json()["party"].clone();
+    Ok(Json(json!({ "item_id": item_id, "party": party })))
+}
+
+async fn get_party(State(state): State<AppState>) -> Result<impl IntoResponse> {
+    Ok(Json(state.party.snapshot_json()["party"].clone()))
+}
+
+async fn leave_party(State(state): State<AppState>) -> Result<impl IntoResponse> {
+    state.party.leave()?;
+    Ok(Json(json!({ "success": true })))
+}
+
+/// Browser-facing party socket: roster/action events downstream, local
+/// actions and player state upstream.
+async fn party_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_party_ws(socket, state.party.clone()))
+}
+
+async fn handle_party_ws(mut socket: WebSocket, party: Arc<crate::party::PartyManager>) {
+    use futures_util::{SinkExt, StreamExt};
+    let mut events = party.subscribe();
+    let snapshot = party.snapshot_json().to_string();
+    if socket
+        .send(Message::Text(snapshot.into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let (mut sink, mut stream) = socket.split();
+    loop {
+        tokio::select! {
+            ev = events.recv() => {
+                match ev {
+                    Ok(msg) => {
+                        if sink.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Fell behind (e.g. suspended tab): catch up with a
+                        // fresh full snapshot.
+                        let snap = party.snapshot_json().to_string();
+                        if sink.send(Message::Text(snap.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(Message::Text(txt))) => {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+                        match v["type"].as_str() {
+                            Some("action") => {
+                                if let Some(kind) = v["kind"].as_str() {
+                                    let t = v["t"].as_f64().unwrap_or(0.0);
+                                    party.send_action(kind, t);
+                                }
+                            }
+                            Some("state") => {
+                                party.set_local_state(
+                                    v["ready"].as_bool().unwrap_or(false),
+                                    v["pos"].as_f64().unwrap_or(0.0),
+                                    v["playing"].as_bool().unwrap_or(false),
+                                    v["buffering"].as_bool().unwrap_or(false),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+        }
+    }
 }
 
 async fn handle_ws(mut socket: WebSocket, state: AppState, id: i64) {

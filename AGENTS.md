@@ -17,14 +17,17 @@ Every edit to `static/index.html` requires `cargo build` to take effect — it i
 ```
 src/
   main.rs        Entry point, graceful SIGINT/SIGTERM, logging setup
-  config.rs      CLI args: --port, --library-dir, --temp-dir, --db-path, --tmdb-api-key
-  db.rs          SQLite CRUD via rusqlite (library items, metadata, state)
+  config.rs      CLI args: --port, --library-dir, --temp-dir, --db-path, --party-relay
+  db.rs          SQLite CRUD via rusqlite (library items, metadata, state, active watch party)
   torrent.rs     TorrentEngine: wraps librqbit Session + ManagedTorrent map
   library.rs     LibraryManager: orchestrates DB + TorrentEngine + file paths
-  http.rs        Axum server: REST routes + WS status + streaming + remux
+  http.rs        Axum server: REST routes + WS status + streaming + remux + party API
   remux.rs       ffprobe helpers: SourceBuffer MIME (AAC profile-aware) + duration
   segmenter.rs   segment pipeline: ffmpeg `-c copy` → init.mp4 + seg-N.m4s on disk (per item), manifest state
   metadata.rs    TMDB API client (search + detail fetch)
+  subtitles.rs   OpenSubtitles client (search/download) + local subs scan
+  party/         Watch parties (see below): protocol, relay, PartyManager
+  bin/relay.rs   `chadtorrent-relay`: standalone stateless relay binary
   error.rs       Error types mapping to HTTP status codes
   lib.rs         Module re-exports
 
@@ -32,7 +35,7 @@ static/
   index.html     Single-file frontend (no framework, all JS inline)
 
 tests/
-  e2e.rs         5 fast integration tests (no torrent downloads; use fake files + DB)
+  e2e.rs         Fast integration tests (no torrent downloads; use fake files + DB)
 ```
 
 ## Data flow
@@ -46,6 +49,17 @@ tests/
 4. **Seek**: `seekTo(t)` is just `v.currentTime = t` — instant when buffered (ready files: ~60-120ms to first frame, measured both directions); past the buffer the segment pump fetches the segment containing `t` (selection = segments *overlapping* the window, not just starting inside it) and playback resumes when it lands. While still downloading, a seek past the frontier simply waits for the sequential download to reach it — the overlay shows real download speed from the WS status; no piece-reprioritization tricks, no 503 path anymore.
 
 5. **Delete** (`DELETE /api/library/:id`): removes the row, deletes `library_dir/{id}` and `temp_dir/{id}`, removes from engine. If `?hard=1`, cascades to all torrents sharing the same `tmdb_id` (movie delete).
+
+## Watch parties
+
+Each member runs their own instance; the BitTorrent swarm is the content distribution (everyone downloads locally — nothing is ever streamed between members). Only a tiny encrypted control channel (play/pause/seek/presence, bytes/sec) goes through a **relay**: a stateless room broadcaster.
+
+- **Protocol** (`src/party/protocol.rs`): every frame is XChaCha20-Poly1305 encrypted with the party key — `seal`/`open` + serde `Message` enum (`Hello`, `Presence{peer}`, `Play/Pause/Seek{from,t}`). Room id + key exist only in the invite.
+- **Invite**: `CTPARTY1:<base64url(JSON)>` carrying `{relay, room, key, magnet, tmdb metadata, host_name}`. The relay URL is inside the invite — joiners configure nothing. Joining dedupes by infohash (`magnet_infohash`) so the same torrent is never added twice.
+- **Relay** (`src/party/relay.rs`): `GET /ws/party/relay/{room}` — broadcasts opaque frames between members, no persistence, idle timeout 75s, max 32 members/room. Mounted on every chadtorrent instance (so a LAN-reachable instance serves as its own relay) and built as the standalone `chadtorrent-relay` binary for internet-wide parties (`--party-relay` points invites at it; unset ⇒ invite uses the instance's LAN address, same-network only).
+- **NAT punch** (`src/party/punch.rs`): the relay binary also runs a UDP "mailroom" hub on the same port (forward both TCP+UDP). Members bind, learn each other's public UDP endpoints, punch directly (simultaneous-open), and sync messages flow peer-to-peer with a small ack/retransmit layer; the server steps out. Strictly an optimization: any punch failure (symmetric NAT/CGNAT, ~15-25% of pairs), a new member joining mid-party, or a peer timing out silently falls back to the WS relay — payload encryption is identical in both modes (`transport` field in the party snapshot reports `udp` vs `relay`).
+- **PartyManager** (`src/party/mod.rs`): one party per instance; outbound tokio-tungstenite connection with backoff reconnect, 4s presence heartbeat, 15s peer timeout, persisted in the `party` table (auto-rejoin on restart). Browser-facing surface: `POST /api/party` (create), `POST /api/party/join`, `GET /api/party`, `POST /api/party/leave`, `GET /ws/party` (events down / `{type:"action"|"state"}` up).
+- **Sync model**: last-writer-wins actions, no host authority. The browser owns the `<video>`: local play/pause/seek broadcast; remote actions applied behind a `partyApply` guard counter (300ms) to prevent echo loops; drift correction re-seeks when >2.5s off the action anchor. Strict stalls: a member stalled >2s reports `buffering`, everyone auto-pauses with a "Waiting for X…" overlay, auto-resumes when clear. `ready` = ≥60s buffered ahead of the party position (or finished file).
 
 ## Frontend conventions
 

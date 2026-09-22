@@ -3,6 +3,11 @@ name = "chadtorrent"
 version = "0.1.0"
 edition = "2021"
 description = "Self-hosted torrent streaming service with library management"
+default-run = "chadtorrent"
+
+[[bin]]
+name = "chadtorrent-relay"
+path = "src/bin/relay.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -23,6 +28,9 @@ flate2 = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 bytes = "1"
 async-trait = "0.1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+chacha20poly1305 = "0.10"
+base64 = "0.22"
 
 # Local fork of librqbit: piece download order is shuffled (non-sequential).
 [patch.crates-io]
@@ -33,4 +41,4 @@ tokio-test = "0.4"
 tempfile = "3"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-tokio-tungstenite = "0.24"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
