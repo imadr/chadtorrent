@@ -1354,6 +1354,14 @@ async function pumpLoop(gen, id) {
     }
 
     if (appended) {
+      // Data is flowing again: never leave the party reporting "buffering"
+      // because a transient starve flag was set. Only the playback-events
+      // recovery path clears it otherwise, and that never fires when the
+      // pump quietly catches up without an actual element stall.
+      if (bufferingSince) {
+        console.warn('[ct] pump recovered after ' + (Date.now() - bufferingSince) + ' ms');
+        bufferingSince = 0;
+      }
       // Target of a clamped seek now buffered? Re-issue it — the original
       // currentTime write snapped back to the buffered edge.
       if (pendSeek != null && timeCovered(pendSeek + 0.05)) {
@@ -1426,9 +1434,13 @@ function evictBehind() {
   });
 }
 
-function seekTo(globalT) {
+function seekTo(globalT, partyOrigin) {
   if (fullDur && globalT > fullDur) globalT = fullDur;
   if (globalT < 0) globalT = 0;
+  // A party-originated seek lands in an 'seeked' event we must not echo back
+  // to the party (the 300ms partyApply guard expires long before an
+  // un-buffered seek settles, so it cannot be relied on).
+  if (partyOrigin && Math.abs(globalT - (v.currentTime || 0)) > 0.05) partyEcho.seek++;
   // Target buffered -> native seek, instant. Target NOT buffered (e.g. past
   // the download frontier) -> show the spinner RIGHT HERE, synchronously.
   // No browser event ever fires while a seek waits for data (pending seeks
@@ -1512,8 +1524,8 @@ window.addEventListener('beforeunload', () => stopPlayback());
 
 /* ---------- player controls ---------- */
 const ppic = () => $('ppicon');
-v.addEventListener('play',  () => { ppic().innerHTML = '<use href="#ic-pause"/>'; partyLocalAction('play'); });
-v.addEventListener('pause', () => { ppic().innerHTML = '<use href="#ic-play"/>'; partyLocalAction('pause'); });
+v.addEventListener('play',  () => { ppic().innerHTML = '<use href="#ic-pause"/>'; if (partyEcho.play > 0) { partyEcho.play--; } else partyLocalAction('play'); });
+v.addEventListener('pause', () => { ppic().innerHTML = '<use href="#ic-play"/>'; if (partyEcho.pause > 0) { partyEcho.pause--; } else partyLocalAction('pause'); });
 $('ppbtn').addEventListener('click', () => { v.paused ? v.play().catch(()=>{}) : v.pause(); });
 
 function updSeek() {
@@ -2659,22 +2671,36 @@ $('kb-restore').addEventListener('click', () => {
 let party = null;               // active party snapshot from the server
 let partyWs = null, partyRetry = 0;
 let partyApply = 0;             // >0 while applying remote actions → suppress echo
+let partyEcho = { seek: 0, play: 0, pause: 0 };  // DOM events born from party code → swallowed once
 let partyAnchor = null;         // {t, playing, at}: party position from the last action
 let partyAutoPaused = false;    // we paused because a member is buffering
 let partyHoldPlay = false;      // party is paused → block the pump's auto-play
 let ptMode = null;              // current party modal render mode
 
 function partyWsConnect() {
-  if (partyWs) { try { partyWs.close(); } catch (e) {} partyWs = null; }
+  if (partyWs) {
+    // Replacing the socket: detach the old one's close handler first, or its
+    // onclose would spawn a *retry* socket that coexists with this new one.
+    // Every live socket subscribes to party.events, so accumulated sockets
+    // redeliver every action (double/triple partyApplyAction → unbalanced
+    // partyEcho counters swallow a later genuine user action).
+    const old = partyWs;
+    old.onclose = null;
+    try { old.close(); } catch (e) {}
+    partyWs = null;
+  }
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  try { partyWs = new WebSocket(proto + location.host + '/ws/party'); } catch (e) { return; }
-  partyWs.onmessage = (ev) => {
+  let ws;
+  try { ws = new WebSocket(proto + location.host + '/ws/party'); } catch (e) { return; }
+  partyWs = ws;
+  ws.onmessage = (ev) => {
     let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.type === 'party') partySetSnapshot(m.party);
     else if (m.type === 'action') partyApplyAction(m.kind, m.t, m.by, m.playing);
   };
-  partyWs.onopen = () => { partyRetry = 0; };
-  partyWs.onclose = () => {
+  ws.onopen = () => { partyRetry = 0; };
+  ws.onclose = () => {
+    if (partyWs !== ws) return; // stale replacement socket: ignore
     partyWs = null;
     setTimeout(partyWsConnect, Math.min(10000, 1500 * Math.max(1, ++partyRetry)));
   };
@@ -2704,9 +2730,9 @@ function partySetSnapshot(p) {
       if (partyPlayerActive()) {
         partyApply++;
         try {
-          if (partyAnchor.t > 0.5) seekTo(partyAnchor.t);
+          if (partyAnchor.t > 0.5) seekTo(partyAnchor.t, true);
           partyHoldPlay = !partyAnchor.playing;
-          if (partyAnchor.playing && v.paused) v.play().catch(() => {});
+          if (partyAnchor.playing && v.paused) { partyEcho.play++; v.play().catch(() => {}); }
         } finally { setTimeout(() => partyApply--, 300); }
       }
     }
@@ -2873,18 +2899,21 @@ function partyApplyAction(kind, t, by, playing) {
   partyApply++;
   try {
     if (kind === 'seek') {
-      seekTo(t);
+      seekTo(t, true);
       // Following a playing member's seek: keep watching with them.
       if (playing && v.paused && !partyAutoPaused) {
         partyHoldPlay = false;
+        partyEcho.play++;
         v.play().catch(() => {});
       }
     } else if (kind === 'play') {
       partyAutoPaused = false;
-      if (Math.abs((v.currentTime || 0) - t) > 1.5) seekTo(t);
+      if (Math.abs((v.currentTime || 0) - t) > 1.5) seekTo(t, true);
+      partyEcho.play++;
       v.play().catch(() => {});
       hideBuf();
     } else if (kind === 'pause') {
+      partyEcho.pause++;
       v.pause();
       hideBuf();
     }
@@ -2899,7 +2928,10 @@ function partyLocalAction(kind) {
   partyHoldPlay = kind === 'pause';
   partySend({ type: 'action', kind, t });
 }
-v.addEventListener('seeked', () => partyLocalAction('seek'));
+v.addEventListener('seeked', () => {
+  if (partyEcho.seek > 0) { partyEcho.seek--; return; }
+  partyLocalAction('seek');
+});
 
 /* ----- strict sync: pause everyone while a member buffers ----- */
 function partyApplyRoster() {
@@ -2910,13 +2942,13 @@ function partyApplyRoster() {
       partyAutoPaused = true;
       partyHoldPlay = true;
       partyApply++;
-      try { v.pause(); } finally { setTimeout(() => partyApply--, 300); }
+      try { partyEcho.pause++; v.pause(); } finally { setTimeout(() => partyApply--, 300); }
       showBuf('Waiting for ' + waiting.map(w => w.name || 'someone').join(', ') + '…');
     } else if (!waiting.length && partyAutoPaused) {
       partyAutoPaused = false;
       partyHoldPlay = false;
       partyApply++;
-      try { v.play().catch(() => {}); } finally { setTimeout(() => partyApply--, 300); }
+      try { partyEcho.play++; v.play().catch(() => {}); } finally { setTimeout(() => partyApply--, 300); }
       hideBuf();
     }
   }
@@ -2950,7 +2982,7 @@ function partyTick() {
     const est = partyAnchor.t + (Date.now() - partyAnchor.at) / 1000;
     if (est > 2 && Math.abs((v.currentTime || 0) - est) > 2.5) {
       partyApply++;
-      try { seekTo(est); } finally { setTimeout(() => partyApply--, 300); }
+      try { seekTo(est, true); } finally { setTimeout(() => partyApply--, 300); }
     }
   }
 }

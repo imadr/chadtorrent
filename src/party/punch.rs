@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::protocol::{self, Message};
 
@@ -110,9 +110,22 @@ pub async fn run_punch_server(socket: UdpSocket) {
         if bind.room.is_empty() || bind.room.len() > 64 || bind.peer_id.is_empty() {
             continue;
         }
-        let members = rooms.entry(bind.room).or_default();
+        let members = rooms.entry(bind.room.clone()).or_default();
+        let n_before = members.len();
         members.retain(|_, (addr, seen)| seen.elapsed() < Duration::from_secs(45) || *addr != from);
+        if members.len() != n_before {
+            warn!(
+                "hub: expired {} silent member(s) of room {} ({} remain)",
+                n_before - members.len(),
+                bind.room.as_str(),
+                members.len()
+            );
+        }
         members.insert(bind.peer_id.clone(), (from, Instant::now()));
+        debug!(
+            "hub: {} bound as {} ({} member(s) in room)",
+            from, bind.peer_id, members.len()
+        );
 
         // Reply to the binder: their mapping + everyone else.
         let others: Vec<BoundPeer> = members
@@ -170,6 +183,7 @@ struct PeerConn {
     last_seen: Instant,
     last_ping: Instant,
     last_req: Instant,
+    last_hold_warn: Instant,
 }
 
 /// The party's transport task. Punches every member of the room, then
@@ -296,15 +310,40 @@ pub(crate) async fn run_transport(
                     } else {
                         if now - conn.last_ping >= PING_EVERY {
                             conn.last_ping = now;
-                            conn.my_seq = conn.my_seq.wrapping_add(1);
-                            send_frame(&socket, addr, &build_frame(F_PING, conn.my_seq, &[]));
+                            // PING eschews the DATA seq namespace: the
+                            // receiver's in-order recv_next only advances on
+                            // F_DATA, so a PING taking a data seq would leave
+                            // a permanent hole in the stream and stall every
+                            // subsequent message in `hold`. Its seq field is
+                            // only echoed by PONG and is never interpreted.
+                            send_frame(&socket, addr, &build_frame(F_PING, 0, &[]));
                         }
                         retransmit(&socket, conn, now).await;
                     }
                 }
 
+                // Stall detector: a non-empty hold map means sequenced frames
+                // are stuck waiting for a gap that isn't closing. Presences
+                // stop, the roster prunes, yet PINGs keep the conn alive —
+                // the exact "online but roster=0" symptom. Log once/5s.
+                for c in conns.values_mut() {
+                    if c.punched && !c.hold.is_empty() && now - c.last_hold_warn > Duration::from_secs(5)
+                    {
+                        c.last_hold_warn = now;
+                        let oldest = c.hold.keys().min().copied().unwrap_or(0);
+                        warn!(
+                            "seq stall: {} unreachable (expected {} got-hold {} oldest {})",
+                            c.peer_id, c.recv_next, c.hold.len(), oldest
+                        );
+                    }
+                }
+
                 // Membership change: re-punch before anything flows again.
                 if targets.len() != known_targets {
+                    warn!(
+                        "membership changed: {} -> {} peer(s)",
+                        known_targets, targets.len()
+                    );
                     known_targets = targets.len();
                     if active {
                         active = false;
@@ -400,6 +439,7 @@ fn new_conn(peer_id: String, addr: SocketAddr, now: Instant) -> PeerConn {
         last_seen: now,
         last_ping: now,
         last_req: now - PUNCH_EVERY, // fire immediately
+        last_hold_warn: now - Duration::from_secs(10),
     }
 }
 
@@ -408,7 +448,12 @@ fn apply_bound(
     conns: &mut HashMap<SocketAddr, PeerConn>,
     b: Bound,
 ) {
+    let prev = targets.len();
     *targets = b.peers;
+    let n = targets.len();
+    if n != prev {
+        warn!("hub push: {} -> {} peer(s)", prev, n);
+    }
     let listed: HashSet<String> = targets.iter().map(|p| p.id.clone()).collect();
     let addrs: HashSet<SocketAddr> = targets
         .iter()
