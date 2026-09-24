@@ -1228,8 +1228,11 @@ async function startSegSession() {
     if (partyAnchor.t > 0.5) seekTo(partyAnchor.t);
     resumeAt = 0;
   } else if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
-  // re-attach the active subtitle track for this item's new session
-  if (activeSub && activeSub.id === currentId) applySubTrack();
+  // restore the subtitle choice for this item's new session (applySubTrack
+  // pulls the saved sync offset from storage too); explicit "None" wins.
+  const subPick = subPickStore()[currentId];
+  if (subPick) { activeSub = { id: currentId, name: subPick }; applySubTrack(); }
+  else activeSub = null;
 }
 
 // Debug hook: inspect live session state from the console.
@@ -1517,6 +1520,7 @@ function teardownSeg() {
 function stopPlayback() {
   segGen++;
   teardownSeg();
+  if (activeSub) ssSaveDelay(); // persist any un-committed sync offset
   subPanelOpen = false;
   const sp = $('subpanel'); if (sp) sp.classList.remove('open');
   ssToggle(false);
@@ -1881,11 +1885,24 @@ async function onSubRowClick(row) {
   subBusy = false; renderSubPanel();
 }
 
+/* Per-item subtitle choice, persisted so re-opening the player brings back
+ * the same subs (and their stored sync offset). */
+function subPickStore() {
+  try { return JSON.parse(localStorage.getItem('chadtorrent.subpick') || '{}'); } catch (e) { return {}; }
+}
+function subPickSave(name) {
+  if (currentId == null) return;
+  const m = subPickStore();
+  if (name) m[currentId] = name; else delete m[currentId];
+  try { localStorage.setItem('chadtorrent.subpick', JSON.stringify(m)); } catch (e) {}
+}
+
 function enableSub(name) {
   activeSub = { id: currentId, name };
+  subPickSave(name);
   applySubTrack();
 }
-function disableSub() { activeSub = null; applySubTrack(); }
+function disableSub() { subPickSave(null); activeSub = null; applySubTrack(); }
 
 function applySubTrack() {
   // drop existing subtitle tracks
