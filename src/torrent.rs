@@ -286,6 +286,13 @@ impl TorrentEngine {
         Some(fnv1a_64(bf.as_raw_slice()))
     }
 
+    /// Whether the engine reports the torrent as fully downloaded (every
+    /// selected piece is present).
+    pub async fn is_finished(&self, library_id: i64) -> Option<bool> {
+        let handle = self.get_torrent(library_id).await?;
+        Some(handle.stats().finished)
+    }
+
     /// Cached .torrent file bytes so a torrent can be re-added offline.
     pub async fn torrent_bytes(&self, library_id: i64) -> Option<bytes::Bytes> {
         let handle = self.get_torrent(library_id).await?;

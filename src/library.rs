@@ -191,6 +191,28 @@ impl LibraryManager {
                         // New torrents surface their initial progress too.
                         changed.push(*id);
                     }
+                    // Reconcile completion straight from the engine. A
+                    // re-registered torrent whose pieces are already on disk
+                    // (e.g. re-enabling a file on a finished torrent) goes
+                    // straight to a full, stable piece map, so no further
+                    // `Progress` events ever fire and the DB row would sit at
+                    // `downloading` until someone happens to poll /status.
+                    if me.engine.is_finished(*id).await == Some(true) {
+                        let already_ready = me
+                            .db
+                            .get_item(*id)
+                            .ok()
+                            .flatten()
+                            .map(|i| i.state == "ready")
+                            .unwrap_or(true);
+                        if !already_ready {
+                            if let Some(handle) = me.engine.get_torrent(*id).await {
+                                if let Err(e) = me.mark_complete(*id, &handle).await {
+                                    warn!("mark_complete({}) failed in progress watcher: {e}", *id);
+                                }
+                            }
+                        }
+                    }
                 }
                 seen.retain(|id, _| ids.contains(id));
                 for id in changed {
