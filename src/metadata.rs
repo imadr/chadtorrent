@@ -59,6 +59,36 @@ struct TmdbMovieDetails {
     backdrop_path: Option<String>,
     #[serde(default)]
     overview: Option<String>,
+    #[serde(default)]
+    seasons: Vec<TmdbSeason>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbSeason {
+    #[serde(default)]
+    season_number: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    episode_count: Option<i64>,
+    #[serde(default)]
+    air_date: Option<String>,
+}
+
+/// One canonical season of a TV show (TMDB), used by the season chips in the
+/// library's TV-show detail view. Chips list the show's real seasons; torrents
+/// are then filtered by the selected season.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SeasonInfo {
+    pub season_number: i64,
+    pub name: Option<String>,
+    pub episode_count: Option<i64>,
+    pub air_date: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SeasonInfoList {
+    pub seasons: Vec<SeasonInfo>,
 }
 
 pub struct TmdbClient {
@@ -117,6 +147,35 @@ impl TmdbClient {
             })
             .collect();
         Ok(results)
+    }
+
+    /// The canonical season list of a TV show (specials skipped). This feeds
+    /// the season chips in the library — the app only knows seasons from
+    /// torrent file names otherwise, and a show "has" seasons 1..N regardless
+    /// of which torrents the user added.
+    pub async fn tv_seasons(&self, tmdb_id: i64) -> Result<Vec<SeasonInfo>> {
+        let resp = self
+            .client
+            .get(format!("{}/tv/{}", TMDB_BASE, tmdb_id))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+            .map_err(|e| Error::BadRequest(format!("search request failed: {e}")))?
+            .json::<TmdbMovieDetails>()
+            .await
+            .map_err(|e| Error::BadRequest(format!("search response invalid: {e}")))?;
+
+        Ok(resp
+            .seasons
+            .into_iter()
+            .filter(|s| s.season_number.unwrap_or(0) > 0)
+            .map(|s| SeasonInfo {
+                season_number: s.season_number.unwrap_or(0),
+                name: s.name,
+                episode_count: s.episode_count,
+                air_date: s.air_date,
+            })
+            .collect())
     }
 
     #[allow(dead_code)]

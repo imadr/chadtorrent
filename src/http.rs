@@ -87,6 +87,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library", post(add_item).get(list_items))
         .route("/api/movies", post(add_movie))
         .route("/api/search", get(search_tmdb))
+        .route("/api/meta/{media_type}/{tmdb_id}", get(meta_detail))
         .route("/api/torrents", get(torrent_search))
         .route("/api/library/{id}", delete(delete_item))
         .route("/api/library/{id}/status", get(get_status))
@@ -146,6 +147,24 @@ async fn add_item(
             .map_err(|e| Error::Internal(e.to_string()))?;
     }
     Ok(Json(json!({ "id": id })))
+}
+
+/// Canonical TV-show seasons from TMDB, for the library's season chips.
+async fn meta_detail(
+    State(state): State<AppState>,
+    axum::extract::Path((media_type, tmdb_id)): axum::extract::Path<(String, i64)>,
+) -> Result<impl IntoResponse> {
+    if media_type != "tv" {
+        return Ok(Json(crate::metadata::SeasonInfoList { seasons: vec![] }));
+    }
+    let Some(tmdb) = state.tmdb.as_ref() else {
+        return Err(Error::BadRequest("Movie search is not configured on this server".into()));
+    };
+    let seasons = tmdb
+        .tv_seasons(tmdb_id)
+        .await
+        .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
+    Ok(Json(crate::metadata::SeasonInfoList { seasons }))
 }
 
 async fn search_tmdb(

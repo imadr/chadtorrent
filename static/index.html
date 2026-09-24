@@ -67,7 +67,7 @@
           background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
   #mv-seasonchips .s-chip:hover { border-color: var(--line-hi); }
   #mv-seasonchips .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
-  .tv-t .eps { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 8px 24px; }
+  .tv-t .eps { display: flex; flex-direction: column; gap: 6px; padding: 8px 0 8px 24px; }
   .tv-t .ep { display: flex; align-items: center; gap: 10px; border: 0.5px solid var(--line);
               padding: 7px 12px 7px 14px; min-height: 44px; }
   .tv-t .ep:hover { background: var(--panel2); border-color: var(--line-hi); }
@@ -366,23 +366,7 @@
 
 <main id="view-movie" hidden>
   <button class="back" id="btn-back">← Library</button>
-  <div class="movie-head">
-    <div class="bigposter" id="mv-poster"></div>
-    <div class="mv-info">
-      <h1 id="mv-title"></h1>
-      <div class="sub" id="mv-sub"></div>
-      <button class="btn danger" id="mv-del">Delete movie</button>
-    </div>
-  </div>
-  <section>
-    <h3>Downloaded contents</h3>
-    <div id="mv-seasonchips" hidden></div>
-    <div class="rows" id="mv-torrents"></div>
-  </section>
-  <section id="mv-searchsec" hidden>
-    <h3>Find torrents</h3>
-    <div class="rows" id="mv-results" style="margin-top:12px"></div>
-  </section>
+  <div id="mv-content"></div>
 </main>
 
 <div class="modal" id="player-modal" hidden>
@@ -764,7 +748,6 @@ function openMovie(k, push = true) {
   setView(true);
   if (push) pushRoute(movieRoute());
   mvSelIdx = -1;
-  $('mv-results').innerHTML = '';
   window.scrollTo(0, 0);
   renderMovie();
   const rep = movieRep(rows);
@@ -778,20 +761,40 @@ const IC_BIN = '<svg viewBox="0 0 24 24"><use href="#ic-bin"/></svg>';
 function renderMovie() {
   const rows = currentMovie.rows;
   const rep = movieRep(rows);
-  const poster = $('mv-poster');
-  poster.innerHTML = rep.poster_path
+  // The whole content area is destroyed and regenerated from scratch on every
+  // render: head (poster/title/sub/delete), season chips, torrents, search
+  // section. Nothing survives a render, so nothing can leak between shows or
+  // movies by construction.
+  $('mv-content').innerHTML =
+    '<div class="movie-head">' +
+      '<div class="bigposter" id="mv-poster"></div>' +
+      '<div class="mv-info">' +
+        '<h1 id="mv-title"></h1>' +
+        '<div class="sub" id="mv-sub"></div>' +
+        '<button class="btn danger" id="mv-del">Delete movie</button>' +
+      '</div>' +
+    '</div>' +
+    '<section>' +
+      '<h3>Downloaded contents</h3>' +
+      '<div id="mv-seasonchips" hidden></div>' +
+      '<div class="rows" id="mv-torrents"></div>' +
+    '</section>' +
+    '<section id="mv-searchsec" hidden>' +
+      '<h3>Find torrents</h3>' +
+      '<div class="rows" id="mv-results" style="margin-top:12px"></div>' +
+    '</section>';
+
+  $('mv-poster').innerHTML = rep.poster_path
     ? posterTag(posterURL(rep.poster_path, POSTER_MD))
     : placeholder('▷');
   $('mv-title').textContent = movieName(rep);
   $('mv-sub').textContent = [movieYear(rep), kindLabel(rep)].filter(Boolean).join(' · ') || ' ';
+  $('mv-del').addEventListener('click', mvDelClick);
+
+  $('mv-searchsec').hidden = !rep.tmdb_id;
 
   const list = $('mv-torrents');
   const torrentRs = rows.filter(r => r.magnet);
-  // Full rebuild on every render: wipe the list and rebuild from scratch. The
-  // old in-place diff only cleaned rows of the current display mode, so TV
-  // episode blocks survived a switch to a movie (and vice-versa) and leaked
-  // onto the wrong page. Nothing is cached — nothing can be left over.
-  list.innerHTML = '';
   if (!torrentRs.length) {
     list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
   } else if (rep.media_type === 'tv') {
@@ -804,9 +807,7 @@ function renderMovie() {
       renderTorrentRow(el, t);
     }
   }
-
-  const sec = $('mv-searchsec');
-  sec.hidden = !rep.tmdb_id;
+  renderSearch();
   mvSyncSel();
 }
 
@@ -920,7 +921,6 @@ function renderTorrentRow(el, t, opts) {
  * rows use `.ep` (NOT `.row[data-id]`) so pollDownloads / mvFlat / renderMovie
  * keep treating the torrent header as the selectable content row. File lists
  * come from /api/library/{id}/files (season/episode per file + `have`). */
-const SEASON_OTHER = 'other';
 
 function basename(p) { return String(p || '').split('/').pop(); }
 function fileSlug(p) { return slugify(basename(p)); }
@@ -932,6 +932,30 @@ function currentTvTorrents() {
 }
 function isTvMovie() {
   return !!(currentMovie && movieRep(currentMovie.rows) && movieRep(currentMovie.rows).media_type === 'tv');
+}
+
+/* Canonical seasons come from TMDB (the show "has" seasons 1..N whether or
+   not the user has torrents for them) — chips are built from that list, and
+   torrents are then filtered by the selected season. Cached per tmdb_id for
+   the session; `false` means the fetch failed and we fall back to bucket-only
+   chips. */
+var seasonsByTmdb = new Map();
+function tvSeasonsOf(rep) {
+  if (!rep || rep.media_type !== 'tv' || !rep.tmdb_id) return null;
+  const s = seasonsByTmdb.get(String(rep.tmdb_id));
+  return Array.isArray(s) && s.length ? s : null;
+}
+function ensureTvSeasons(rep) {
+  if (!rep || rep.media_type !== 'tv' || !rep.tmdb_id) return;
+  const key = String(rep.tmdb_id);
+  if (seasonsByTmdb.has(key)) return;
+  seasonsByTmdb.set(key, null); // in-flight marker; do not refetch this session
+  api('/api/meta/tv/' + rep.tmdb_id)
+    .then(d => {
+      seasonsByTmdb.set(key, (d.seasons || []).map(s => String(s.season_number)));
+      if (isTvMovie()) refreshTvView();
+    })
+    .catch(() => { seasonsByTmdb.set(key, false); });
 }
 
 function loadFileList(id, force) {
@@ -949,32 +973,23 @@ function refreshTvView() {
   if (isTvMovie()) renderTV(currentTvTorrents());
 }
 
-/* Bucket a torrent into seasons by its video files. A torrent with no file
- * list yet (still connecting) lands in the 'other' bucket as a plain header. */
+/* Bucket a torrent into seasons by its parsed video files. A torrent with no
+ * file list yet, or with files that match no season, gets no bucket at all —
+ * it renders under nothing and is only shown once the list lands. */
 function tvBuckets(torrentRs) {
   const byKey = new Map();
   const keys = new Set();
   for (const t of torrentRs) {
-    const files = fileLists.get(String(t.id));
-    let seasons;
-    if (files && files.length) {
-      seasons = new Set(files.filter(f => f.video).map(f => f.season != null ? String(f.season) : SEASON_OTHER));
-      if (!seasons.size) seasons.add(SEASON_OTHER);
-    } else {
-      seasons = new Set([SEASON_OTHER]);
-    }
+    const files = fileLists.get(String(t.id)) || [];
+    const seasons = new Set(
+      files.filter(f => f.video && f.season != null).map(f => String(f.season)));
     for (const s of seasons) {
       if (!byKey.has(s)) byKey.set(s, []);
       byKey.get(s).push(t);
       keys.add(s);
     }
   }
-  const sorted = [...keys].sort((a, b) => {
-    if (a === SEASON_OTHER) return 1;
-    if (b === SEASON_OTHER) return -1;
-    return (+a) - (+b);
-  });
-  return { keys: sorted, byKey };
+  return { keys: [...keys].sort((a, b) => (+a) - (+b)), byKey };
 }
 
 function renderTV(torrentRs) {
@@ -983,30 +998,43 @@ function renderTV(torrentRs) {
 
   const b = tvBuckets(torrentRs);
   const chips = $('mv-seasonchips');
-  if (b.keys.length > 1) {
-    if (!b.keys.includes(tvSeason)) tvSeason = b.keys[0];
-    chips.hidden = false;
-    chips.innerHTML = b.keys.map(k =>
+  const rep = movieRep(currentMovie.rows);
+  ensureTvSeasons(rep);
+  // Chips are the show's canonical TMDB seasons and nothing else. A torrent
+  // that matches no season is simply never shown.
+  const seasons = tvSeasonsOf(rep) || [];
+  chips.hidden = !seasons.length;
+  if (seasons.length) {
+    if (!seasons.includes(tvSeason)) tvSeason = seasons[0];
+    chips.innerHTML = seasons.map(k =>
       '<button class="s-chip' + (tvSeason === k ? ' sel' : '') + '" data-season="' + k + '">' +
-      esc(k === SEASON_OTHER ? 'Other' : 'Season ' + k) + '</button>').join('');
+      'Season ' + k + '</button>').join('');
     chips.onclick = (e) => {
       const btn = e.target.closest('button.s-chip');
       if (!btn) return;
       tvSeason = btn.dataset.season;
       renderTV(currentTvTorrents());
     };
-  } else {
-    chips.hidden = true;
-    tvSeason = b.keys[0];
   }
 
+  // Fetch any missing file lists — a torrent has no season until its list
+  // arrives, so it renders nothing now and appears once the list lands.
+  for (const t of torrentRs) {
+    if (!fileLists.has(String(t.id))) {
+      loadFileList(t.id).then(() => { if (isTvMovie()) refreshTvView(); });
+    }
+  }
+
+  let any = false;
   for (const t of (b.byKey.get(tvSeason) || [])) {
     const el = document.createElement('div');
     el.className = 'tv-t';
     el.dataset.id = String(t.id);
     list.appendChild(el);
     renderTvTorrent(el, t);
+    any = true;
   }
+  if (!any) list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
   mvSyncSel();
 }
 
@@ -1025,7 +1053,7 @@ function renderTvTorrent(el, t) {
   }
   const shown = files
     .filter(f => f.video)
-    .filter(f => tvSeason === SEASON_OTHER ? f.season == null : String(f.season) === String(tvSeason));
+    .filter(f => String(f.season) === String(tvSeason));
   if (!shown.length) return;
   const eps = document.createElement('div');
   eps.className = 'eps';
@@ -1130,7 +1158,7 @@ async function delItem(t) {
   refreshLibrary();
 }
 
-$('mv-del').addEventListener('click', async () => {
+async function mvDelClick() {
   if (!(await confirmBox('Delete this movie and all of its contents from the library?'))) return;
   const rep = movieRep(currentMovie.rows);
   if (rep) {
@@ -1153,7 +1181,7 @@ $('mv-del').addEventListener('click', async () => {
   currentMovie = null;
   setView(false);
   refreshLibrary();
-});
+}
 
 $('btn-back').addEventListener('click', () => {
   currentMovie = null;
@@ -3267,10 +3295,7 @@ function renderPartyModal() {
   if (!party) {
     body.innerHTML =
       '<div class="pt-join"><input type="text" id="pt-invite" placeholder="Paste a watch party invite…">' +
-      '<button class="btn primary" id="pt-joinbtn">Join</button></div>' +
-      '<div class="pt-hint">To start a watch party, open a movie and press the party button on a torrent row. ' +
-      'Send the invite to your friends — they paste it here. Everyone downloads the movie with their own ' +
-      'BitTorrent swarm and playback stays in sync.</div>';
+      '<button class="btn primary" id="pt-joinbtn">Join</button></div>';
     const inp = $('pt-invite');
     const go = () => { if (inp.value.trim()) partyJoin(inp.value); };
     $('pt-joinbtn').onclick = go;
