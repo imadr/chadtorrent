@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,22 +18,53 @@ pub(crate) const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mkv", "avi", "webm", "mov", "ts", "flv", "wmv", "mpg", "mpeg", "vob",
 ];
 
+pub(crate) fn is_video_path(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    VIDEO_EXTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Sub-directories we never treat as content.
+const IGNORED_DIRS: &[&str] = &[".seg", ".subs"];
+
 /// Find the largest video file under `dir` (recursively, or the file itself
 /// if given a file path). Returns `None` if no video file exists.
 pub(crate) fn find_largest_video_in(dir: &Path) -> Option<PathBuf> {
+    list_video_files_in(dir)
+        .into_iter()
+        .map(|(path, size)| (dir.join(path), size))
+        .max_by_key(|(_, size)| *size)
+        .map(|(path, _)| path)
+}
+
+/// Every video file under `dir` as `(relative path, size)`, `dir`-relative
+/// and `/`-normalized. Skips internal `.seg`/`.subs` directories. Skips the
+/// rendering-cache `segmenter` subfolder when `dir` is the item folder, too.
+pub(crate) fn list_video_files_in(dir: &Path) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
     if dir.is_file() {
-        return Some(dir.to_path_buf());
+        if let Ok(meta) = dir.metadata() {
+            out.push((String::new(), meta.len()));
+        }
+        return out;
     }
-    let mut best: Option<(PathBuf, u64)> = None;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(cur) = stack.pop() {
+    let mut stack = vec![(dir.to_path_buf(), String::new())];
+    while let Some((cur, rel_prefix)) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&cur) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if rel_prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel_prefix}/{name}")
+            };
             if path.is_dir() {
-                stack.push(path);
+                if IGNORED_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                stack.push((path, rel));
                 continue;
             }
             let ext = path
@@ -44,13 +76,11 @@ pub(crate) fn find_largest_video_in(dir: &Path) -> Option<PathBuf> {
                 continue;
             }
             if let Ok(meta) = path.metadata() {
-                if best.as_ref().map(|(_, size)| meta.len() > *size).unwrap_or(true) {
-                    best = Some((path, meta.len()));
-                }
+                out.push((rel, meta.len()));
             }
         }
     }
-    best.map(|(path, _)| path)
+    out
 }
 
 #[allow(dead_code)]
@@ -66,6 +96,26 @@ pub struct LibraryManager {
 pub struct StatusUpdate {
     pub library_id: i64,
     pub status: TorrentStatus,
+}
+
+/// One file of a torrent, as shown in the TV-show episode UI. `path` is the
+/// normalized relative path inside the torrent (the stable key used by the
+/// segmenter, skipped-file store and playhead store).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub have: u64,
+    pub video: bool,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub skipped: bool,
+    pub playhead: f64,
+    /// The torrent's default play file: the largest video file. Streaming
+    /// with no `?file=` serves this one, and its playhead mirrors
+    /// `library.playhead`.
+    pub default: bool,
 }
 
 impl LibraryManager {
@@ -162,7 +212,7 @@ impl LibraryManager {
         // and `ensure` won't double-spawn.
         let segments = self.segments.clone();
         tokio::spawn(async move {
-            segments.ensure(id).await;
+            segments.ensure(id, None).await;
         });
         Ok(())
     }
@@ -317,6 +367,40 @@ impl LibraryManager {
         if let Err(e) = self.db.update_file_path(library_id, &resolved) {
             warn!("Failed to set file path for {}: {}", library_id, e);
         }
+
+        // Re-apply the persisted per-file selection (skipped episodes) once the
+        // torrent is past initializing. `update_only_files` bails while
+        // metadata is resolving; retry briefly so an early start doesn't waste
+        // bandwidth on unselected files. Fresh adds have an empty skipped set.
+        let skipped = match self.db.list_skipped_files(library_id) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to read skipped files for {}: {}", library_id, e);
+                HashSet::new()
+            }
+        };
+        if !skipped.is_empty() {
+            let me = self.clone();
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    // Resolve the included ids only once metadata is available,
+                    // then hand the selection to the engine.
+                    let applied = if let Some(only) =
+                        me.engine.included_file_ids(library_id, &skipped).await
+                    {
+                        me.engine.set_only_files(library_id, &only).await.is_ok()
+                    } else {
+                        false
+                    };
+                    if applied {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                warn!("Gave up applying per-file selection for {library_id} after 10s");
+            });
+        }
+
         info!("Library item {} registered", library_id);
     }
 
@@ -485,6 +569,206 @@ impl LibraryManager {
         })
     }
 
+    /// The torrent-relative path of the item's canonical stream file (largest
+    /// video). `None` when no video file is known yet.
+    pub async fn default_video_path(&self, id: i64) -> Option<String> {
+        let item = self.db.get_item(id).ok().flatten()?;
+        // live torrent metadata first, then the on-disk layout
+        if self.engine.get_torrent(id).await.is_some() {
+            let files = self.engine.list_files(id).await?;
+            let mut best: Option<(String, u64)> = None;
+            for (_, path, size) in files {
+                let is_video = is_video_path(&path);
+                if is_video && best.as_ref().map(|(_, s)| size > *s).unwrap_or(true) {
+                    best = Some((path, size));
+                }
+            }
+            return best.map(|(path, _)| path);
+        }
+        let dir = self.item_dir(&item);
+        list_video_files_in(&dir)
+            .into_iter()
+            .max_by_key(|(_, size)| *size)
+            .map(|(path, _)| path)
+    }
+
+    fn item_dir(&self, item: &crate::db::LibraryItem) -> PathBuf {
+        item.file_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.config.library_dir.join(item.id.to_string()))
+    }
+
+    /// Every (video) file of an item with its season/episode mapping, have
+    /// bytes, skipped flag and saved playhead. Sources priority:
+    ///   - ready items: what's actually on disk (selected files are complete;
+    ///     skipped files may be missing or partial)
+    ///   - live torrents: engine metadata + per-file progress
+    ///   - paused/stopped: on-disk layout (partial files)
+    ///
+    /// Anything else returns an empty list. Non-video files from live torrent
+    /// metadata are included (flagged `video: false`) so skipped-file state
+    /// covers them too, but the frontend shows only video entries.
+    pub async fn list_item_files(&self, id: i64) -> Result<Vec<FileEntry>> {
+        let item = self
+            .db
+            .get_item(id)?
+            .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+        let skipped = self.db.list_skipped_files(id)?;
+        let playheads: std::collections::HashMap<String, f64> =
+            self.db.list_playheads(id)?.into_iter().collect();
+
+        let is_local_ready = item.state == "ready";
+        let has_handle = self.engine.get_torrent(id).await.is_some();
+
+        let mut entries: Vec<(String, u64, u64)> = Vec::new();
+        if is_local_ready {
+            let dir = self.item_dir(&item);
+            for (path, size) in list_video_files_in(&dir) {
+                let have = std::fs::metadata(dir.join(&path))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                entries.push((path, size, have));
+            }
+        } else if has_handle {
+            let files = self.engine.list_files(id).await.unwrap_or_default();
+            let progress = self.engine.stats_file_progress(id).await.unwrap_or_default();
+            for (file_id, path, size) in files {
+                let have = progress.get(file_id).copied().unwrap_or(0);
+                entries.push((path, size, have));
+            }
+        } else if matches!(item.state.as_str(), "paused" | "stopped") {
+            let dir = self.item_dir(&item);
+            for (path, size) in list_video_files_in(&dir) {
+                let have = std::fs::metadata(dir.join(&path))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                entries.push((path, size, have));
+            }
+        }
+
+        // The default stream file: the largest video in the raw list. Every source
+        // (disk or engine metadata) is already in `entries`, so this covers
+        // ready, paused/stopped and live torrents.
+        let default_path = entries
+            .iter()
+            .filter(|(path, _, _)| is_video_path(path))
+            .max_by_key(|(_, size, _)| *size)
+            .map(|(path, _, _)| path.clone());
+
+        let mut out = Vec::with_capacity(entries.len());
+        for (path, size, have) in entries {
+            let video = is_video_path(&path);
+            let (season, episode) = if video {
+                match crate::episodes::parse_episode_path(&path) {
+                    Some((s, e)) => (Some(s), Some(e)),
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+            let default = default_path
+                .as_deref()
+                .map(|d| d == path)
+                .unwrap_or(false);
+            let displayed_have = if is_local_ready && !skipped.contains(&path) {
+                // a fully-selected ready file is complete on disk
+                std::fs::metadata(
+                    self.item_dir(&item)
+                        .join(&path),
+                )
+                .map(|m| m.len())
+                .unwrap_or(have)
+            } else {
+                have
+            };
+            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            let playhead = playheads
+                .get(&path)
+                .copied()
+                .unwrap_or(if default { item.playhead } else { 0.0 });
+            out.push(FileEntry {
+                path: path.clone(),
+                name,
+                size,
+                have: displayed_have,
+                video,
+                season,
+                episode,
+                skipped: skipped.contains(&path),
+                playhead,
+                default,
+            });
+        }
+        // When no default could be pinned (no metadata, nothing on disk),
+        // fall back to the biggest video entry so the UI still marks one.
+        if default_path.is_none() {
+            if let Some(entry) = out.iter_mut().filter(|e| e.video).max_by_key(|e| e.size) {
+                entry.default = true;
+                if entry.playhead == 0.0 {
+                    entry.playhead = item.playhead;
+                }
+            }
+        }
+        out.sort_by(|a, b| match (a.season, b.season) {
+            (Some(x), Some(y)) => x
+                .cmp(&y)
+                .then(a.episode.cmp(&b.episode)),
+            (None, None) => a.path.cmp(&b.path),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+        });
+        Ok(out)
+    }
+
+    /// Mark one torrent file as selected (downloaded) or skipped, persist the
+    /// choice and apply it to the running torrent. Re-enabling a file on an
+    /// item with no live engine (e.g. a finished torrent after a restart)
+    /// re-registers the torrent so the new file actually starts downloading.
+    pub async fn set_file_selected(
+        self: &Arc<Self>,
+        id: i64,
+        path: &str,
+        selected: bool,
+    ) -> Result<()> {
+        let path = crate::episodes::normalize_rel_path(path);
+        let item = self
+            .db
+            .get_item(id)?
+            .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+        if item.magnet.is_empty() {
+            return Err(Error::BadRequest("item has no torrent".into()));
+        }
+
+        self.db.set_file_skipped(id, &path, !selected)?;
+        let skipped = self.db.list_skipped_files(id)?;
+
+        if self.engine.get_torrent(id).await.is_some() {
+            if let Some(only) = self.engine.included_file_ids(id, &skipped).await {
+                match self.engine.set_only_files(id, &only).await {
+                    // still initializing: the register loop applies it shortly
+                    Err(e) if e.to_string().contains("initializing") => {}
+                    Err(e) => warn!("set_only_files({id}) failed: {e}"),
+                    Ok(()) => {}
+                }
+            }
+            return Ok(());
+        }
+
+        // No live torrent. If we are enabling a file, kick off a re-add so the
+        // episode actually downloads (its pieces were never fetched).
+        if selected {
+            let output_dir = self.config.library_dir.join(id.to_string());
+            let _ = std::fs::create_dir_all(&output_dir);
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.register_torrent(id, output_dir, None).await;
+            });
+        }
+        Ok(())
+    }
+
     /// Remove a single torrent: deletes the library row and every file on
     /// disk (engine output folder plus any legacy temp leftover).
     pub async fn remove_item(&self, id: i64) -> Result<()> {
@@ -512,6 +796,9 @@ impl LibraryManager {
             }
         }
         self.segments.remove(id).await;
+        if let Err(e) = self.db.clear_item_files(id) {
+            warn!("Failed to clear file selection for {}: {}", id, e);
+        }
 
         self.remove_files_of(id).await;
 
@@ -527,6 +814,9 @@ impl LibraryManager {
                     .collect();
                 for sibling in siblings {
                     self.remove_files_of(sibling).await;
+                    if let Err(e) = self.db.clear_item_files(sibling) {
+                        warn!("Failed to clear file selection for {}: {}", sibling, e);
+                    }
                     self.db.delete_item(sibling)?;
                 }
             }

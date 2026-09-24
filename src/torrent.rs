@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use librqbit::{
     api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, BitV, BitVFactory,
-    DhtSessionConfig, ManagedTorrent, Session, SessionOptions, TorrentStats, BF,
+    DhtSessionConfig, ManagedTorrent, Session, SessionOptions, TorrentStats, TorrentStatsState, BF,
 };
 use tokio::sync::RwLock;
 use tracing::info;
@@ -307,6 +308,75 @@ impl TorrentEngine {
         }
 
         best
+    }
+
+    /// Every file in the torrent as `(file_id, normalized relative path,
+    /// length)`, from the engine's resolved metadata. `None` when the torrent
+    /// isn't attached or its metadata isn't resolved yet.
+    pub async fn list_files(&self, library_id: i64) -> Option<Vec<(usize, String, u64)>> {
+        let handle = self.get_torrent(library_id).await?;
+        let metadata = handle.with_metadata(|m| m.clone()).ok()?;
+        Some(
+            metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .map(|(i, fi)| {
+                    (
+                        i,
+                        crate::episodes::normalize_rel_path(&fi.relative_filename.to_string_lossy()),
+                        fi.len,
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Per-file downloaded bytes (indexed by file id), matching `list_files`.
+    pub async fn stats_file_progress(&self, library_id: i64) -> Option<Vec<u64>> {
+        let handle = self.get_torrent(library_id).await?;
+        Some(handle.stats().file_progress)
+    }
+
+    /// The set of file ids to download: every file whose normalized relative
+    /// path is not in `skipped_paths`. `None` when metadata isn't resolvable.
+    pub async fn included_file_ids(
+        &self,
+        library_id: i64,
+        skipped_paths: &HashSet<String>,
+    ) -> Option<HashSet<usize>> {
+        let files = self.list_files(library_id).await?;
+        Some(
+            files
+                .into_iter()
+                .filter(|(_, path, _)| !skipped_paths.contains(path))
+                .map(|(id, _, _)| id)
+                .collect(),
+        )
+    }
+
+    /// Replace the torrent's per-file download selection. The delta pieces of
+    /// unselected files stop being requested (already-downloaded pieces stay
+    /// on disk); re-selecting a file resumes its remaining pieces. Fails while
+    /// the torrent is still initializing — callers retry until metadata is
+    /// resolved.
+    pub async fn set_only_files(&self, library_id: i64, only: &HashSet<usize>) -> Result<()> {
+        let handle = self
+            .get_torrent(library_id)
+            .await
+            .ok_or_else(|| Error::NotFound(format!("torrent {library_id} is not active")))?;
+        if matches!(
+            handle.stats().state,
+            TorrentStatsState::Initializing { .. }
+        ) {
+            return Err(Error::Torrent("torrent is still initializing".into()));
+        }
+        self.session
+            .clone()
+            .update_only_files(&handle, only)
+            .await
+            .map_err(|e| Error::Torrent(e.to_string()))?;
+        Ok(())
     }
 
     #[allow(dead_code)]

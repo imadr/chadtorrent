@@ -40,6 +40,16 @@ pub struct SetSequentialRequest {
 #[derive(Deserialize)]
 pub struct SetPlayheadRequest {
     t: f64,
+    /// Per-file playback position. Absent = the torrent's default file
+    /// (mirrored to the legacy `library.playhead`).
+    file: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SetFileSelectedRequest {
+    /// Normalized relative path inside the torrent.
+    file: String,
+    selected: bool,
 }
 
 fn default_true() -> bool {
@@ -84,7 +94,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/{id}/pause", post(pause_item))
         .route("/api/library/{id}/resume", post(resume_item))
         .route("/api/library/{id}/sequential", post(set_sequential))
-    .route("/api/library/{id}/playhead", post(set_playhead))
+        .route("/api/library/{id}/files", get(files_list))
+        .route("/api/library/{id}/file", post(set_file_selected))
+        .route("/api/library/{id}/playhead", post(set_playhead))
         .route("/api/library/{id}/stream", get(stream_info))
         .route("/api/library/{id}/subs", get(subs_list))
         .route("/api/library/{id}/subs/search", get(subs_search))
@@ -365,9 +377,34 @@ async fn set_sequential(
     Ok(Json(json!({ "success": true })))
 }
 
-/// Save the playback position for a torrent item (per torrent file, not per
-/// movie). Called by the player on every seek and when the player closes;
-/// the client resets it to 0 itself when a movie finishes.
+/// Every file of an item with its season/episode mapping, download state and
+/// saved playhead — the data behind the TV-show episode UI.
+async fn files_list(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    let files = state.library.list_item_files(id).await?;
+    Ok(Json(json!({ "files": files })))
+}
+
+/// Toggle whether one torrent file should be downloaded (skip/unskip).
+async fn set_file_selected(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<SetFileSelectedRequest>,
+) -> Result<impl IntoResponse> {
+    state
+        .library
+        .set_file_selected(id, &req.file, req.selected)
+        .await?;
+    Ok(Json(json!({ "success": true })))
+}
+
+/// Save the playback position for a torrent item. When `file` is present the
+/// position is stored per file (mirrored to the legacy `library.playhead`
+/// when it's the item's default stream file); otherwise it lands on
+/// `library.playhead`. Called by the player on every seek and when the player
+/// closes; the client resets it to 0 itself when a movie finishes.
 async fn set_playhead(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -378,8 +415,27 @@ async fn set_playhead(
         .db
         .get_item(id)?
         .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
-    state.library.db.set_playhead(id, req.t)?;
+    match req.file.as_deref() {
+        Some(file) => {
+            let file = crate::episodes::normalize_rel_path(file);
+            state.library.db.set_file_playhead(id, &file, req.t)?;
+            if state.library.default_video_path(id).await.as_deref() == Some(&file) {
+                state.library.db.set_playhead(id, req.t)?;
+            }
+        }
+        None => state.library.db.set_playhead(id, req.t)?,
+    }
     Ok(Json(json!({ "success": true })))
+}
+
+/// Read the optional `?file=` query param and normalize it. None = the
+/// torrent's default (largest) video file.
+fn query_file(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("file")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(crate::episodes::normalize_rel_path)
 }
 
 /// Segment-stream manifest: tells the client the SourceBuffer MIME, total
@@ -390,6 +446,7 @@ async fn set_playhead(
 async fn stream_info(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
 ) -> Result<impl IntoResponse> {
     state
         .library
@@ -397,7 +454,8 @@ async fn stream_info(
         .get_item(id)?
         .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
 
-    let seg = state.library.segments.ensure(id).await;
+    let file = query_file(&params);
+    let seg = state.library.segments.ensure(id, file).await;
     let snap = seg.snapshot();
     if (snap.mime.is_none() || snap.duration.is_none()) && !snap.done {
         if let Some(p) = &snap.probe_path {
@@ -464,8 +522,13 @@ async fn test_page() -> Response {
 }
 
 /// Serve `init.mp4` (ftyp+moov) for a segment session.
-async fn seg_init(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
-    let Some(seg) = state.library.segments.get(id).await else {
+async fn seg_init(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Response {
+    let file = query_file(&params);
+    let Some(seg) = state.library.segments.get(id, file).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     serve_seg_file(&seg.dir, "init.mp4").await
@@ -476,8 +539,10 @@ async fn seg_init(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
 async fn seg_n(
     State(state): State<AppState>,
     Path((id, n)): Path<(i64, usize)>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
 ) -> Response {
-    let Some(seg) = state.library.segments.get(id).await else {
+    let file = query_file(&params);
+    let Some(seg) = state.library.segments.get(id, file).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     serve_seg_file(&seg.dir, &format!("seg-{n}.m4s")).await
@@ -503,11 +568,30 @@ fn subs_dirs(state: &AppState, id: i64) -> (PathBuf, PathBuf) {
     (item_dir, subs_dir)
 }
 
-async fn video_info(state: &AppState, id: i64) -> Option<(PathBuf, String)> {
-    // (largest video path, query name) — file may be partial while downloading
+async fn video_info(state: &AppState, id: i64, file: Option<&str>) -> Option<(PathBuf, String)> {
+    // (video path, query name) — file may be partial while downloading
     let handle = state.library.engine.get_torrent(id).await;
     if let Some(handle) = handle {
-        if let Some((_file_id, name, _size)) = state.library.engine.find_largest_video_file(id).await {
+        let chosen = match file {
+            Some(rel) => state
+                .library
+                .engine
+                .list_files(id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find(|(_, path, _)| {
+                    path == rel || crate::episodes::normalize_rel_path(path) == rel
+                })
+                .map(|(_, name, _)| name),
+            None => state
+                .library
+                .engine
+                .find_largest_video_file(id)
+                .await
+                .map(|(_, name, _)| name),
+        };
+        if let Some(name) = chosen {
             let path = handle.output_folder().join(&name);
             let stem = std::path::Path::new(&name)
                 .file_stem()
@@ -524,7 +608,10 @@ async fn video_info(state: &AppState, id: i64) -> Option<(PathBuf, String)> {
         .map(PathBuf::from)
         .filter(|p| p.exists())
         .unwrap_or(item_dir);
-    let full = crate::library::find_largest_video_in(&dir)?;
+    let full = match file {
+        Some(rel) => dir.join(rel).exists().then(|| dir.join(rel)),
+        None => crate::library::find_largest_video_in(&dir),
+    }?;
     let stem = full
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -554,8 +641,12 @@ async fn subs_list(State(state): State<AppState>, Path(id): Path<i64>) -> Result
     })))
 }
 
-/// Search OpenSubtitles for the item's video.
-async fn subs_search(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse> {
+/// Search OpenSubtitles for the item's video (optionally a specific file).
+async fn subs_search(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
     let Some(subs) = state.subs.clone() else {
         return Ok(Json(json!({ "configured": false, "results": [] })));
     };
@@ -564,7 +655,8 @@ async fn subs_search(State(state): State<AppState>, Path(id): Path<i64>) -> Resu
         .db
         .get_item(id)?
         .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
-    let Some((video_path, stem)) = video_info(&state, id).await else {
+    let file = query_file(&params);
+    let Some((video_path, stem)) = video_info(&state, id, file.as_deref()).await else {
         return Err(Error::NotFound("no video file found for item".into()));
     };
     let query = stem.replace('.', " ");

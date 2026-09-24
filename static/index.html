@@ -42,8 +42,6 @@
   .card .meta { padding: 9px 11px; }
   .card .meta .t { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .card .meta .y { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .badge { position: absolute; top: 8px; right: 8px; background: var(--accent); color: var(--accent-ink);
-           font-size: 11px; font-weight: 700; padding: 2px 8px; }
   .empty { color: var(--muted); text-align: center; padding: 60px 0; }
 
   .back { background: none; border: none; color: var(--muted); padding: 0 0 14px; font-size: 14px; }
@@ -61,6 +59,34 @@
   .rows { display: flex; flex-direction: column; gap: 8px; }
   .row { display: flex; align-items: center; gap: 12px; background: var(--panel);
          border: 0.5px solid var(--line); padding: 10px 14px; }
+  #mv-seasonchips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
+  #mv-seasonchips[hidden] { display: none; }
+  #mv-seasonchips .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
+          background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  #mv-seasonchips .s-chip:hover { border-color: var(--line-hi); }
+  #mv-seasonchips .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
+  .tv-t .eps { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 8px 24px; }
+  .tv-t .ep { display: flex; align-items: center; gap: 10px; border: 0.5px solid var(--line);
+              padding: 7px 12px 7px 14px; min-height: 44px; }
+  .tv-t .ep:hover { background: var(--panel2); border-color: var(--line-hi); }
+  .tv-t .ep.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
+  .tv-t .ep .ep-cb { display: inline-flex; align-items: center; gap: 7px; flex-shrink: 0;
+                     cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
+  .tv-t .ep .ep-cb input { accent-color: var(--line-hi); cursor: pointer; margin: 0; }
+  .tv-t .ep .ep-num { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tv-t .ep-info { flex: 1; min-width: 0; }
+  .tv-t .ep-name { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tv-t .ep-info .dl { margin-top: 5px; }
+  .tv-t .ep-size { font-size: 12px; color: var(--muted); flex-shrink: 0; width: 92px;
+                   text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tv-t .ep .ibtn { width: 30px; height: 30px; padding: 0; flex-shrink: 0; display: inline-flex;
+                    align-items: center; justify-content: center; background: var(--panel2);
+                    border: 0.5px solid var(--line); color: var(--text); }
+  .tv-t .ep .ibtn:hover { border-color: var(--line-hi); }
+  .tv-t .ep .ibtn.primary { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
+  .tv-t .ep .ibtn:disabled { opacity: .35; cursor: default; }
+  .tv-t .ep .ibtn svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none;
+                        stroke-linecap: round; stroke-linejoin: round; }
   #mv-torrents .row { min-height: 68px; }
   .row:hover { background: var(--panel2); border-color: var(--line-hi); }
   .row.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
@@ -341,6 +367,7 @@
   </div>
   <section>
     <h3>Downloaded contents</h3>
+    <div id="mv-seasonchips" hidden></div>
     <div class="rows" id="mv-torrents"></div>
   </section>
   <section id="mv-searchsec" hidden>
@@ -502,6 +529,12 @@ const $ = (id) => document.getElementById(id);
 const v = $('player');
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, pollBusy = 0, dlState = {};
+// Per-torrent file lists for the TV-show UI (episode picker, per-file skip).
+var fileLists = new Map();        // String(id) -> files [] from /api/library/{id}/files
+var fileListsBusy = new Map();    // String(id) -> in-flight fetch promise (dedupe)
+var fileStatsAt = new Map();      // String(id) -> last per-file progress refresh (ts)
+var tvSeason = null;              // selected season bucket ('1', '2', ... 'other')
+var currentFile = null;           // rel path of the file currently playing (null = default)
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
 let fullDur = 0; // declared here; player session state lives with the player below
 var libSel = -1, mvSelIdx = -1;
@@ -585,13 +618,11 @@ function renderGrid() {
     const rep = movieRep(rows);
     const card = document.createElement('div');
     card.className = 'card';
-    const count = rows.filter(r => r.magnet).length;
     const posterHtml = rep.poster_path
       ? posterTag(posterURL(rep.poster_path, POSTER_IDX))
       : placeholder('▷');
     card.innerHTML =
       '<div class="poster">' + posterHtml + '</div>' +
-      (count ? '<span class="badge">' + count + '</span>' : '') +
       '<div class="meta"><div class="t">' + esc(movieName(rep)) + '</div>' +
       '<div class="y">' + esc(movieYear(rep)) + (kindLabel(rep) ? ' · ' + kindLabel(rep) : '') + '</div></div>';
     card.onclick = () => openMovie(k);
@@ -694,8 +725,12 @@ function openMovie(k, push = true) {
   if (!rows.length) return;
   currentMovie = { key: k, rows };
   dlState = {};
+  fileLists = new Map();
+  fileListsBusy = new Map();
+  fileStatsAt = new Map();
+  tvSeason = null;
+  currentFile = null;
   setView(true);
-  if (push) pushRoute(movieRoute());
   if (push) pushRoute(movieRoute());
   mvSelIdx = -1;
   $('mv-results').innerHTML = '';
@@ -709,15 +744,6 @@ const IC_PLAY = '<svg viewBox="0 0 24 24"><use href="#ic-play"/></svg>';
 const IC_PAUSE = '<svg viewBox="0 0 24 24"><use href="#ic-pause"/></svg>';
 const IC_BIN = '<svg viewBox="0 0 24 24"><use href="#ic-bin"/></svg>';
 
-function icBtn(inner, cls, onclick) {
-  const b = document.createElement('button');
-  b.className = 'ibtn' + (cls ? ' ' + cls : '');
-  b.innerHTML = inner;
-  b.onclick = onclick;
-  b.title = cls || '';
-  return b;
-}
-
 function renderMovie() {
   const rows = currentMovie.rows;
   const rep = movieRep(rows);
@@ -730,28 +756,22 @@ function renderMovie() {
 
   const list = $('mv-torrents');
   const torrentRs = rows.filter(r => r.magnet);
-  // Update rows in place so the same DOM node transitions between states
-  // (adding → downloading → ready) without a rebuild flash. Row boxes stay
-  // the same height; only the inside content changes.
-  const empty = list.querySelector('.empty');
+  // Full rebuild on every render: wipe the list and rebuild from scratch. The
+  // old in-place diff only cleaned rows of the current display mode, so TV
+  // episode blocks survived a switch to a movie (and vice-versa) and leaked
+  // onto the wrong page. Nothing is cached — nothing can be left over.
+  list.innerHTML = '';
   if (!torrentRs.length) {
-    if (!empty) list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
+    list.innerHTML = '<div class="empty" style="padding:12px 0">No content</div>';
+  } else if (rep.media_type === 'tv') {
+    renderTV(torrentRs);
   } else {
-    if (empty) empty.remove();
-    const existing = {};
-    for (const el of list.querySelectorAll(':scope > .row')) existing[el.dataset.id] = el;
-    const keep = new Set();
     for (const t of torrentRs) {
-      keep.add(String(t.id));
-      let el = existing[t.id];
-      if (!el) {
-        el = document.createElement('div');
-        el.dataset.id = t.id;
-        list.appendChild(el);
-      }
+      const el = document.createElement('div');
+      el.dataset.id = t.id;
+      list.appendChild(el);
       renderTorrentRow(el, t);
     }
-    for (const id in existing) if (!keep.has(id)) existing[id].remove();
   }
 
   const sec = $('mv-searchsec');
@@ -759,7 +779,7 @@ function renderMovie() {
   mvSyncSel();
 }
 
-function renderTorrentRow(el, t) {
+function renderTorrentRow(el, t, opts) {
   el.className = 'row';
   el.dataset.state = t.state || '';
   const isDown = t.state === 'downloading';
@@ -794,12 +814,18 @@ function renderTorrentRow(el, t) {
     txt.textContent = 'Stopped';
   }
   const canPlay = t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error';
-  el.style.cursor = canPlay ? 'pointer' : 'default';
-  el.onclick = (e) => {
-    if (!canPlay) return;
-    if (e.target.closest('button, label, input, a')) return;
-    playTorrent(t);
-  };
+  if (opts && opts.clickable === false) {
+    // TV torrent header: only the episode rows below play media.
+    el.style.cursor = 'default';
+    el.onclick = null;
+  } else {
+    el.style.cursor = canPlay ? 'pointer' : 'default';
+    el.onclick = (e) => {
+      if (!canPlay) return;
+      if (e.target.closest('button, label, input, a')) return;
+      playTorrent(t);
+    };
+  }
   if (isDown) {
     const pr = document.createElement('button');
     pr.className = 'ibtn'; pr.innerHTML = IC_PAUSE;
@@ -855,6 +881,205 @@ function renderTorrentRow(el, t) {
     };
     el.appendChild(seq);
   }
+}
+
+/* ---------- TV-show episode UI ----------
+ * A TV group renders each torrent as a header row (pause/resume/delete/seq —
+ * identical to the movie path) plus a list of episode rows under it. Episode
+ * rows use `.ep` (NOT `.row[data-id]`) so pollDownloads / mvFlat / renderMovie
+ * keep treating the torrent header as the selectable content row. File lists
+ * come from /api/library/{id}/files (season/episode per file + `have`). */
+const SEASON_OTHER = 'other';
+
+function basename(p) { return String(p || '').split('/').pop(); }
+function fileSlug(p) { return slugify(basename(p)); }
+function segFileQ() {
+  return currentFile ? '?file=' + encodeURIComponent(currentFile) : '';
+}
+function currentTvTorrents() {
+  return currentMovie ? currentMovie.rows.filter(r => r.magnet) : [];
+}
+function isTvMovie() {
+  return !!(currentMovie && movieRep(currentMovie.rows) && movieRep(currentMovie.rows).media_type === 'tv');
+}
+
+function loadFileList(id, force) {
+  const key = String(id);
+  if (!force && fileLists.has(key)) return Promise.resolve(fileLists.get(key));
+  if (!force && fileListsBusy.has(key)) return fileListsBusy.get(key);
+  const p = api('/api/library/' + key + '/files')
+    .then(r => { const f = (r && r.files) || []; fileLists.set(key, f); return f; })
+    .catch(e => { console.error('file list failed', key, e); return null; });
+  if (!force) { fileListsBusy.set(key, p); p.finally(() => fileListsBusy.delete(key)); }
+  return p;
+}
+
+function refreshTvView() {
+  if (isTvMovie()) renderTV(currentTvTorrents());
+}
+
+/* Bucket a torrent into seasons by its video files. A torrent with no file
+ * list yet (still connecting) lands in the 'other' bucket as a plain header. */
+function tvBuckets(torrentRs) {
+  const byKey = new Map();
+  const keys = new Set();
+  for (const t of torrentRs) {
+    const files = fileLists.get(String(t.id));
+    let seasons;
+    if (files && files.length) {
+      seasons = new Set(files.filter(f => f.video).map(f => f.season != null ? String(f.season) : SEASON_OTHER));
+      if (!seasons.size) seasons.add(SEASON_OTHER);
+    } else {
+      seasons = new Set([SEASON_OTHER]);
+    }
+    for (const s of seasons) {
+      if (!byKey.has(s)) byKey.set(s, []);
+      byKey.get(s).push(t);
+      keys.add(s);
+    }
+  }
+  const sorted = [...keys].sort((a, b) => {
+    if (a === SEASON_OTHER) return 1;
+    if (b === SEASON_OTHER) return -1;
+    return (+a) - (+b);
+  });
+  return { keys: sorted, byKey };
+}
+
+function renderTV(torrentRs) {
+  const list = $('mv-torrents');
+  list.innerHTML = ''; // full rebuild — nothing cached, nothing to clean
+
+  const b = tvBuckets(torrentRs);
+  const chips = $('mv-seasonchips');
+  if (b.keys.length > 1) {
+    if (!b.keys.includes(tvSeason)) tvSeason = b.keys[0];
+    chips.hidden = false;
+    chips.innerHTML = b.keys.map(k =>
+      '<button class="s-chip' + (tvSeason === k ? ' sel' : '') + '" data-season="' + k + '">' +
+      esc(k === SEASON_OTHER ? 'Other' : 'Season ' + k) + '</button>').join('');
+    chips.onclick = (e) => {
+      const btn = e.target.closest('button.s-chip');
+      if (!btn) return;
+      tvSeason = btn.dataset.season;
+      renderTV(currentTvTorrents());
+    };
+  } else {
+    chips.hidden = true;
+    tvSeason = b.keys[0];
+  }
+
+  for (const t of (b.byKey.get(tvSeason) || [])) {
+    const el = document.createElement('div');
+    el.className = 'tv-t';
+    el.dataset.id = String(t.id);
+    list.appendChild(el);
+    renderTvTorrent(el, t);
+  }
+  mvSyncSel();
+}
+
+function renderTvTorrent(el, t) {
+  el.innerHTML = ''; // build fresh every time
+  const head = document.createElement('div');
+  el.appendChild(head);
+  renderTorrentRow(head, t, { clickable: false });
+
+  const files = fileLists.get(String(t.id));
+  // Load lazily; render nothing until the list lands (an empty area is better
+  // than a stranded "Getting file list…" text).
+  if (!files) {
+    loadFileList(t.id).then(() => refreshTvView());
+    return;
+  }
+  const shown = files
+    .filter(f => f.video)
+    .filter(f => tvSeason === SEASON_OTHER ? f.season == null : String(f.season) === String(tvSeason));
+  if (!shown.length) return;
+  const eps = document.createElement('div');
+  eps.className = 'eps';
+  el.appendChild(eps);
+  for (const f of shown) {
+    const r = document.createElement('div');
+    r.className = 'ep';
+    r.dataset.file = f.path;
+    eps.appendChild(r);
+    renderEpRow(r, t, f);
+  }
+}
+
+function renderEpRow(r, t, f) {
+  const done = t.state === 'ready';
+  const skipped = !!f.skipped;
+  const canPlay = t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error';
+  const num = (f.season != null && f.episode != null)
+    ? 'S' + String(f.season).padStart(2, '0') + 'E' + String(f.episode).padStart(2, '0')
+    : '';
+  const nm = basename(f.path);
+  const have = f.have || 0, size = f.size || 0;
+  const pct = size ? Math.min(100, (have / size) * 100) : 0;
+  const status = done
+    ? ''
+    : (have > 0
+        ? Math.round(pct) + '%' + (pct < 100 ? ' · ' + fmtBytes(have) : '')
+        : 'not downloaded');
+  r.innerHTML =
+    '<label class="ep-cb" title="Download this episode">' +
+      '<input type="checkbox"' + (skipped ? '' : ' checked') + '>' +
+      '<span class="ep-num">' + esc(num || f.name || nm) + '</span>' +
+    '</label>' +
+    '<div class="ep-info">' +
+      '<div class="ep-name">' + esc(nm) + '</div>' +
+      '<div class="dl"' + (done ? ' hidden' : '') + '><div class="bar"></div><div class="txt"></div></div>' +
+    '</div>' +
+    '<div class="ep-size">' + esc(done ? fmtBytes(size) : status) + '</div>' +
+    '<button class="ibtn primary" title="Play">' + IC_PLAY + '</button>';
+  if (!done && have > 0) {
+    const bar = r.querySelector('.bar');
+    const seg = document.createElement('b');
+    seg.style.flex = 'none';
+    seg.style.width = pct + '%';
+    seg.style.background = '#3ddc97';
+    bar.replaceChildren(seg);
+    r.querySelector('.txt').textContent = Math.round(pct) + '%';
+  }
+  const cb = r.querySelector('input');
+  cb.onchange = () => { cb.disabled = true; setFileSelected(t, f.path, cb.checked); };
+  const play = r.querySelector('.ibtn');
+  play.disabled = !canPlay || skipped || (have <= 0 && !done);
+  play.onclick = (e) => { e.stopPropagation(); playTorrent(t, f.path); };
+}
+
+/* Lowest-numbered playable episode for a torrent (header click / keybinding).
+ * "Playable" = not skipped and has at least some bytes on disk/engine. */
+function pickEpisodeToPlay(t) {
+  const files = fileLists.get(String(t.id)) || [];
+  const playable = files.filter(f => f.video && !f.skipped && (f.have || 0) > 0);
+  const pool = playable.length ? playable : files.filter(f => f.video && !f.skipped);
+  if (!pool.length) return null;
+  pool.sort((a, b) => {
+    const s = (a.season != null ? a.season : 9999) - (b.season != null ? b.season : 9999);
+    if (s) return s;
+    const e = (a.episode != null ? a.episode : 99999) - (b.episode != null ? b.episode : 99999);
+    if (e) return e;
+    return a.path.localeCompare(b.path);
+  });
+  return pool[0];
+}
+
+async function setFileSelected(t, path, selected) {
+  const id = String(t.id);
+  try {
+    await api('/api/library/' + id + '/file', {
+      method: 'POST',
+      body: JSON.stringify({ file: path, selected }),
+    });
+  } catch (e) { console.error('file toggle failed', e); }
+  fileLists.delete(id);
+  fileStatsAt.delete(id);
+  await loadFileList(id, true);
+  refreshTvView();
+  refreshLibrary();
 }
 
 async function delItem(t) {
@@ -1132,13 +1357,18 @@ function bufDump(kind) {
 
 const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function playTorrent(item) {
+async function playTorrent(item, file) {
   stopPlayback();
   currentId = item.id;
-  // Resume where this torrent file left off (per torrent, not per movie).
-  resumeAt = Math.max(0, item.playhead || 0);
-  if (currentMovie) pushRoute(movieRoute() + '/' + torrentSlug(item));
-  if (currentMovie) pushRoute(movieRoute() + '/' + torrentSlug(item));
+  currentFile = file || null;
+  // Resume per torrent FILE (per torrent for the default file).
+  const fl = currentFile ? (fileLists.get(String(item.id)) || []).find(f => f.path === currentFile) : null;
+  resumeAt = Math.max(0, fl ? (fl.playhead || 0) : (item.playhead || 0));
+  if (currentMovie) {
+    let path = movieRoute() + '/' + torrentSlug(item);
+    if (currentFile) path += '/' + fileSlug(currentFile);
+    pushRoute(path);
+  }
   $('player-modal').hidden = false;
   $('ctrl').style.display = 'block';
   showBuf('Loading…');
@@ -1175,7 +1405,7 @@ async function startSegSession() {
   for (;;) {
     if (gen !== segGen) return;
     try {
-      info = await api('/api/library/' + id + '/stream');
+      info = await api('/api/library/' + id + '/stream' + segFileQ());
     } catch (e) {
       throw new Error(String(e.message || e).includes('not found') ? 'Item is gone' : 'Server unreachable');
     }
@@ -1267,7 +1497,7 @@ async function manifestPoller(gen, id) {
     }
     let info = null;
     try {
-      info = await api('/api/library/' + id + '/stream');
+      info = await api('/api/library/' + id + '/stream' + segFileQ());
     } catch (e) { continue; }
     if (gen !== segGen) return;
     if (info.error) { segFatal(new Error(info.error)); return; }
@@ -1414,7 +1644,7 @@ async function pumpLoop(gen, id) {
 }
 
 async function fetchSegBuf(id, name) {
-  const r = await fetch('/mse/' + id + '/' + name, { signal: segAbort ? segAbort.signal : undefined });
+  const r = await fetch('/mse/' + id + '/' + name + segFileQ(), { signal: segAbort ? segAbort.signal : undefined });
   if (r.status === 404) return null;
   if (!r.ok) {
     console.error('[ct] segment fetch failed:', name, 'HTTP', r.status);
@@ -1494,8 +1724,15 @@ function savePlayhead(t) {
   if (currentId == null) return;
   const id = currentId;
   const it = items.find(i => i.id === id);
-  if (it) it.playhead = t;
-  api('/api/library/' + id + '/playhead', { method: 'POST', body: JSON.stringify({ t }) }).catch(() => {});
+  const body = { t };
+  if (currentFile) {
+    const fl = fileLists.get(String(id));
+    if (fl) { const f = fl.find(x => x.path === currentFile); if (f) f.playhead = t; }
+    body.file = currentFile;
+  } else if (it) {
+    it.playhead = t;
+  }
+  api('/api/library/' + id + '/playhead', { method: 'POST', body: JSON.stringify(body) }).catch(() => {});
 }
 
 function segFatal(e) {
@@ -1530,6 +1767,7 @@ function stopPlayback() {
   subsLoadedFor = null;
   fullDur = 0;
   currentId = null;
+  currentFile = null;
   lastSkKey = null;
   resumeAt = 0;
   hideBuf();
@@ -1995,7 +2233,8 @@ async function toggleSubsPanel(show) {
   p.classList.toggle('open', subPanelOpen);
   if (!subPanelOpen) syncCtrlVis(); // back to bottom-10% hide rule right away
   if (!subPanelOpen || currentId == null) return;
-  if (subsLoadedFor !== currentId) {
+  const subKey = currentId + ':' + (currentFile || '');
+  if (subsLoadedFor !== subKey) {
     subsLocal = []; subsOnline = null; subsConfigured = false; subBusy = true; renderSubPanel();
     try {
       const info = await api('/api/library/' + currentId + '/subs');
@@ -2003,12 +2242,12 @@ async function toggleSubsPanel(show) {
       if (subsConfigured) {
         subBusy = true; renderSubPanel();
         try {
-          const res = await api('/api/library/' + currentId + '/subs/search');
+          const res = await api('/api/library/' + currentId + '/subs/search' + segFileQ());
           subsOnline = res.results || []; subsConfigured = !!res.configured;
         } catch (e) { subsOnline = null; }
       }
     } catch (e) { console.error('subs list failed', e); }
-    subBusy = false; subsLoadedFor = currentId;
+    subBusy = false; subsLoadedFor = subKey;
   }
   renderSubPanel();
 }
@@ -2280,6 +2519,7 @@ $('fsbtn').addEventListener('click', toggleFs);
  * /library                      grid
  * /library/<movie_slug>         movie detail
  * /library/<movie>/<torrent>    movie detail + player on that torrent
+ * /library/<movie>/<torrent>/<file>  TV: player on that episode file
  * pushState on user actions; popstate + first load route accordingly. */
 let bootRouted = false;
 function slugify(x) { return String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, ''); }
@@ -2307,10 +2547,27 @@ function handleRoute() {
     if (playerOpen) { stopPlayback(); $('player-modal').hidden = true; }
     return;
   }
-  const tslug = parts.slice(2).join('_');
+  // 3 parts = torrent (default file); 4 parts = torrent + specific episode file.
+  const tslug = parts.slice(2, parts.length > 3 ? 3 : undefined).join('_');
+  const fslug = parts.length > 3 ? parts.slice(3).join('_') : null;
   const t = mrows.filter(r => r.magnet && r.state !== '_pending' && r.state !== 'connecting' && r.state !== 'error')
                  .find(r => torrentSlug(r) === tslug);
-  if (t && currentId !== t.id) playTorrent(t);
+  if (!t || currentId === t.id) return;
+  if (fslug) {
+    loadFileList(t.id).then(files => {
+      const f = (files || []).find(x => x.video && fileSlug(x.path) === fslug);
+      if (currentId !== t.id) playTorrent(t, f ? f.path : null);
+    });
+    return;
+  }
+  if (movieRep(mrows) && movieRep(mrows).media_type === 'tv') {
+    loadFileList(t.id).then(() => {
+      const f = pickEpisodeToPlay(t);
+      if (currentId !== t.id) playTorrent(t, f ? f.path : null);
+    });
+  } else {
+    playTorrent(t);
+  }
 }
 function showLibraryRoute() {
   if (currentId !== null) stopPlayback();
@@ -2506,8 +2763,14 @@ function libSelMove(d) {
 
 function mvFlat() {
   const out = [];
-  for (const el of document.querySelectorAll('#mv-torrents .row[data-id]')) out.push({ kind: 'content', el });
-  for (const el of document.querySelectorAll('#mv-results .row'))         out.push({ kind: 'torrent',  el });
+  // TV shows: walk each torrent block in DOM order so a header is followed by
+  // its own episode rows (Up/Down then step header → episodes → next header).
+  for (const el of document.querySelectorAll('#mv-torrents > .tv-t')) {
+    for (const row of el.querySelectorAll(':scope > .row[data-id]')) out.push({ kind: 'content', el: row });
+    for (const ep of el.querySelectorAll(':scope > .eps > .ep')) out.push({ kind: 'episode', el: ep });
+  }
+  for (const el of document.querySelectorAll('#mv-torrents > .row[data-id]')) out.push({ kind: 'content', el });
+  for (const el of document.querySelectorAll('#mv-results .row'))          out.push({ kind: 'torrent',  el });
   return out;
 }
 function mvHighlight() {
@@ -2539,9 +2802,22 @@ function selOpen() {
   }
   const x = mvFlat()[mvSelIdx];
   if (!x) return;
+  if (x.kind === 'episode') {
+    const play = x.el.querySelector('.ibtn');
+    if (play && !play.disabled) play.click();
+    return;
+  }
   if (x.kind === 'content') {
     const t = items.find(i => String(i.id) === String(x.el.dataset.id));
-    if (t && t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error') playTorrent(t);
+    if (!t || t.state === '_pending' || t.state === 'connecting' || t.state === 'error') return;
+    if (isTvMovie()) {
+      loadFileList(t.id).then(() => {
+        const f = pickEpisodeToPlay(t);
+        if (currentId !== t.id) playTorrent(t, f ? f.path : null);
+      });
+    } else {
+      playTorrent(t);
+    }
   } else {
     const add = x.el.querySelector('button.btn');
     if (add && !add.disabled) add.click();
@@ -2549,7 +2825,17 @@ function selOpen() {
 }
 function selToggleDl() {
   const x = mvFlat()[mvSelIdx];
-  if (!x || x.kind !== 'content') return;
+  if (!x) return;
+  if (x.kind === 'episode') {
+    // Space toggles whether this episode is downloaded (skip/unskip).
+    const cb = x.el.querySelector('input[type=checkbox]');
+    if (cb && !cb.disabled) {
+      cb.checked = !cb.checked;
+      cb.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return;
+  }
+  if (x.kind !== 'content') return;
   const btn = x.el.dataset.state === 'paused'
     ? x.el.querySelector('.ibtn.primary')
     : x.el.querySelector('.ibtn:not(.primary):not(.danger)');
@@ -3219,6 +3505,22 @@ async function pollDownloads() {
         }
         const p = await api('/api/library/' + row.dataset.id + '/pieces');
         applyDlRow(row, row.dataset.id, p, s);
+        if (isTvMovie()) {
+          // Per-episode bars: refresh the file list (have bytes) at most
+          // every ~5s per torrent and re-render just that torrent's rows.
+          const id = String(row.dataset.id);
+          const now = Date.now();
+          if (now - (fileStatsAt.get(id) || 0) >= 5000) {
+            fileStatsAt.set(id, now);
+            loadFileList(id, true).then(() => {
+              const el = document.querySelector('#mv-torrents .tv-t[data-id="' + id + '"]');
+              if (el && currentId !== Number(id)) {
+                const t = items.find(i => String(i.id) === id);
+                if (t) { renderTvTorrent(el, t); mvSyncSel(); }
+              }
+            });
+          }
+        }
       } catch (e) { /* torrent may be gone; keep row as-is */ }
     }
   } finally { pollBusy = 0; }

@@ -117,7 +117,20 @@ impl Database {
                 poster_path TEXT,
                 item_id INTEGER NOT NULL,
                 name TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS skipped_files (
+                item_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                PRIMARY KEY (item_id, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_skipped_files_item ON skipped_files(item_id);
+            CREATE TABLE IF NOT EXISTS playheads (
+                item_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                t REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (item_id, file_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_playheads_item ON playheads(item_id);",
         )?;
         // Migrate: drop the obsolete "keep" column if a pre-removal database
         // still has it.
@@ -414,6 +427,70 @@ impl Database {
         conn.execute("DELETE FROM party WHERE id = 1", [])?;
         Ok(())
     }
+
+    // ---- per-torrent-file selection & playhead ----
+
+    /// Mark a torrent-relative file as skipped (not downloaded) or selected.
+    pub fn set_file_skipped(&self, item_id: i64, file_path: &str, skipped: bool) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        if skipped {
+            conn.execute(
+                "INSERT OR IGNORE INTO skipped_files (item_id, file_path) VALUES (?1, ?2)",
+                params![item_id, file_path],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM skipped_files WHERE item_id = ?1 AND file_path = ?2",
+                params![item_id, file_path],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All skipped (not-downloaded) file paths for an item.
+    pub fn list_skipped_files(&self, item_id: i64) -> Result<std::collections::HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file_path FROM skipped_files WHERE item_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![item_id], |row| row.get(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// Save the playback position (seconds) for one file of a torrent.
+    pub fn set_file_playhead(&self, item_id: i64, file_path: &str, t: f64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO playheads (item_id, file_path, t) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item_id, file_path) DO UPDATE SET t = excluded.t",
+            params![item_id, file_path, if t.is_finite() { t.max(0.0) } else { 0.0 }],
+        )?;
+        Ok(())
+    }
+
+    /// All saved per-file playheads for an item, as (file_path, seconds).
+    pub fn list_playheads(&self, item_id: i64) -> Result<Vec<(String, f64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT file_path, t FROM playheads WHERE item_id = ?1")?;
+        let rows = stmt.query_map(params![item_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Delete all per-file selection/playhead rows for an item (item deleted).
+    pub fn clear_item_files(&self, item_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM skipped_files WHERE item_id = ?1", params![item_id])?;
+        conn.execute("DELETE FROM playheads WHERE item_id = ?1", params![item_id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -582,6 +659,57 @@ mod tests {
             db.get_item(id).unwrap().unwrap().torrent_bytes.unwrap(),
             vec![9, 8, 7]
         );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_skipped_files_roundtrip() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:skip").unwrap();
+        assert!(db.list_skipped_files(id).unwrap().is_empty());
+        db.set_file_skipped(id, "Show.S01E02.mkv", true).unwrap();
+        db.set_file_skipped(id, "Show.S01E03.mkv", true).unwrap();
+        let set = db.list_skipped_files(id).unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("Show.S01E02.mkv"));
+        assert!(set.contains("Show.S01E03.mkv"));
+        db.set_file_skipped(id, "Show.S01E02.mkv", false).unwrap();
+        let set = db.list_skipped_files(id).unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(!set.contains("Show.S01E02.mkv"));
+        // other items are isolated
+        let id2 = db.insert_item("magnet:?xt=urn:btih:other").unwrap();
+        assert!(db.list_skipped_files(id2).unwrap().is_empty());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_file_playhead_roundtrip() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:ph2").unwrap();
+        assert!(db.list_playheads(id).unwrap().is_empty());
+        db.set_file_playhead(id, "a.mkv", 12.5).unwrap();
+        db.set_file_playhead(id, "b.mkv", -3.0).unwrap();
+        let ph = db.list_playheads(id).unwrap();
+        assert!(ph.contains(&("a.mkv".to_string(), 12.5)));
+        assert!(ph.contains(&("b.mkv".to_string(), 0.0)));
+        // upsert
+        db.set_file_playhead(id, "a.mkv", 99.0).unwrap();
+        let ph = db.list_playheads(id).unwrap();
+        assert!(ph.contains(&("a.mkv".to_string(), 99.0)));
+        assert_eq!(ph.len(), 2);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_clear_item_files() {
+        let (db, dir) = temp_db();
+        let id = db.insert_item("magnet:?xt=urn:btih:clear").unwrap();
+        db.set_file_skipped(id, "x.mkv", true).unwrap();
+        db.set_file_playhead(id, "x.mkv", 5.0).unwrap();
+        db.clear_item_files(id).unwrap();
+        assert!(db.list_skipped_files(id).unwrap().is_empty());
+        assert!(db.list_playheads(id).unwrap().is_empty());
         cleanup(&dir);
     }
 

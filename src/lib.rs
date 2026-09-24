@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod episodes;
 pub mod error;
 pub mod http;
 pub mod library;

@@ -60,6 +60,9 @@ pub struct SegInfo {
 
 pub struct Segmenter {
     pub id: i64,
+    /// Which file of the torrent this segmenter cuts. `None` = the default
+    /// (largest) video file — the one streamed with no `?file=`.
+    pub file: Option<String>,
     pub dir: PathBuf,
     info: Mutex<SegInfo>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -79,9 +82,10 @@ fn file_fp(path: &Path) -> Option<(u64, u64)> {
 }
 
 impl Segmenter {
-    fn new(id: i64, dir: PathBuf) -> Self {
+    fn new(id: i64, file: Option<String>, dir: PathBuf) -> Self {
         Self {
             id,
+            file,
             dir,
             info: Mutex::new(SegInfo::default()),
             task: Mutex::new(None),
@@ -123,7 +127,25 @@ pub struct SegmenterManager {
     engine: Arc<TorrentEngine>,
     db: Arc<Database>,
     library_dir: PathBuf,
-    map: AsyncMutex<HashMap<i64, Arc<Segmenter>>>,
+    /// Keyed by `(item id, file)` — separate pipelines per torrent file so TV
+    /// episodes can each stream from their own `.seg` cache.
+    map: AsyncMutex<SegMap>,
+}
+
+/// `(item id, file)` → running segmenter. `file` is the normalized relative
+/// path of the torrent file being cut (`None` = the default/largest file).
+type SegMap = HashMap<(i64, Option<String>), Arc<Segmenter>>;
+
+/// FNV-1a 64-bit — deterministic, no crate deps. Used to derive a stable
+/// per-file `.seg` subfolder so re-cutting never writes through a parent
+/// cache and leftover dirs never accumulate.
+fn fnv1a(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 impl SegmenterManager {
@@ -136,12 +158,13 @@ impl SegmenterManager {
         }
     }
 
-    /// Get (creating if necessary) the segmenter for an item. Any `.seg` dir
-    /// left over from a previous process run is stale (we don't know whether
-    /// it was complete) and is wiped; re-segmentation is cheap.
-    pub async fn ensure(&self, id: i64) -> Arc<Segmenter> {
+    /// Get (creating if necessary) the segmenter for an item+file. Any `.seg`
+    /// dir left over from a previous process run is stale (we don't know
+    /// whether it was complete) and is wiped; re-segmentation is cheap.
+    pub async fn ensure(&self, id: i64, file: Option<String>) -> Arc<Segmenter> {
+        let key = (id, file.clone());
         let mut map = self.map.lock().await;
-        if let Some(seg) = map.get(&id) {
+        if let Some(seg) = map.get(&key) {
             // If the source file changed since we last cut it (torrent resumed
             // mid-stream, piece reverification, re-download), the cached
             // segments no longer match the file: reset and re-cut.
@@ -153,7 +176,10 @@ impl SegmenterManager {
                 }
             };
             if fp_changed {
-                warn!("source changed for item {id} — re-cutting segments");
+                warn!(
+                    "source changed for item {} file {:?} — re-cutting segments",
+                    id, file
+                );
                 if let Some(t) = seg.task.lock().unwrap().take() {
                     t.abort();
                 }
@@ -187,7 +213,7 @@ impl SegmenterManager {
             }
             return seg.clone();
         }
-        let dir = self.library_dir.join(id.to_string()).join(".seg");
+        let dir = self.seg_dir(id, file.as_deref());
         if dir.exists() {
             if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
                 warn!("failed to wipe stale segment dir {:?}: {e}", dir);
@@ -196,8 +222,8 @@ impl SegmenterManager {
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
             warn!("failed to create segment dir {:?}: {e}", dir);
         }
-        let seg = Arc::new(Segmenter::new(id, dir));
-        map.insert(id, seg.clone());
+        let seg = Arc::new(Segmenter::new(id, file, dir));
+        map.insert(key, seg.clone());
         drop(map);
 
         if let Some(input) = self.resolve_input(&seg).await {
@@ -208,35 +234,54 @@ impl SegmenterManager {
         seg
     }
 
+    fn seg_root(&self, id: i64) -> PathBuf {
+        self.library_dir.join(id.to_string()).join(".seg")
+    }
+
+    fn seg_dir(&self, id: i64, file: Option<&str>) -> PathBuf {
+        match file {
+            None => self.seg_root(id),
+            Some(path) => self.seg_root(id).join(format!("{:016x}", fnv1a(path))),
+        }
+    }
+
     async fn resolve_input(&self, seg: &Arc<Segmenter>) -> Option<Input> {
         let item = self.db.get_item(seg.id).ok().flatten()?;
 
-        // 1) File on disk: read the path directly. `file_path` may be stale
-        // (library dir moved, DB copied to a new machine) or NULL for items
-        // marked ready before path recording existed — fall back to the
-        // canonical `library_dir/{id}` and heal the DB when we find it there.
-        // Paused/stopped items must also use the file: their torrent's
-        // FileStream blocks at the piece frontier forever, which would wedge
-        // the segmenter into an eternal "buffering" with `done` never true.
+        // 1) File on disk: read the path directly.
+        //    - no explicit file: largest video under `file_path` (a file, a
+        //      directory, or stale/NULL) / canonical `library_dir/{id}`; heal
+        //      the DB when found in the canonical spot.
+        //    - explicit file: the exact relative path beneath the same base.
+        //    Paused/stopped items must also use the file: their torrent's
+        //    FileStream blocks at the piece frontier forever, which would
+        //    wedge the segmenter into an eternal "buffering" with `done` never
+        //    true.
         if matches!(item.state.as_str(), "ready" | "paused" | "stopped") {
-            if let Some(full) = item
+            let base = item
                 .file_path
                 .as_ref()
-                .and_then(|p| find_largest_video_in(Path::new(p)))
-            {
-                let mut info = seg.info.lock().unwrap();
-                info.running = true;
-                info.probe_path = Some(full.clone());
-                info.src_fingerprint = file_fp(&full);
-                return Some(Input::File(full));
-            }
-            let canonical = self.library_dir.join(seg.id.to_string());
-            if let Some(full) = find_largest_video_in(&canonical) {
-                if let Err(e) = self
-                    .db
-                    .update_file_path(seg.id, &canonical.to_string_lossy())
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| self.library_dir.join(seg.id.to_string()));
+            let candidate = match seg.file.as_deref() {
+                Some(rel) => {
+                    let full = base.join(rel);
+                    full.exists().then_some(full)
+                }
+                None => find_largest_video_in(&base),
+            };
+            if let Some(full) = candidate {
+                let canonical = self.library_dir.join(seg.id.to_string());
+                if base == canonical
+                    && item.file_path.as_deref() != Some(canonical.to_str().unwrap())
                 {
-                    warn!("failed to heal stale path for item {}: {e}", seg.id);
+                    if let Err(e) = self
+                        .db
+                        .update_file_path(seg.id, &canonical.to_string_lossy())
+                    {
+                        warn!("failed to heal stale path for item {}: {e}", seg.id);
+                    }
                 }
                 let mut info = seg.info.lock().unwrap();
                 info.running = true;
@@ -246,10 +291,25 @@ impl SegmenterManager {
             }
         }
 
-        // 2) Live torrent: feed the FileStream of the largest video file.
+        // 2) Live torrent: feed the FileStream of the chosen file.
         if let Some(handle) = self.engine.get_torrent(seg.id).await {
-            if let Some((file_id, name, _size)) = self.engine.find_largest_video_file(seg.id).await
-            {
+            let chosen = match seg.file.as_deref() {
+                Some(rel) => self
+                    .engine
+                    .list_files(seg.id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|(_, path, _)| {
+                        path == rel || crate::episodes::normalize_rel_path(path) == rel
+                    }),
+                None => self
+                    .engine
+                    .find_largest_video_file(seg.id)
+                    .await
+                    .map(|(id, name, _)| (id, name, 0)),
+            };
+            if let Some((file_id, name, _size)) = chosen {
                 let probe_path = handle.output_folder().join(&name);
                 let mut info = seg.info.lock().unwrap();
                 info.running = true;
@@ -260,23 +320,27 @@ impl SegmenterManager {
         None
     }
 
-    /// Existing segmenter for an item, if one was ever created this run.
-    pub async fn get(&self, id: i64) -> Option<Arc<Segmenter>> {
-        self.map.lock().await.get(&id).cloned()
+    /// Existing segmenter for an item+file, if one was ever created this run.
+    pub async fn get(&self, id: i64, file: Option<String>) -> Option<Arc<Segmenter>> {
+        self.map.lock().await.get(&(id, file)).cloned()
     }
 
-    /// Kill the segmenter for an item (called on item delete).
+    /// Kill every segmenter pipeline for an item (called on item delete).
     pub async fn remove(&self, id: i64) {
-        let seg = self.map.lock().await.remove(&id);
-        if let Some(seg) = seg {
-            if let Some(task) = seg.task.lock().unwrap().take() {
-                task.abort();
+        let mut map = self.map.lock().await;
+        let keys: Vec<(i64, Option<String>)> =
+            map.keys().filter(|(i, _)| *i == id).cloned().collect();
+        for key in keys {
+            if let Some(seg) = map.remove(&key) {
+                if let Some(task) = seg.task.lock().unwrap().take() {
+                    task.abort();
+                }
             }
         }
     }
 
     pub async fn stop_all(&self) {
-        let ids: Vec<i64> = self.map.lock().await.keys().copied().collect();
+        let ids: Vec<i64> = self.map.lock().await.keys().map(|(i, _)| *i).collect();
         for id in ids {
             self.remove(id).await;
         }

@@ -67,8 +67,8 @@ Each member runs their own instance; the BitTorrent swarm is the content distrib
 - **Movie grouping**: items grouped by `media_type + ':' + tmdb_id` (or `'r' + id` for standalone torrents). The movie detail shows a placeholder row (tmdb_id, no magnet) plus all attached torrent rows.
 - **Optimistic add**: clicking "Add" in torrent search pushes a synthetic row (`state: '_pending'`) into `items` instantly, shows "Adding…", then the server call completes in the background. The synthetic row is removed once the POST returns and `refreshLibrary` picks up the real row.
 
-- **Row layout**: all torrent rows have identical structure (title + subline + controls) with `min-height: 68px` so state transitions don't cause layout shifts. Rows update in place (keyed by id) — never wipe and rebuild `#mv-torrents`.
-- **In-place updates**: `renderMovie()` matches existing DOM nodes by `data-id` and updates them, only adding/removing nodes when the row set changes. This prevents flash when a row transitions between states.
+- **Row layout**: all torrent rows have identical structure (title + subline + controls) with `min-height: 68px` so state transitions don't cause layout shifts.
+- **Add-in-place**: a torrent added from search results is pushed into the downloaded-content list immediately (synthetic `_pending` row) and that same row then updates with the real information as the background add completes and the state progresses (`connecting → downloading → ready`), keyed by id so the optimistic row matures into the real one without re-adding it.
 
 ## Key gotchas
 
