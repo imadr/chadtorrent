@@ -1477,13 +1477,13 @@ function seekTo(globalT, partyOrigin) {
     pendSeek = globalT;
     showBufProgress();
   }
-  savePlayhead(globalT);
   v.currentTime = globalT;
 }
 
 /* Persist the playback position for the current torrent (per torrent file,
- * not per movie). Fire-and-forget: called on every seek, on player close,
- * and with 0 when the movie ends. */
+ * not per movie). Realtime-only: called from a throttled timeupdate hook, so
+ * whatever the video is showing is always what gets saved. No per-event saves
+ * (seek / close / ended) — a hard kill loses at most the current second. */
 function savePlayhead(t) {
   if (currentId == null) return;
   const id = currentId;
@@ -1515,8 +1515,6 @@ function teardownSeg() {
 }
 
 function stopPlayback() {
-  // Save where we stopped for this torrent (0 if it played to the end).
-  savePlayhead(v.ended ? 0 : (v.currentTime || 0));
   segGen++;
   teardownSeg();
   subPanelOpen = false;
@@ -1605,6 +1603,16 @@ function updSk() {
 }
 v.addEventListener('timeupdate', updSeek);
 v.addEventListener('loadedmetadata', updSeek);
+// Realtime playhead persistence: one tiny POST/second while watching (no save
+// on seek/close/end — the video's current position is always the truth).
+let lastPlayheadSave = 0;
+v.addEventListener('timeupdate', () => {
+  if (currentId == null) return;
+  const now = performance.now();
+  if (now - lastPlayheadSave < 1000) return;
+  lastPlayheadSave = now;
+  savePlayhead(v.currentTime || 0);
+});
 
 $('seekbar').addEventListener('mousedown',   () => { seeking = true; });
 $('seekbar').addEventListener('mouseup',     () => { seeking = false; });
@@ -1657,8 +1665,11 @@ function hideBuf() { $('buf').hidden = true; }
 // order differs per engine); seekTo() itself decides, synchronously.
 v.addEventListener('playing',  () => hideBuf());
 v.addEventListener('canplay',  () => hideBuf());
-// Movie finished: reset the saved progress to 0 so the next open starts fresh.
-v.addEventListener('ended', () => savePlayhead(0));
+// Movie finished: loop back to the start, regardless of any saved playhead.
+v.addEventListener('ended', () => {
+  v.currentTime = 0;
+  v.play().catch(() => {});
+});
 function showBufProgress() {
   showBuf('Buffering…');
 }
