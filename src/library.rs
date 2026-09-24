@@ -88,14 +88,25 @@ pub struct LibraryManager {
     pub db: Arc<Database>,
     pub engine: Arc<TorrentEngine>,
     pub config: Config,
-    pub status_tx: broadcast::Sender<StatusUpdate>,
+    /// The one notification channel the client needs: library changes and
+    /// per-torrent piece progress. All frontend polling (the old 1s progress
+    /// loop and the 3s library refresh) is driven from subscribed events; the
+    /// progress source is `spawn_progress_watcher`.
+    pub events_tx: broadcast::Sender<LibraryEvent>,
     pub segments: Arc<SegmenterManager>,
 }
 
+/// A library notification, serialized to WS subscribers as
+/// `{"type":"changed"}` / `{"type":"progress","id":N}`.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct StatusUpdate {
-    pub library_id: i64,
-    pub status: TorrentStatus,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum LibraryEvent {
+    /// The item set or any item's fields changed (add/delete/state/skip).
+    /// The client re-fetches `/api/library` and re-renders only if it changed.
+    Changed,
+    /// Torrent `id` made piece progress. The client refreshes its
+    /// `status` + `pieces` and repaints just that row.
+    Progress { id: i64 },
 }
 
 /// One file of a torrent, as shown in the TV-show episode UI. `path` is the
@@ -126,7 +137,7 @@ impl LibraryManager {
         let db = Arc::new(Database::new(&config.db_path.to_string_lossy())?);
         let download_base = config.temp_dir.join("rqbit");
         let engine = Arc::new(TorrentEngine::new(download_base, db.clone()).await?);
-        let (status_tx, _) = broadcast::channel(256);
+        let (events_tx, _) = broadcast::channel(256);
         let segments = Arc::new(SegmenterManager::new(
             config.library_dir.clone(),
             engine.clone(),
@@ -137,12 +148,56 @@ impl LibraryManager {
             db,
             engine,
             config,
-            status_tx,
+            events_tx,
             segments,
         });
         manager.resume_existing_torrents().await?;
 
         Ok(manager)
+    }
+
+    fn notify(&self, ev: LibraryEvent) {
+        let _ = self.events_tx.send(ev);
+    }
+
+    fn notify_changed(&self) {
+        self.notify(LibraryEvent::Changed);
+    }
+
+    /// Watch the engine's piece maps and broadcast `Progress { id }` whenever
+    /// a torrent's downloaded pieces actually change (max ~1/s per torrent).
+    /// librqbit has no public per-piece event stream, so this single lazy task
+    /// is the event source — it only scans while something is subscribed and
+    /// never fires for torrents whose state is stable.
+    pub fn spawn_progress_watcher(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut seen: std::collections::HashMap<i64, u64> =
+                std::collections::HashMap::new();
+            loop {
+                tick.tick().await;
+                if me.events_tx.receiver_count() == 0 {
+                    continue;
+                }
+                let ids = me.engine.active_ids().await;
+                let mut changed = Vec::new();
+                for id in &ids {
+                    let Some(fp) = me.engine.piece_fingerprint(*id).await else {
+                        continue;
+                    };
+                    if seen.insert(*id, fp) != Some(fp) {
+                        // New torrents surface their initial progress too.
+                        changed.push(*id);
+                    }
+                }
+                seen.retain(|id, _| ids.contains(id));
+                for id in changed {
+                    me.notify(LibraryEvent::Progress { id });
+                }
+            }
+        });
     }
 
     /// On startup, re-attach every in-progress library item to the torrent
@@ -214,6 +269,7 @@ impl LibraryManager {
         tokio::spawn(async move {
             segments.ensure(id, None).await;
         });
+        self.notify_changed();
         Ok(())
     }
 
@@ -237,8 +293,11 @@ impl LibraryManager {
         tmdb_id: i64,
         media_type: &str,
     ) -> Result<i64> {
-        self.db
-            .insert_movie(title, year, poster_path, tmdb_id, media_type)
+        let id = self
+            .db
+            .insert_movie(title, year, poster_path, tmdb_id, media_type)?;
+        self.notify_changed();
+        Ok(id)
     }
 
     #[allow(dead_code)]
@@ -267,6 +326,7 @@ impl LibraryManager {
         if !sequential {
             self.db.set_sequential(library_id, false)?;
         }
+        self.notify_changed();
 
         let me = self.clone();
         tokio::spawn(async move {
@@ -324,6 +384,7 @@ impl LibraryManager {
             Ok(h) => h,
             Err(e) => {
                 let _ = self.db.update_state(library_id, "error");
+                self.notify_changed();
                 warn!("Failed to register torrent {}: {}", library_id, e);
                 return;
             }
@@ -348,6 +409,7 @@ impl LibraryManager {
         {
             warn!("Failed to set state for {}: {}", library_id, e);
         }
+        self.notify_changed();
 
         if let Some((_file_id, file_name, size)) = self
             .engine
@@ -408,12 +470,14 @@ impl LibraryManager {
         self.engine.pause_torrent(id).await?;
         self.store_pieces(id).await;
         self.db.update_state(id, "paused")?;
+        self.notify_changed();
         Ok(())
     }
 
     pub async fn resume_item(&self, id: i64) -> Result<()> {
         self.engine.resume_torrent(id).await?;
         self.db.update_state(id, "downloading")?;
+        self.notify_changed();
         Ok(())
     }
 
@@ -426,6 +490,7 @@ impl LibraryManager {
     pub async fn set_sequential(&self, id: i64, sequential: bool) -> Result<()> {
         self.db.set_sequential(id, sequential)?;
         self.engine.set_sequential(id, sequential).await;
+        self.notify_changed();
         Ok(())
     }
 
@@ -742,6 +807,7 @@ impl LibraryManager {
         }
 
         self.db.set_file_skipped(id, &path, !selected)?;
+        self.notify_changed();
         let skipped = self.db.list_skipped_files(id)?;
 
         if self.engine.get_torrent(id).await.is_some() {
@@ -823,6 +889,7 @@ impl LibraryManager {
         }
 
         self.db.delete_item(id)?;
+        self.notify_changed();
         info!("Library item {} removed", id);
         Ok(())
     }

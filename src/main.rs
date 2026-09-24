@@ -73,6 +73,7 @@ async fn main() {
         }
     };
     library.spawn_piece_flusher();
+    library.spawn_progress_watcher();
 
     let keys = match config::ApiKeys::load_or_create(Path::new("chadtorrent.json")) {
         Ok(k) => k,

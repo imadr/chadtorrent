@@ -27,6 +27,16 @@ fn info_hash_of(id: TorrentIdOrHash) -> Option<String> {
     }
 }
 
+/// FNV-1a 64-bit over raw bytes (piece-map fingerprints / `.seg` dir names).
+fn fnv1a_64(input: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 #[async_trait::async_trait]
 impl BitVFactory for SqliteBitVFactory {
     async fn load(&self, id: TorrentIdOrHash) -> anyhow::Result<Option<Box<dyn BitV>>> {
@@ -263,6 +273,17 @@ impl TorrentEngine {
         let api = Api::new(self.session.clone(), None);
         let (bf, _total) = api.api_dump_haves(handle.id().into()).ok()?;
         Some((handle.info_hash().as_string(), bf.as_raw_slice().to_vec()))
+    }
+
+    /// A cheap 64-bit fingerprint of a torrent's current piece map. The
+    /// progress watcher compares consecutive fingerprints to detect real
+    /// download progress (and broadcast a notification) without carrying the
+    /// whole bitfield around.
+    pub async fn piece_fingerprint(&self, library_id: i64) -> Option<u64> {
+        let handle = self.get_torrent(library_id).await?;
+        let api = Api::new(self.session.clone(), None);
+        let (bf, _total) = api.api_dump_haves(handle.id().into()).ok()?;
+        Some(fnv1a_64(bf.as_raw_slice()))
     }
 
     /// Cached .torrent file bytes so a torrent can be re-added offline.

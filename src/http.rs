@@ -106,6 +106,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mse/{id}/init", get(seg_init))
         .route("/mse/{id}/seg/{n}", get(seg_n))
         .route("/ws/torrent/{id}", get(ws_handler))
+        .route("/ws/library", get(library_ws_handler))
         .route("/api/party", post(create_party).get(get_party))
         .route("/api/party/join", post(join_party))
         .route("/api/party/leave", post(leave_party))
@@ -807,6 +808,13 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state, id))
 }
 
+async fn library_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_library_ws(socket, state.library.clone()))
+}
+
 // ---- watch party ----
 
 #[derive(Deserialize)]
@@ -915,6 +923,41 @@ async fn party_ws_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_party_ws(socket, state.party.clone()))
+}
+
+/// Library notification channel: streams `changed` / `progress` events to the
+/// frontend so it never has to poll. Mirrors the party WS pattern (broadcast
+/// subscribe + lagged catch-up) — and the frontend drives both its library
+/// refresh and its per-torrent progress repaint from these events.
+async fn handle_library_ws(
+    socket: WebSocket,
+    library: Arc<crate::library::LibraryManager>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    let mut rx = library.events_tx.subscribe();
+    let (mut sink, mut stream) = socket.split();
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                let out = match ev {
+                    Ok(ev) => serde_json::to_string(&ev).unwrap_or_default(),
+                    // Fell behind (e.g. suspended tab): send a resync marker;
+                    // the client re-fetches the library + progress once.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        "{\"type\":\"resync\"}".to_string()
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                if sink.send(Message::Text(out.into())).await.is_err() {
+                    break;
+                }
+            }
+            msg = stream.next() => match msg {
+                Some(Ok(_)) => {} // client->server messages are ignored
+                Some(Err(_)) | None => break,
+            },
+        }
+    }
 }
 
 async fn handle_party_ws(mut socket: WebSocket, party: Arc<crate::party::PartyManager>) {

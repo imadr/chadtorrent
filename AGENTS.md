@@ -50,6 +50,10 @@ tests/
 
 5. **Delete** (`DELETE /api/library/:id`): removes the row, deletes `library_dir/{id}` and `temp_dir/{id}`, removes from engine. If `?hard=1`, cascades to all torrents sharing the same `tmdb_id` (movie delete).
 
+## Library updates are notification-driven (no polling)
+
+The frontend never polls the library. `/ws/library` streams two events from `LibraryEvent` (`src/library.rs`): `{"type":"changed"}` broadcast synchronously at every mutation point (`notify_changed()`) and `{"type":"progress","id":N}` emitted by the lazy 1s `spawn_progress_watcher` aggregator (filters to real changes via `piece_fingerprint` FNV-1a over the piece map in `src/torrent.rs`; scans only while subscribers exist). The client only refetches/repaints what those events imply: `changed` → `refreshLibrary()` (JSON-fingerprint-guarded, defers grid paint to `gridDirty` when the library view is hidden), `progress` → one status+pieces GET for that id through a coalescing `progQueue` pump — never a full sweep. `Lagged`/reconnect sends `{"type":"resync"}`. A 5s fallback refresh runs only while the WS is down.
+
 ## Watch parties
 
 Each member runs their own instance; the BitTorrent swarm is the content distribution (everyone downloads locally — nothing is ever streamed between members). Sync traffic (play/pause/seek/presence, bytes/sec) flows **peer-to-peer over punched UDP** — there is deliberately no server relay fallback.

@@ -528,7 +528,7 @@
 const $ = (id) => document.getElementById(id);
 const v = $('player');
 const wrap = $('videowrap');
-var items = [], currentId = null, seeking = false, currentMovie = null, pollBusy = 0, dlState = {};
+var items = [], currentId = null, seeking = false, currentMovie = null, dlState = {};
 // Per-torrent file lists for the TV-show UI (episode picker, per-file skip).
 var fileLists = new Map();        // String(id) -> files [] from /api/library/{id}/files
 var fileListsBusy = new Map();    // String(id) -> in-flight fetch promise (dedupe)
@@ -538,6 +538,14 @@ var currentFile = null;           // rel path of the file currently playing (nul
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
 let fullDur = 0; // declared here; player session state lives with the player below
 var libSel = -1, mvSelIdx = -1;
+// Library is notification-driven: `refreshLibrary()` only re-renders when the
+// item data actually changed (`libFp`), and never rebuilds the grid offscreen
+// (`gridDirty` defers that to the next time the library view is shown).
+var libFp = null, gridDirty = false;
+// Download progress is event-driven too: `/ws/library` delivers per-torrent
+// `progress` events; pending ids are coalesced in `progQueue` and drained by
+// `pumpProgress()` at most one in-flight batch at a time.
+var progQueue = new Set(), progBusy = false;
 
 const TMDB_IMG = 'https://image.tmdb.org/t/p';
 const POSTER_IDX = 'w342';
@@ -693,10 +701,16 @@ async function refreshLibrary() {
       const isLive = srv.some(i => infoHash(i.magnet) === infoHash(syn.magnet));
       if (!isLive) srv.push(syn);
     }
+    const fp = JSON.stringify(srv);
+    const same = fp === libFp;
+    libFp = fp;
+    if (same) return; // nothing changed — leave the DOM alone
     items = srv;
-    renderGrid();
+    if ($('view-library').hidden) gridDirty = true;
+    else renderGrid();
     syncMovie();
     renderSearch();
+    pollDownloads(); // fresh rows: repaint every active torrent's progress bar
     if (!bootRouted) { bootRouted = true; handleRoute(); }
   }
   catch (e) { console.error('refresh failed', e); }
@@ -706,6 +720,12 @@ function setView(isMovie) {
   $('view-library').hidden = isMovie;
   $('view-movie').hidden = !isMovie;
   $('btn-add').hidden = isMovie;
+  if (!isMovie && gridDirty) {
+    // Items changed while the library was hidden: paint once now that it's
+    // visible again.
+    gridDirty = false;
+    renderGrid();
+  }
 }
 
 function syncMovie() {
@@ -3488,50 +3508,114 @@ function fmtEta(sec) {
   return h + 'h ' + (m % 60) + 'm';
 }
 
-async function pollDownloads() {
-  if (pollBusy) return;
-  if (!currentMovie) return;
-  pollBusy = 1;
+/* Download progress is notification-driven: `/ws/library` pushes
+   `{type:"progress", id}` whenever a torrent's piece map actually changes.
+   `pokeProgress` enqueues the id and `pumpProgress` coalesces bursts into one
+   in-flight batch (instead of the old every-second full sweep). */
+function pokeProgress(id) {
+  progQueue.add(String(id));
+  pumpProgress();
+}
+async function pumpProgress() {
+  if (progBusy) return;
+  progBusy = true;
   try {
-    for (const row of document.querySelectorAll('#mv-torrents .row[data-id]')) {
-      const st = row.dataset.state;
-      if (st !== 'downloading' && st !== 'paused') continue;
-      try {
-        const s = await api('/api/library/' + row.dataset.id + '/status');
-        if (s.state && s.state !== st) {
-          row.dataset.state = s.state;
-          refreshLibrary();
-          continue;
-        }
-        const p = await api('/api/library/' + row.dataset.id + '/pieces');
-        applyDlRow(row, row.dataset.id, p, s);
-        if (isTvMovie()) {
-          // Per-episode bars: refresh the file list (have bytes) at most
-          // every ~5s per torrent and re-render just that torrent's rows.
-          const id = String(row.dataset.id);
-          const now = Date.now();
-          if (now - (fileStatsAt.get(id) || 0) >= 5000) {
-            fileStatsAt.set(id, now);
-            loadFileList(id, true).then(() => {
-              const el = document.querySelector('#mv-torrents .tv-t[data-id="' + id + '"]');
-              if (el && currentId !== Number(id)) {
-                const t = items.find(i => String(i.id) === id);
-                if (t) { renderTvTorrent(el, t); mvSyncSel(); }
-              }
-            });
-          }
-        }
-      } catch (e) { /* torrent may be gone; keep row as-is */ }
+    while (progQueue.size) {
+      const id = progQueue.values().next().value;
+      progQueue.delete(id);
+      const row = document.querySelector('#mv-torrents .row[data-id="' + id + '"]');
+      if (row) await refreshRow(id, row);
     }
-  } finally { pollBusy = 0; }
+  } finally { progBusy = false; }
+}
+
+async function refreshRow(id, row) {
+  const st = row.dataset.state;
+  if (st !== 'downloading' && st !== 'paused') return;
+  try {
+    const s = await api('/api/library/' + id + '/status');
+    if (!row.isConnected) return;
+    if (s.state && s.state !== st) {
+      row.dataset.state = s.state;
+      refreshLibrary();
+      return;
+    }
+    const p = await api('/api/library/' + id + '/pieces');
+    if (!row.isConnected) return;
+    applyDlRow(row, id, p, s);
+    if (isTvMovie()) {
+      // Per-episode bars: refresh the file list (have bytes) at most ~1s per
+      // torrent per progress event, and re-render just that torrent's block.
+      const now = Date.now();
+      if (now - (fileStatsAt.get(id) || 0) >= 1000) {
+        fileStatsAt.set(id, now);
+        loadFileList(id, true).then(() => {
+          const el = document.querySelector('#mv-torrents .tv-t[data-id="' + id + '"]');
+          if (el && currentId !== Number(id)) {
+            const t = items.find(i => String(i.id) === id);
+            if (t) { renderTvTorrent(el, t); mvSyncSel(); }
+          }
+        });
+      }
+    }
+  } catch (e) { /* torrent may be gone; keep row as-is */ }
+}
+
+/* One-shot sweep over every visible active row (reconnect/resync/after a
+   re-render): enqueue all of them; the pump coalesces with incoming events. */
+async function pollDownloads() {
+  if (!currentMovie) return;
+  for (const row of document.querySelectorAll('#mv-torrents .row[data-id]')) {
+    const st = row.dataset.state;
+    if (st !== 'downloading' && st !== 'paused') continue;
+    pokeProgress(row.dataset.id);
+  }
+}
+
+/* /ws/library: the single event channel that drives both the library refresh
+   and per-torrent progress. No polling intervals run while it is connected. */
+let libWs = null, libRetry = 0;
+function libraryWsConnect() {
+  if (libWs) return;
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  let ws;
+  try { ws = new WebSocket(proto + location.host + '/ws/library'); } catch (e) { return; }
+  libWs = ws;
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.type === 'changed') refreshLibrary();
+    else if (m.type === 'progress') pokeProgress(m.id);
+    else if (m.type === 'resync') { refreshLibrary(); pollDownloads(); }
+  };
+  ws.onopen = () => {
+    libRetry = 0;
+    /* Back from a gap: re-sync anything we missed while disconnected. */
+    refreshLibrary();
+    pollDownloads();
+  };
+  ws.onclose = () => {
+    if (libWs !== ws) return; // stale replacement socket: ignore
+    libWs = null;
+    setTimeout(libraryWsConnect, Math.min(10000, 1500 * Math.max(1, ++libRetry)));
+  };
 }
 
 updVol();
 refreshLibrary();
 partyWsConnect();
 renderPartyBtn();
-setInterval(pollDownloads, 1000);
-setInterval(refreshLibrary, 3000);
+libraryWsConnect();
+/* Degraded fallback: only while /ws/library is down (so the UI never freezes
+   on a WS hiccup), re-sync at 5s. The moment the socket is back, polling
+   stops and notifications take over again. */
+let wsDownTick = 0;
+setInterval(() => {
+  if (libWs && libWs.readyState === 1) { wsDownTick = 0; return; }
+  if (++wsDownTick < 5) return;
+  wsDownTick = 0;
+  refreshLibrary();
+  pollDownloads();
+}, 1000);
 </script>
 </body>
 </html>
