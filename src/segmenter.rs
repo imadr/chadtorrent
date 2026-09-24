@@ -52,6 +52,10 @@ pub struct SegInfo {
     /// On-disk path to probe for codec metadata (the partial file while
     /// streaming). Not part of the manifest JSON.
     pub probe_path: Option<PathBuf>,
+    /// (mtime_secs, len) of the source file when this session started cutting.
+    /// If the file has since changed (e.g. the torrent finished writing past
+    /// where we cut), the segments are stale and must be re-cut.
+    pub src_fingerprint: Option<(u64, u64)>,
 }
 
 pub struct Segmenter {
@@ -59,6 +63,19 @@ pub struct Segmenter {
     pub dir: PathBuf,
     info: Mutex<SegInfo>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// (mtime_secs, len) of a file, used to detect that a source changed after
+/// segments were cut from it.
+fn file_fp(path: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((mtime, md.len()))
 }
 
 impl Segmenter {
@@ -125,6 +142,35 @@ impl SegmenterManager {
     pub async fn ensure(&self, id: i64) -> Arc<Segmenter> {
         let mut map = self.map.lock().await;
         if let Some(seg) = map.get(&id) {
+            // If the source file changed since we last cut it (torrent resumed
+            // mid-stream, piece reverification, re-download), the cached
+            // segments no longer match the file: reset and re-cut.
+            let fp_changed = {
+                let info = seg.info.lock().unwrap();
+                match (&info.src_fingerprint, &info.probe_path) {
+                    (Some(fp), Some(path)) => file_fp(path).filter(|cur| cur == fp).is_none(),
+                    _ => false,
+                }
+            };
+            if fp_changed {
+                warn!("source changed for item {id} — re-cutting segments");
+                if let Some(t) = seg.task.lock().unwrap().take() {
+                    t.abort();
+                }
+                if let Err(e) = tokio::fs::remove_dir_all(&seg.dir).await {
+                    warn!("failed to wipe stale segment dir {:?}: {e}", seg.dir);
+                }
+                if let Err(e) = tokio::fs::create_dir_all(&seg.dir).await {
+                    warn!("failed to create segment dir {:?}: {e}", seg.dir);
+                }
+                *seg.info.lock().unwrap() = SegInfo::default();
+                if let Some(input) = self.resolve_input(seg).await {
+                    let seg2 = seg.clone();
+                    let h = tokio::spawn(async move { run_segmenter(seg2, input).await });
+                    *seg.task.lock().unwrap() = Some(h);
+                }
+                return seg.clone();
+            }
             // The input may only become resolvable later (metadata still
             // downloading, torrent still registering) — retry on each poll
             // until a task is actually running or the run has concluded.
@@ -165,11 +211,14 @@ impl SegmenterManager {
     async fn resolve_input(&self, seg: &Arc<Segmenter>) -> Option<Input> {
         let item = self.db.get_item(seg.id).ok().flatten()?;
 
-        // 1) Finished file on disk: read the path directly. `file_path` may be
-        // stale (library dir moved, DB copied to a new machine) or NULL for
-        // items marked ready before path recording existed — fall back to the
+        // 1) File on disk: read the path directly. `file_path` may be stale
+        // (library dir moved, DB copied to a new machine) or NULL for items
+        // marked ready before path recording existed — fall back to the
         // canonical `library_dir/{id}` and heal the DB when we find it there.
-        if item.state == "ready" {
+        // Paused/stopped items must also use the file: their torrent's
+        // FileStream blocks at the piece frontier forever, which would wedge
+        // the segmenter into an eternal "buffering" with `done` never true.
+        if matches!(item.state.as_str(), "ready" | "paused" | "stopped") {
             if let Some(full) = item
                 .file_path
                 .as_ref()
@@ -178,6 +227,7 @@ impl SegmenterManager {
                 let mut info = seg.info.lock().unwrap();
                 info.running = true;
                 info.probe_path = Some(full.clone());
+                info.src_fingerprint = file_fp(&full);
                 return Some(Input::File(full));
             }
             let canonical = self.library_dir.join(seg.id.to_string());
@@ -191,6 +241,7 @@ impl SegmenterManager {
                 let mut info = seg.info.lock().unwrap();
                 info.running = true;
                 info.probe_path = Some(full.clone());
+                info.src_fingerprint = file_fp(&full);
                 return Some(Input::File(full));
             }
         }

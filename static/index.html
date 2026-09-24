@@ -1169,10 +1169,14 @@ async function startSegSession() {
   fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
   segInfo = { mime: info.mime, done: !!info.done, segs: new Map(info.segments.map(s => [s.n, s.t])) };
 
+  // The declared codec must be actually decodable. NEVER fall back to a fake
+  // avc1 SourceBuffer for an hvc1 stream: appending HEVC fragments into an
+  // AVC-declared buffer silently wedges the element at 'Loading…' (Firefox
+  // without HEVC support) or poisons later appends (v.error). Surface it.
   try {
     segSb = segMs.addSourceBuffer(segInfo.mime);
   } catch (e) {
-    segSb = segMs.addSourceBuffer('video/mp4; codecs="avc1.640028,mp4a.40.2"');
+    return segFatal(new Error('This browser cannot play this file: unsupported codec ' + segInfo.mime + ' — ' + (e.message || e)));
   }
 
   // Init segment (ftyp+moov); retry until the segmenter has written it.
