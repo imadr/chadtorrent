@@ -223,6 +223,7 @@
   .subrow .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .subrow .dl { color: var(--muted); font-size: 11px; flex-shrink: 0; }
   .subpanel .empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
+  .subpanel .oswrap { min-height: 180px; display: flex; flex-direction: column; }
   .substyle { display: flex; flex-direction: column; gap: 8px; padding: 2px 8px 10px; }
   .substyle label { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
   .substyle label span { width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -1733,6 +1734,7 @@ function renderSubPanel() {
       + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
       + (s.source === 'downloaded' ? '<span class="dl">downloaded</span>' : '') + '</div>';
   }
+  html += '<div class="oswrap">';
   html += '<h4>OpenSubtitles</h4>';
   if (!subsConfigured) html += '<div class="empty">Online search disabled — add an OpenSubtitles API key to chadtorrent.json</div>';
   else if (subBusy) html += '<div class="empty">Searching…</div>';
@@ -1743,6 +1745,7 @@ function renderSubPanel() {
       + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
       + '<span class="dl">↓ ' + (s.downloads || 0) + '</span></div>';
   }
+  html += '</div>';
   p.innerHTML = html;
   p.querySelectorAll('.subrow:not(#ssopen)').forEach(row => {
     row.addEventListener('click', () => onSubRowClick(row));
