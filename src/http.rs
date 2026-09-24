@@ -88,6 +88,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/movies", post(add_movie))
         .route("/api/search", get(search_tmdb))
         .route("/api/meta/{media_type}/{tmdb_id}", get(meta_detail))
+        .route("/api/meta/tv/{tmdb_id}/season/{season_number}", get(meta_episodes))
         .route("/api/torrents", get(torrent_search))
         .route("/api/library/{id}", delete(delete_item))
         .route("/api/library/{id}/status", get(get_status))
@@ -166,6 +167,21 @@ async fn meta_detail(
         Vec::new()
     };
     Ok(Json(json!({ "overview": overview, "seasons": seasons })))
+}
+
+/// The ordered episode list of one TV season, for the show's episode buttons.
+async fn meta_episodes(
+    State(state): State<AppState>,
+    axum::extract::Path((tmdb_id, season_number)): axum::extract::Path<(i64, i64)>,
+) -> Result<impl IntoResponse> {
+    let Some(tmdb) = state.tmdb.as_ref() else {
+        return Err(Error::BadRequest("Movie search is not configured on this server".into()));
+    };
+    let episodes = tmdb
+        .tv_episodes(tmdb_id, season_number)
+        .await
+        .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
+    Ok(Json(json!({ "episodes": episodes })))
 }
 
 async fn search_tmdb(

@@ -154,6 +154,13 @@ impl Database {
         ] {
             let _ = conn.execute_batch(stmt);
         }
+        // Migrate: titles used to carry a " / <largest video file>" suffix
+        // appended by an older register path. The file name is now surfaced
+        // per-file instead, so strip the appended segment.
+        let _ = conn.execute_batch(
+            "UPDATE library SET title = trim(substr(title, 1, instr(title, ' / ') - 1))
+             WHERE title LIKE '% / %'",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

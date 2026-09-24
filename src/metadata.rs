@@ -86,6 +86,35 @@ pub struct SeasonInfo {
     pub air_date: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EpisodeInfo {
+    pub episode_number: i64,
+    pub name: Option<String>,
+    pub overview: Option<String>,
+    pub still_path: Option<String>,
+    pub air_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbSeasonDetail {
+    #[serde(default)]
+    episodes: Vec<TmdbEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TmdbEpisode {
+    #[serde(default)]
+    episode_number: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    overview: Option<String>,
+    #[serde(default)]
+    still_path: Option<String>,
+    #[serde(default)]
+    air_date: Option<String>,
+}
+
 pub struct TmdbClient {
     client: Client,
     api_key: String,
@@ -169,6 +198,40 @@ impl TmdbClient {
                 name: s.name,
                 episode_count: s.episode_count,
                 air_date: s.air_date,
+            })
+            .collect())
+    }
+
+    /// The ordered episode list of one TV season (TMDB), for the show's episode
+    /// buttons — the show "has" episodes 1..N regardless of which torrents the
+    /// user added.
+    pub async fn tv_episodes(&self, tmdb_id: i64, season_number: i64) -> Result<Vec<EpisodeInfo>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/tv/{}/season/{}",
+                TMDB_BASE, tmdb_id, season_number
+            ))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+            .map_err(|e| Error::BadRequest(format!("search request failed: {e}")))?
+            .json::<TmdbSeasonDetail>()
+            .await
+            .map_err(|e| Error::BadRequest(format!("search response invalid: {e}")))?;
+
+        Ok(resp
+            .episodes
+            .into_iter()
+            .filter_map(|e| {
+                let episode_number = e.episode_number?;
+                Some(EpisodeInfo {
+                    episode_number,
+                    name: e.name,
+                    overview: e.overview,
+                    still_path: e.still_path,
+                    air_date: e.air_date,
+                })
             })
             .collect())
     }

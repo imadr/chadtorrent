@@ -433,15 +433,14 @@ impl LibraryManager {
         }
         self.notify_changed();
 
-        if let Some((_file_id, file_name, size)) = self
+        // The torrent's real name is the title. The file name is surfaced
+        // per-file (episode rows / movie file view), never appended to the
+        // heading.
+        if let Some((_file_id, _file_name, size)) = self
             .engine
             .find_largest_video_file(library_id)
             .await
         {
-            let title_with_ext = format!("{} / {}", name, file_name);
-            if let Err(e) = self.db.update_title(library_id, &title_with_ext) {
-                warn!("Failed to set extended title for {}: {}", library_id, e);
-            }
             if let Err(e) = self.db.update_size(library_id, size as i64) {
                 warn!("Failed to set size for {}: {}", library_id, e);
             }
