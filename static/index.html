@@ -31,6 +31,8 @@
   main[hidden] { display: none; }
   #view-library { max-width: none; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px; }
+  .lib-sec { margin-bottom: 36px; }
+  .lib-sec[hidden] { display: none; }
   .card { position: relative; background: var(--panel); border: 1px solid var(--line);
  overflow: hidden; cursor: pointer; transition: transform .12s, border-color .12s; }
   .card:hover { transform: translateY(-3px); border-color: var(--line-hi); }
@@ -352,7 +354,14 @@
 </div>
 
 <main id="view-library">
-  <div id="grid" class="grid"></div>
+  <section class="lib-sec" id="lib-sec-movies">
+    <h3>Movies</h3>
+    <div id="grid-movies" class="grid"></div>
+  </section>
+  <section class="lib-sec" id="lib-sec-tv" hidden>
+    <h3>TV Shows</h3>
+    <div id="grid-tv" class="grid"></div>
+  </section>
 </main>
 
 <main id="view-movie" hidden>
@@ -619,8 +628,8 @@ function infoHash(mag) {
 }
 
 function renderGrid() {
-  const grid = $('grid');
-  grid.innerHTML = '';
+  const gm = $('grid-movies'), gtv = $('grid-tv');
+  gm.innerHTML = ''; gtv.innerHTML = '';
   const g = groupItems(items);
   for (const [k, rows] of g) {
     const rep = movieRep(rows);
@@ -632,10 +641,12 @@ function renderGrid() {
     card.innerHTML =
       '<div class="poster">' + posterHtml + '</div>' +
       '<div class="meta"><div class="t">' + esc(movieName(rep)) + '</div>' +
-      '<div class="y">' + esc(movieYear(rep)) + (kindLabel(rep) ? ' · ' + kindLabel(rep) : '') + '</div></div>';
+      '<div class="y">' + esc(movieYear(rep)) + '</div></div>';
     card.onclick = () => openMovie(k);
-    grid.appendChild(card);
+    (rep.media_type === 'tv' ? gtv : gm).appendChild(card);
   }
+  $('lib-sec-movies').hidden = !gm.children.length;
+  $('lib-sec-tv').hidden = !gtv.children.length;
   libHighlight();
 }
 
@@ -2767,9 +2778,9 @@ function toggleFs() {
   else if (v.webkitEnterFullscreen) { v.webkitEnterFullscreen(); }
 }
 
-function libCount() { return document.querySelectorAll('#grid .card').length; }
+function libCount() { return document.querySelectorAll('#grid-movies .card, #grid-tv .card').length; }
 function libHighlight() {
-  document.querySelectorAll('#grid .card').forEach((c, i) => c.classList.toggle('sel', i === libSel));
+  document.querySelectorAll('#grid-movies .card, #grid-tv .card').forEach((c, i) => c.classList.toggle('sel', i === libSel));
 }
 function libSelMove(d) {
   const n = libCount();
@@ -2777,7 +2788,7 @@ function libSelMove(d) {
   if (libSel < 0 || libSel >= n) libSel = d > 0 ? 0 : n - 1;
   else libSel = Math.max(0, Math.min(n - 1, libSel + d));
   libHighlight();
-  const els = document.querySelectorAll('#grid .card');
+  const els = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
   if (els[libSel]) els[libSel].scrollIntoView({ block: 'nearest' });
 }
 
@@ -2816,7 +2827,7 @@ function selNext() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(1); else libSe
 function selPrev() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(-1); else libSelMove(-1); }
 function selOpen() {
   if (activeKeyCtx() === KCTX_LIBRARY) {
-    const cards = document.querySelectorAll('#grid .card');
+    const cards = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
     if (libSel >= 0 && libSel < cards.length) cards[libSel].click();
     return;
   }
