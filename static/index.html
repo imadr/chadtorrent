@@ -171,6 +171,7 @@
   #player-modal[hidden] { display: none; }
   .pwrap { position: relative; width: 100vw; height: 100vh; background: #000; }
   #player { display: block; width: 100vw; height: 100vh; background: #000; pointer-events: none; object-fit: contain; }
+  body.cursor-none, body.cursor-none * { cursor: none !important; }
   .buf { position: absolute; left: 0; right: 0; top: 0; bottom: 48px; z-index: 5; display: flex; flex-direction: column; gap: 12px;
          align-items: center; justify-content: center; background: rgba(0,0,0,.45); pointer-events: none; }
   .buf .spin { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2);
@@ -2260,6 +2261,20 @@ document.addEventListener('mousemove', (e) => {
                e.clientY >= br.top - pad && e.clientY <= br.bottom + pad;
   $('pback').classList.toggle('on', near);
 });
+
+/* Hide the cursor the instant it stops moving in the player — no grace delay.
+ * A position poll catches "stopped" on the very next tick (browser mousemove
+ * events go quiet when the pointer is still). Only the bottom control bar /
+ * open popovers keep it visible. */
+let cPrev = null;
+setInterval(() => {
+  const modal = $('player-modal');
+  if (modal.hidden) { document.body.classList.remove('cursor-none'); cPrev = null; return; }
+  const ctrlOn = $('ctrl').style.display !== 'none';
+  const same = cPrev !== null && cPrev[0] === lastMouse.x && cPrev[1] === lastMouse.y;
+  cPrev = [lastMouse.x, lastMouse.y];
+  document.body.classList.toggle('cursor-none', same && !ctrlOn);
+}, 50);
 
 /* ---------- input system ----------
  * No key does anything by default. The browser's native behaviors are killed
