@@ -53,6 +53,7 @@ const FILENAME_TAGS: &[(&str, &str)] = &[
     ("tr", "tr"), ("tur", "tr"), ("turkish", "tr"),
     ("el", "el"), ("ell", "el"), ("greek", "el"),
     ("zh", "zh"), ("chi", "zh"), ("zho", "zh"), ("chinese", "zh"),
+    ("chs", "zh"), ("cht", "zh"), ("cn", "zh"), ("sc", "zh"), ("tc", "zh"),
     ("ja", "ja"), ("jpn", "ja"), ("japanese", "ja"),
     ("ko", "ko"), ("kor", "ko"), ("korean", "ko"),
     ("hi", "hi"), ("hin", "hi"), ("hindi", "hi"),
@@ -66,6 +67,7 @@ const FILENAME_TAGS: &[(&str, &str)] = &[
     ("bg", "bg"), ("bul", "bg"), ("bulgarian", "bg"),
     ("hr", "hr"), ("hrv", "hr"), ("croatian", "hr"),
     ("sr", "sr"), ("srp", "sr"), ("serbian", "sr"),
+    ("sk", "sk"), ("slk", "sk"), ("slo", "sk"), ("slovak", "sk"),
 ];
 
 /// whatlang 3-letter code → ISO 639-1.

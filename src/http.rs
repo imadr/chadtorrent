@@ -89,6 +89,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/{id}/subs", get(subs_list))
         .route("/api/library/{id}/subs/search", get(subs_search))
         .route("/api/library/{id}/subs/download", post(subs_download))
+        .route("/api/library/{id}/subs/{name}", delete(subs_delete))
         .route("/sub/{id}/{name}", get(sub_file))
         .route("/mse/{id}/init", get(seg_init))
         .route("/mse/{id}/seg/{n}", get(seg_n))
@@ -613,7 +614,13 @@ async fn subs_download(
         .map_err(|e| Error::BadRequest(format!("subtitle download failed: {e:#}")))?;
     let vtt = subtitles::to_vtt(&saved_name, &bytes)
         .map_err(|e| Error::BadRequest(format!("subtitle conversion failed: {e:#}")))?;
-    let lang = subtitles::detect_lang(&saved_name, Some(&vtt));
+    // prefer the language OpenSubtitles reported for this subtitle (the online
+    // row's flag is derived from it), so the downloaded row matches the list.
+    let lang = body["lang"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| subtitles::detect_lang(&saved_name, Some(&vtt)));
     let stem = std::path::Path::new(&saved_name)
         .file_stem()
         .map(|s| {
@@ -637,6 +644,24 @@ async fn subs_download(
         .map_err(|e| Error::Internal(e.to_string()))?;
     let flag = subtitles::flag_for(lang.as_deref());
     Ok(Json(json!({ "name": fname, "lang": lang, "flag": flag, "source": "downloaded" })))
+}
+
+/// Delete a downloaded subtitle from `.subs/`. Only files we downloaded are
+/// deletable — a torrent-folder subtitle belongs to the torrent.
+async fn subs_delete(
+    State(state): State<AppState>,
+    Path((id, name)): Path<(i64, String)>,
+) -> Result<impl IntoResponse> {
+    let (_item_dir, subs_dir) = subs_dirs(&state, id);
+    let path = subtitles::resolve_sub_path(&subs_dir, &name)
+        .ok_or_else(|| Error::NotFound(format!("subtitle {name} not found")))?;
+    if !path.is_file() {
+        return Err(Error::NotFound(format!("subtitle {name} not found")));
+    }
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|e| Error::Internal(e.to_string()))?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// Serve a subtitle converted to WebVTT. `name` is matched against both the

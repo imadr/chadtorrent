@@ -223,8 +223,11 @@
   .subrow .flag { font-size: 16px; flex-shrink: 0; }
   .subrow .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .subrow .dl { color: var(--muted); font-size: 11px; flex-shrink: 0; }
+  .subrow .dl.sub-del { cursor: pointer; }
+  .subrow .dl.sub-del.danger { color: #ff5252; }
   .subpanel .empty { color: var(--muted); font-size: 12px; padding: 4px 8px; }
   .subpanel .oswrap { min-height: 180px; display: flex; flex-direction: column; }
+  .subpanel .oswrap h4 { margin-top: 12px; }
   .substyle { display: flex; flex-direction: column; gap: 8px; padding: 2px 8px 10px; }
   .substyle label { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
   .substyle label span { width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
@@ -1712,6 +1715,7 @@ v.addEventListener('volumechange', updVol);
 /* ---------- subtitles ---------- */
 let subPanelOpen = false, subsLocal = [], subsConfigured = false, subsOnline = null;
 let subsLoadedFor = null, activeSub = null, subBusy = false;
+let subDeleteConfirm = null;
 
 const esc2 = esc;
 function flagSpan(f) { return '<span class="flag">' + esc2(f || '🏳') + '</span>'; }
@@ -1746,9 +1750,12 @@ function renderSubPanel() {
     + '<span class="name">None</span></div>';
   if (!subsLocal.length) html += '<div class="empty">No subtitles in this torrent</div>';
   else for (const s of subsLocal) {
-    html += '<div class="subrow' + (activeSub && activeSub.name === s.name ? ' active' : '') + '" data-name="' + esc2(s.name) + '" data-local="1">'
+    const del = s.source === 'downloaded' && !s.pending;
+    html += '<div class="subrow' + (activeSub && activeSub.name === s.name ? ' active' : '') + '" data-name="' + esc2(s.name) + '" data-local="1"' + (s.pending ? ' data-pending="1"' : '') + '>'
       + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
-      + (s.source === 'downloaded' ? '<span class="dl">downloaded</span>' : '') + '</div>';
+      + (s.pending ? '<span class="dl">downloading…</span>' : (del
+        ? '<span class="dl sub-del' + (s.name === subDeleteConfirm ? ' danger' : '') + '" data-del="1" data-name="' + esc2(s.name) + '">' + (s.name === subDeleteConfirm ? 'confirm?' : 'downloaded') + '</span>'
+        : '')) + '</div>';
   }
   html += '<div class="oswrap">';
   html += '<h4>OpenSubtitles</h4>';
@@ -1757,7 +1764,7 @@ function renderSubPanel() {
   else if (!subsOnline) html += '<div class="empty">Search failed</div>';
   else if (!subsOnline.length) html += '<div class="empty">Nothing found online</div>';
   else for (const s of subsOnline) {
-    html += '<div class="subrow" data-fileid="' + esc2(s.file_id) + '">'
+    html += '<div class="subrow" data-fileid="' + esc2(s.file_id) + '" data-name="' + esc2(s.name) + '" data-lang="' + esc2(s.lang || '') + '" data-flag="' + esc2(s.flag || '') + '">'
       + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
       + '<span class="dl">↓ ' + (s.downloads || 0) + '</span></div>';
   }
@@ -1765,6 +1772,15 @@ function renderSubPanel() {
   p.innerHTML = html;
   p.querySelectorAll('.subrow:not(#ssopen)').forEach(row => {
     row.addEventListener('click', () => onSubRowClick(row));
+  });
+  p.querySelectorAll('.sub-del').forEach(el => {
+    el.addEventListener('click', (ev) => { ev.stopPropagation(); onSubDelClick(el); });
+    el.addEventListener('mouseenter', () => {
+      if (subDeleteConfirm !== el.dataset.name) { el.textContent = 'delete?'; el.classList.add('danger'); }
+    });
+    el.addEventListener('mouseleave', () => {
+      if (subDeleteConfirm !== el.dataset.name) { el.textContent = 'downloaded'; el.classList.remove('danger'); }
+    });
   });
   const ssopen = p.querySelector('#ssopen');
   if (ssopen) ssopen.addEventListener('click', () => { toggleSubsPanel(false); ssToggle(); });
@@ -1865,7 +1881,7 @@ async function onSubRowClick(row) {
     renderSubPanel();
     return;
   }
-  if (subBusy) return;
+  if (subBusy || row.dataset.pending) return;
   if (row.dataset.local) {
     const name = row.dataset.name;
     if (activeSub && activeSub.name === name) disableSub();
@@ -1873,16 +1889,49 @@ async function onSubRowClick(row) {
     renderSubPanel();
     return;
   }
+  // Don't toggle subBusy while downloading — the OpenSubtitles result list
+  // stays up ("Searching…" would blink), and the row we're downloading is
+  // already pre-added below, so the panel size doesn't change either.
   const fileid = row.dataset.fileid;
-  subBusy = true; renderSubPanel();
+  subsLocal.unshift({
+    name: row.dataset.name || fileid,
+    lang: row.dataset.lang || null,
+    flag: row.dataset.flag || '🏳',
+    source: 'downloaded',
+    pending: true,
+  });
+  renderSubPanel();
   try {
-    const added = await api('/api/library/' + currentId + '/subs/download', { method: 'POST', body: JSON.stringify({ file_id: fileid }) });
-    if (!subsLocal.some(x => x.name === added.name)) {
+    const added = await api('/api/library/' + currentId + '/subs/download', { method: 'POST', body: JSON.stringify({ file_id: fileid, lang: row.dataset.lang || '' }) });
+    const i = subsLocal.findIndex(x => x.pending);
+    if (i >= 0) subsLocal[i] = { name: added.name, lang: added.lang, flag: added.flag, source: 'downloaded' };
+    else if (!subsLocal.some(x => x.name === added.name)) {
       subsLocal.push({ name: added.name, lang: added.lang, flag: added.flag, source: 'downloaded' });
     }
     enableSub(added.name);
-  } catch (e) { console.error('sub download failed', e); }
-  subBusy = false; renderSubPanel();
+  } catch (e) {
+    console.error('sub download failed', e);
+    const i = subsLocal.findIndex(x => x.pending);
+    if (i >= 0) subsLocal.splice(i, 1);
+  }
+  renderSubPanel();
+}
+
+async function onSubDelClick(el) {
+  const name = el.dataset.name;
+  if (subDeleteConfirm === name) {
+    try {
+      await api('/api/library/' + currentId + '/subs/' + encodeURIComponent(name), { method: 'DELETE' });
+    } catch (e) { console.error('sub delete failed', e); }
+    subDeleteConfirm = null;
+    subsLocal = subsLocal.filter(x => x.name !== name);
+    if (activeSub && activeSub.name === name) disableSub();
+    renderSubPanel();
+  } else {
+    subDeleteConfirm = name;
+    el.textContent = 'confirm?';
+    el.classList.add('danger');
+  }
 }
 
 /* Per-item subtitle choice, persisted so re-opening the player brings back
@@ -2077,17 +2126,16 @@ function ssBuild() {
   ssFollowScroll = ssList.scrollTop;
 }
 
-/* Cue matching the playhead (ORIGINAL times + delay). Between cues the next
- * line is current, like lyrics. */
+/* Cue covering the playhead (ORIGINAL times + delay), or -1 in a gap. The
+ * highlight must track the realtime subtitle exactly: no "next line is
+ * current" anticipation, or future lines glow before their time. */
 function ssActiveIdx() {
   const t = (v.currentTime || 0) - ssDelay;
-  let cover = -1, next = ssCues.length;
   for (let i = 0; i < ssCues.length; i++) {
     const c = ssCues[i];
-    if (c.start <= t && t < c.end) cover = i;
-    else if (c.start > t) { next = i; break; }
+    if (c.start <= t && t < c.end) return i;
   }
-  return cover >= 0 ? cover : next;
+  return -1;
 }
 
 function ssPaint(idx) {
@@ -2097,9 +2145,10 @@ function ssPaint(idx) {
     const c = ssCues[i];
     if (c) { c.el.classList.add(cls); ssPainted.push(c.el); }
   };
-  add(idx, 'on');
-  add(idx - 1, 'near');
-  add(idx + 1, 'near');
+  if (idx >= 0) {
+    add(idx, 'on');
+    add(idx - 1, 'near');
+  }
 }
 
 function ssBadge() {
