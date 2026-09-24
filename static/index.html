@@ -55,6 +55,8 @@
   .bigposter .ph { font-size: 56px; opacity: .4; }
   .mv-info h1 { margin: 0 0 6px; font-size: 28px; }
   .mv-info .sub { color: var(--muted); margin-bottom: 18px; }
+  .mv-info .mv-desc { margin: 0 0 18px; font-size: 13px; line-height: 1.45;
+                      color: var(--muted); max-width: 620px; }
   .mv-info label { display: inline-flex; align-items: center; gap: 8px; margin-right: 14px; cursor: pointer; }
   section { margin: 26px 0; }
   section h3 { font-size: 14px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 12px; }
@@ -70,6 +72,7 @@
   .tv-t .eps { display: flex; flex-direction: column; gap: 6px; padding: 8px 0 8px 24px; }
   .tv-t .ep { display: flex; align-items: center; gap: 10px; border: 0.5px solid var(--line);
               padding: 7px 12px 7px 14px; min-height: 44px; }
+  .tv-t .ep.playable { cursor: pointer; }
   .tv-t .ep:hover { background: var(--panel2); border-color: var(--line-hi); }
   .tv-t .ep.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
   .tv-t .ep .ep-cb { display: inline-flex; align-items: center; gap: 7px; flex-shrink: 0;
@@ -81,14 +84,6 @@
   .tv-t .ep-info .dl { margin-top: 5px; }
   .tv-t .ep-size { font-size: 12px; color: var(--muted); flex-shrink: 0; width: 92px;
                    text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .tv-t .ep .ibtn { width: 30px; height: 30px; padding: 0; flex-shrink: 0; display: inline-flex;
-                    align-items: center; justify-content: center; background: var(--panel2);
-                    border: 0.5px solid var(--line); color: var(--text); }
-  .tv-t .ep .ibtn:hover { border-color: var(--line-hi); }
-  .tv-t .ep .ibtn.primary { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
-  .tv-t .ep .ibtn:disabled { opacity: .35; cursor: default; }
-  .tv-t .ep .ibtn svg { width: 15px; height: 15px; stroke: currentColor; stroke-width: 2; fill: none;
-                        stroke-linecap: round; stroke-linejoin: round; }
   #mv-torrents .row { min-height: 68px; }
   .row:hover { background: var(--panel2); border-color: var(--line-hi); }
   .row.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
@@ -771,7 +766,8 @@ function renderMovie() {
       '<div class="mv-info">' +
         '<h1 id="mv-title"></h1>' +
         '<div class="sub" id="mv-sub"></div>' +
-        '<button class="btn danger" id="mv-del">Delete movie</button>' +
+        '<p class="mv-desc" id="mv-overview"></p>' +
+        '<button class="btn danger" id="mv-del">Delete</button>' +
       '</div>' +
     '</div>' +
     '<section>' +
@@ -792,6 +788,9 @@ function renderMovie() {
   $('mv-del').addEventListener('click', mvDelClick);
 
   $('mv-searchsec').hidden = !rep.tmdb_id;
+
+  applyMvOverview(rep);
+  ensureMvMeta(rep);
 
   const list = $('mv-torrents');
   const torrentRs = rows.filter(r => r.magnet);
@@ -936,26 +935,44 @@ function isTvMovie() {
 
 /* Canonical seasons come from TMDB (the show "has" seasons 1..N whether or
    not the user has torrents for them) — chips are built from that list, and
-   torrents are then filtered by the selected season. Cached per tmdb_id for
-   the session; `false` means the fetch failed and we fall back to bucket-only
-   chips. */
-var seasonsByTmdb = new Map();
+   torrents are then filtered by the selected season. The same detail response
+   also powers the description paragraph under the title. Cached per media_type
+   + tmdb_id for the session; `false` means the fetch failed and we fall back
+   to bucket-only chips / no description. */
+var mvMetaByTmdb = new Map();
+function mvMetaKey(rep) { return (rep.media_type || 'movie') + ':' + rep.tmdb_id; }
 function tvSeasonsOf(rep) {
   if (!rep || rep.media_type !== 'tv' || !rep.tmdb_id) return null;
-  const s = seasonsByTmdb.get(String(rep.tmdb_id));
+  const m = mvMetaByTmdb.get(mvMetaKey(rep));
+  const s = m && m.seasons;
   return Array.isArray(s) && s.length ? s : null;
 }
-function ensureTvSeasons(rep) {
-  if (!rep || rep.media_type !== 'tv' || !rep.tmdb_id) return;
-  const key = String(rep.tmdb_id);
-  if (seasonsByTmdb.has(key)) return;
-  seasonsByTmdb.set(key, null); // in-flight marker; do not refetch this session
-  api('/api/meta/tv/' + rep.tmdb_id)
+function applyMvOverview(rep) {
+  const el = $('mv-overview');
+  if (!el || !rep || !rep.tmdb_id) return;
+  const m = mvMetaByTmdb.get(mvMetaKey(rep));
+  const t = m && m.overview && String(m.overview).trim();
+  if (t) { el.hidden = false; el.textContent = m.overview; }
+  else el.hidden = true;
+}
+function ensureMvMeta(rep) {
+  if (!rep || !rep.tmdb_id) return;
+  const key = mvMetaKey(rep);
+  if (mvMetaByTmdb.has(key)) return;
+  mvMetaByTmdb.set(key, null); // in-flight marker; do not refetch this session
+  api('/api/meta/' + encodeURIComponent(rep.media_type || 'movie') + '/' + rep.tmdb_id)
     .then(d => {
-      seasonsByTmdb.set(key, (d.seasons || []).map(s => String(s.season_number)));
-      if (isTvMovie()) refreshTvView();
+      mvMetaByTmdb.set(key, {
+        overview: (d && d.overview) || '',
+        seasons: ((d && d.seasons) || []).map(s => String(s.season_number)),
+      });
+      const me = currentMovie && movieRep(currentMovie.rows);
+      if (me && me.tmdb_id && mvMetaKey(me) === key) {
+        if (me.media_type === 'tv') refreshTvView();
+        applyMvOverview(me);
+      }
     })
-    .catch(() => { seasonsByTmdb.set(key, false); });
+    .catch(() => { mvMetaByTmdb.set(key, false); });
 }
 
 function loadFileList(id, force) {
@@ -999,7 +1016,7 @@ function renderTV(torrentRs) {
   const b = tvBuckets(torrentRs);
   const chips = $('mv-seasonchips');
   const rep = movieRep(currentMovie.rows);
-  ensureTvSeasons(rep);
+  ensureMvMeta(rep);
   // Chips are the show's canonical TMDB seasons and nothing else. A torrent
   // that matches no season is simply never shown.
   const seasons = tvSeasonsOf(rep) || [];
@@ -1091,8 +1108,7 @@ function renderEpRow(r, t, f) {
       '<div class="ep-name">' + esc(nm) + '</div>' +
       '<div class="dl"' + (done ? ' hidden' : '') + '><div class="bar"></div><div class="txt"></div></div>' +
     '</div>' +
-    '<div class="ep-size">' + esc(done ? fmtBytes(size) : status) + '</div>' +
-    '<button class="ibtn primary" title="Play">' + IC_PLAY + '</button>';
+    '<div class="ep-size">' + esc(done ? fmtBytes(size) : status) + '</div>';
   if (!done && have > 0) {
     const bar = r.querySelector('.bar');
     const seg = document.createElement('b');
@@ -1104,9 +1120,12 @@ function renderEpRow(r, t, f) {
   }
   const cb = r.querySelector('input');
   cb.onchange = () => { cb.disabled = true; setFileSelected(t, f.path, cb.checked); };
-  const play = r.querySelector('.ibtn');
-  play.disabled = !canPlay || skipped || (have <= 0 && !done);
-  play.onclick = (e) => { e.stopPropagation(); playTorrent(t, f.path); };
+  const playable = canPlay && !skipped && (have > 0 || done);
+  r.classList.toggle('playable', playable);
+  r.onclick = (e) => {
+    if (!playable || e.target.closest('button, label, input, a')) return;
+    playTorrent(t, f.path);
+  };
 }
 
 /* Lowest-numbered playable episode for a torrent (header click / keybinding).

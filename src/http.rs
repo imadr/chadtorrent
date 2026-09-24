@@ -149,22 +149,23 @@ async fn add_item(
     Ok(Json(json!({ "id": id })))
 }
 
-/// Canonical TV-show seasons from TMDB, for the library's season chips.
+/// TMDB detail for a library item's head section: the overview (description
+/// paragraph) always, plus the canonical TV-season list for the season chips.
 async fn meta_detail(
     State(state): State<AppState>,
     axum::extract::Path((media_type, tmdb_id)): axum::extract::Path<(String, i64)>,
 ) -> Result<impl IntoResponse> {
-    if media_type != "tv" {
-        return Ok(Json(crate::metadata::SeasonInfoList { seasons: vec![] }));
-    }
     let Some(tmdb) = state.tmdb.as_ref() else {
         return Err(Error::BadRequest("Movie search is not configured on this server".into()));
     };
-    let seasons = tmdb
-        .tv_seasons(tmdb_id)
-        .await
-        .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
-    Ok(Json(crate::metadata::SeasonInfoList { seasons }))
+    let details = tmdb.get_details(tmdb_id, &media_type).await.ok();
+    let overview = details.as_ref().and_then(|d| d.overview.clone());
+    let seasons = if media_type == "tv" {
+        tmdb.tv_seasons(tmdb_id).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(json!({ "overview": overview, "seasons": seasons })))
 }
 
 async fn search_tmdb(
@@ -254,7 +255,10 @@ async fn torrent_search(
                     .into_iter()
                     .filter_map(|it| {
                         let info_hash = it.info_hash.trim().to_string();
-                        if info_hash.len() != 40 {
+                        if info_hash.len() != 40 || info_hash.bytes().all(|b| b == b'0') {
+                            // apibay signals "no results" with a placeholder
+                            // entry carrying a zeroed info hash: never surface
+                            // it as a torrent.
                             return None;
                         }
                         let magnet = format!(

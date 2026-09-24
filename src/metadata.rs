@@ -86,11 +86,6 @@ pub struct SeasonInfo {
     pub air_date: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SeasonInfoList {
-    pub seasons: Vec<SeasonInfo>,
-}
-
 pub struct TmdbClient {
     client: Client,
     api_key: String,
@@ -178,7 +173,6 @@ impl TmdbClient {
             .collect())
     }
 
-    #[allow(dead_code)]
     pub async fn get_details(&self, tmdb_id: i64, media_type: &str) -> Result<SearchResult> {
         let endpoint = match media_type {
             "tv" => format!("{}/tv/{}", TMDB_BASE, tmdb_id),
