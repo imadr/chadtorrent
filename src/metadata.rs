@@ -78,7 +78,7 @@ struct TmdbSeason {
 /// One canonical season of a TV show (TMDB), used by the season chips in the
 /// library's TV-show detail view. Chips list the show's real seasons; torrents
 /// are then filtered by the selected season.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeasonInfo {
     pub season_number: i64,
     pub name: Option<String>,

@@ -159,6 +159,11 @@ async fn meta_detail(
     let Some(tmdb) = state.tmdb.as_ref() else {
         return Err(Error::BadRequest("Movie search is not configured on this server".into()));
     };
+    // Serve from the DB cache first — a page refresh must never re-hit TMDB.
+    // `mvMetaByTmdb` on the client only covers the current session.
+    if let Some((overview, seasons)) = state.library.db.get_tmdb_meta(&media_type, tmdb_id)? {
+        return Ok(Json(json!({ "overview": overview, "seasons": seasons })));
+    }
     let details = tmdb.get_details(tmdb_id, &media_type).await.ok();
     let overview = details.as_ref().and_then(|d| d.overview.clone());
     let seasons = if media_type == "tv" {
@@ -166,6 +171,14 @@ async fn meta_detail(
     } else {
         Vec::new()
     };
+    // Persist only when TMDB actually answered, so a failed run is retried on
+    // the next refresh instead of being pinned in the DB as "no data".
+    if details.is_some() {
+        let _ = state
+            .library
+            .db
+            .set_tmdb_meta(&media_type, tmdb_id, overview.as_deref(), &seasons);
+    }
     Ok(Json(json!({ "overview": overview, "seasons": seasons })))
 }
 

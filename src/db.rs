@@ -130,7 +130,14 @@ impl Database {
                 t REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (item_id, file_path)
             );
-            CREATE INDEX IF NOT EXISTS idx_playheads_item ON playheads(item_id);",
+            CREATE INDEX IF NOT EXISTS idx_playheads_item ON playheads(item_id);
+            CREATE TABLE IF NOT EXISTS tmdb_meta (
+                media_type TEXT NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                overview TEXT,
+                seasons_json TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (media_type, tmdb_id)
+            );",
         )?;
         // Migrate: drop the obsolete "keep" column if a pre-removal database
         // still has it.
@@ -498,6 +505,54 @@ impl Database {
         conn.execute("DELETE FROM playheads WHERE item_id = ?1", params![item_id])?;
         Ok(())
     }
+
+    // ---- TMDB metadata cache ----
+
+    /// Cached TMDB detail — the overview (description) paragraph plus the
+    /// canonical TV-season list — so the sidebar serves from SQLite instead of
+    /// re-hitting TMDB on every page refresh.
+    pub fn get_tmdb_meta(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+    ) -> Result<Option<(Option<String>, Vec<crate::metadata::SeasonInfo>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT overview, seasons_json FROM tmdb_meta WHERE media_type = ?1 AND tmdb_id = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![media_type, tmdb_id], |row| {
+            let overview: Option<String> = row.get(0)?;
+            let seasons_json: String = row.get(1)?;
+            let seasons: Vec<crate::metadata::SeasonInfo> =
+                serde_json::from_str(&seasons_json).unwrap_or_default();
+            Ok((overview, seasons))
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_tmdb_meta(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+        overview: Option<&str>,
+        seasons: &[crate::metadata::SeasonInfo],
+    ) -> Result<()> {
+        let seasons_json = serde_json::to_string(seasons)
+            .map_err(|e| crate::error::Error::BadRequest(format!("serialize seasons: {e}")))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO tmdb_meta (media_type, tmdb_id, overview, seasons_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(media_type, tmdb_id) DO UPDATE SET
+                 overview = excluded.overview,
+                 seasons_json = excluded.seasons_json",
+            params![media_type, tmdb_id, overview, seasons_json],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +826,33 @@ mod tests {
             .collect::<std::result::Result<Vec<String>, _>>()
             .unwrap();
         assert!(!cols.contains(&"keep".to_string()));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_tmdb_meta_roundtrip() {
+        let (db, dir) = temp_db();
+        assert!(db.get_tmdb_meta("movie", 46648).unwrap().is_none());
+        let seasons = vec![crate::metadata::SeasonInfo {
+            season_number: 1,
+            name: Some("Season 1".into()),
+            episode_count: Some(8),
+            air_date: Some("2014-01-12".into()),
+        }];
+        db.set_tmdb_meta("tv", 46648, Some("A cool show."), &seasons)
+            .unwrap();
+        let (overview, got) = db.get_tmdb_meta("tv", 46648).unwrap().unwrap();
+        assert_eq!(overview.as_deref(), Some("A cool show."));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].season_number, 1);
+        assert_eq!(got[0].name.as_deref(), Some("Season 1"));
+        // Upsert replaces the stored payload.
+        db.set_tmdb_meta("tv", 46648, Some("New desc."), &[]).unwrap();
+        let (overview, got) = db.get_tmdb_meta("tv", 46648).unwrap().unwrap();
+        assert_eq!(overview.as_deref(), Some("New desc."));
+        assert!(got.is_empty());
+        // A different media_type with the same id is isolated.
+        assert!(db.get_tmdb_meta("movie", 46648).unwrap().is_none());
         cleanup(&dir);
     }
 }
