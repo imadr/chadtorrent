@@ -69,6 +69,7 @@
           background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
   #mv-seasonchips .s-chip:hover, #mv-epselect .s-chip:hover { border-color: var(--line-hi); }
   #mv-seasonchips .s-chip.sel, #mv-epselect .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
+  #mv-seasonchips .s-chip.kbd-sel, #mv-epselect .s-chip.kbd-sel { box-shadow: 0 0 0 2px var(--line-hi); }
   #mv-epselect { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
   #mv-epselect[hidden] { display: none; }
   #mv-epfiles .ep { display: flex; align-items: center; gap: 10px;
@@ -2788,6 +2789,8 @@ const DEFAULT_KEYBIND = [
   { id: 'mv-dltoggle', ctx: KCTX_MOVIE,  code: 'Space',      label: 'Pause / resume torrent', fn: selToggleDl },
   { id: 'lib-next',    ctx: KCTX_LIBRARY,code: 'ArrowRight', label: 'Next movie',             fn: selNext },
   { id: 'lib-prev',    ctx: KCTX_LIBRARY,code: 'ArrowLeft',  label: 'Previous movie',         fn: selPrev },
+  { id: 'lib-down',    ctx: KCTX_LIBRARY,code: 'ArrowDown',  label: 'Movie below (row)',      fn: selDown },
+  { id: 'lib-up',      ctx: KCTX_LIBRARY,code: 'ArrowUp',    label: 'Movie above (row)',      fn: selUp },
   { id: 'lib-open',    ctx: KCTX_LIBRARY,code: 'Enter',      label: 'Open movie',             fn: selOpen },
   { id: 'lib-settings',ctx: KCTX_LIBRARY,code: 'Escape',     label: 'Open settings',           fn: openSettings },
   { id: 'lib-add',    ctx: KCTX_LIBRARY,code: 'Space',      label: 'Add movie',               fn: openAdd },
@@ -2897,11 +2900,29 @@ function libCount() { return document.querySelectorAll('#grid-movies .card, #gri
 function libHighlight() {
   document.querySelectorAll('#grid-movies .card, #grid-tv .card').forEach((c, i) => c.classList.toggle('sel', i === libSel));
 }
-function libSelMove(d) {
+/* Cards per row at the current window width — measured from the actual grid
+ * (the shared top of the first row), so up/down follow screen layout instead
+ * of a hard-coded offset. */
+function libCols() {
+  const els = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
+  if (!els.length) return 1;
+  const top = Math.round(els[0].getBoundingClientRect().top);
+  let cols = 0;
+  for (const el of els) {
+    if (Math.round(el.getBoundingClientRect().top) !== top) break;
+    cols++;
+  }
+  return Math.max(1, cols);
+}
+function libSelJump(d, axis) {
   const n = libCount();
   if (!n) return;
+  // Vertical moves step by one full row (cols adapts to the window width);
+  // horizontal stays ±1. Edges clamp instead of wrapping so a press always
+  // lands on something visible.
+  const step = axis === 'v' ? libCols() : 1;
   if (libSel < 0 || libSel >= n) libSel = d > 0 ? 0 : n - 1;
-  else libSel = Math.max(0, Math.min(n - 1, libSel + d));
+  else libSel = Math.max(0, Math.min(n - 1, libSel + d * step));
   libHighlight();
   const els = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
   if (els[libSel]) els[libSel].scrollIntoView({ block: 'nearest' });
@@ -2909,32 +2930,48 @@ function libSelMove(d) {
 
 function mvFlat() {
   const out = [];
+  // Order must match what's on screen (top→bottom): season chips, episode
+  // buttons, episode rows, then the "Downloaded contents" torrent list, then
+  // search results. Out of order, up/down jump between sections backwards and
+  // wrap around the visual layout. Hidden chip bars are skipped so a stale
+  // innerHTML can't put invisible buttons in the nav.
+  for (const el of document.querySelectorAll('#mv-seasonchips:not([hidden]) button.s-chip')) out.push({ kind: 'season', el });
+  for (const el of document.querySelectorAll('#mv-epselect:not([hidden]) button.s-chip'))    out.push({ kind: 'epbtn',  el });
+  for (const el of document.querySelectorAll('#mv-epfiles > .ep'))            out.push({ kind: 'episode', el });
   for (const el of document.querySelectorAll('#mv-torrents > .row[data-id]')) out.push({ kind: 'content', el });
-  for (const el of document.querySelectorAll('#mv-epfiles > .ep'))       out.push({ kind: 'episode', el });
-  for (const el of document.querySelectorAll('#mv-results .row'))          out.push({ kind: 'torrent',  el });
+  for (const el of document.querySelectorAll('#mv-results .row'))             out.push({ kind: 'torrent',  el });
   return out;
 }
-function mvHighlight() {
-  mvFlat().forEach((x, i) => x.el.classList.toggle('sel', i === mvSelIdx));
+function mvHighlight(l) {
+  const flat = l || mvFlat();
+  flat.forEach((x, i) => {
+    const sel = i === mvSelIdx;
+    // Chips already use `.sel` to mean "season/episode selected" — a keyboard
+    // highlight must not collide with it.
+    if (x.kind === 'season' || x.kind === 'epbtn') x.el.classList.toggle('kbd-sel', sel);
+    else x.el.classList.toggle('sel', sel);
+  });
 }
 function mvSyncSel() {
   const l = mvFlat();
   if (!l.length) { mvSelIdx = -1; return; }
   if (mvSelIdx < 0 || mvSelIdx >= l.length) mvSelIdx = 0;
-  mvHighlight();
+  mvHighlight(l);
 }
 function mvSelMove(d) {
   const l = mvFlat();
   if (!l.length) return;
   if (mvSelIdx < 0 || mvSelIdx >= l.length) mvSelIdx = d > 0 ? 0 : l.length - 1;
   else mvSelIdx = Math.max(0, Math.min(l.length - 1, mvSelIdx + d));
-  mvHighlight();
+  mvHighlight(l);
   const x = l[mvSelIdx];
   if (x) x.el.scrollIntoView({ block: 'nearest' });
 }
 
-function selNext() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(1); else libSelMove(1); }
-function selPrev() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(-1); else libSelMove(-1); }
+function selNext() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(1); else libSelJump(1, 'h'); }
+function selPrev() { if (activeKeyCtx() === KCTX_MOVIE) mvSelMove(-1); else libSelJump(-1, 'h'); }
+function selDown() { libSelJump(1, 'v'); }
+function selUp() { libSelJump(-1, 'v'); }
 function selOpen() {
   if (activeKeyCtx() === KCTX_LIBRARY) {
     const cards = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
@@ -2943,7 +2980,10 @@ function selOpen() {
   }
   const x = mvFlat()[mvSelIdx];
   if (!x) return;
-  if (x.kind === 'episode' || x.kind === 'content') { x.el.click(); return; }
+  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn') {
+    x.el.click();
+    return;
+  }
   const add = x.el.querySelector('button.btn');
   if (add && !add.disabled) add.click();
 }
