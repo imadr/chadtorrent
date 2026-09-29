@@ -78,7 +78,7 @@ Each member runs their own instance; the BitTorrent swarm is the content distrib
 
 - `static/index.html` is embedded at compile time. Any frontend edit requires `cargo build` before it shows up in the binary.
 - Torrent registration is non-blocking (returns immediately). A row can sit in `connecting` state for seconds; the frontend shows "Adding…" during this time. The Play button is disabled until the state advances.
-- **Browser quirks (verified with the MSE harness in `docs/browser-harness/`, served same-origin at `/__test`)**:
+- **Browser quirks (previously verified with an MSE harness; keep them in mind when touching the player)**:
   - Firefox wedges or degrades when the SourceBuffer MIME's AAC profile doesn't match the stream's actual AudioSpecificConfig (HE-AAC must be declared `mp4a.40.5`). Chrome tolerates the mismatch.
   - Firefox clamps `v.currentTime` writes to the seekable range; with fragmented MP4 the duration is Infinity until `endOfStream()` — always pin `ms.duration` from the manifest before seeking.
   - Firefox coalesces fetch body chunks into ~16–32MB batches (Chrome delivers ~64KB slices) — never assume chunk size on the client.

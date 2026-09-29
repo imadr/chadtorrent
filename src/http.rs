@@ -113,7 +113,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/party/join", post(join_party))
         .route("/api/party/leave", post(leave_party))
         .route("/ws/party", get(party_ws_handler))
-        .route("/__test", get(test_page))
         .fallback(get(spa_fallback))
         .with_state(state)
 }
@@ -558,19 +557,6 @@ async fn spa_fallback() -> Response {
                 .into_response(),
             Err(_) => StatusCode::NOT_FOUND.into_response(),
         },
-    }
-}
-
-/// Dev-only: serve the browser test harness page (docs/browser-harness/) so
-/// it runs same-origin against the real server. Missing file -> plain 404.
-async fn test_page() -> Response {
-    match tokio::fs::read("docs/browser-harness/page.html").await {
-        Ok(bytes) => (
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
