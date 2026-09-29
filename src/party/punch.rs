@@ -37,6 +37,10 @@ const F_DATA: u8 = 3; // payload = sealed party-message envelope
 const F_ACK: u8 = 4; // payload = u32 BE cumulative ack
 const F_PING: u8 = 5;
 const F_PONG: u8 = 6;
+/// Resync request: both sides drop their sequence state (send counter,
+/// receive frontier, held/unacked frames) and keep the punch. Old peers
+/// ignore the unknown type — same behaviour as before this existed.
+const F_RESET: u8 = 7;
 
 const TICK: Duration = Duration::from_millis(100);
 const PUNCH_EVERY: Duration = Duration::from_millis(250);
@@ -50,6 +54,13 @@ const PING_EVERY: Duration = Duration::from_secs(8);
 /// live peer is never hit by this.
 const DEAD_AFTER: Duration = Duration::from_secs(35);
 const REBIND_EVERY: Duration = Duration::from_secs(15);
+/// A hold map (out-of-order frames awaiting a gap) that stays unmoved this
+/// long means the two sides' seq counters have diverged — the gap will never
+/// close, so ask the peer to resync (F_RESET) and reset ours too.
+const STALL_RECOVER: Duration = Duration::from_secs(10);
+/// The hub drops a room member after this much silence. Live members rebind
+/// every ~15s, so 45s means the member is gone for good.
+const HUB_MEMBER_EXPIRE: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
 // Wire structs (JSON; tiny and rare)
@@ -111,12 +122,10 @@ pub async fn run_punch_server(socket: UdpSocket) {
             continue;
         }
         let members = rooms.entry(bind.room.clone()).or_default();
-        let n_before = members.len();
-        members.retain(|_, (addr, seen)| seen.elapsed() < Duration::from_secs(45) || *addr != from);
-        if members.len() != n_before {
+        let expired = expire_room_members(members, from, Instant::now());
+        if expired > 0 {
             warn!(
-                "hub: expired {} silent member(s) of room {} ({} remain)",
-                n_before - members.len(),
+                "hub: expired {expired} silent member(s) of room {} ({} remain)",
                 bind.room.as_str(),
                 members.len()
             );
@@ -184,6 +193,13 @@ struct PeerConn {
     last_ping: Instant,
     last_req: Instant,
     last_hold_warn: Instant,
+    /// Oldest seq sitting in `hold`, and when it last changed. Lets the tick
+    /// tell a closing gap (retransmit lands within ~400ms) from a permanently
+    /// desynced stream.
+    stall_oldest: u32,
+    stall_since: Option<Instant>,
+    /// Last F_RESET sent/received — cooldown guards the reply loop.
+    last_reset: Instant,
 }
 
 /// The party's transport task. Punches every member of the room, then
@@ -322,20 +338,41 @@ pub(crate) async fn run_transport(
                     }
                 }
 
-                // Stall detector: a non-empty hold map means sequenced frames
-                // are stuck waiting for a gap that isn't closing. Presences
-                // stop, the roster prunes, yet PINGs keep the conn alive —
-                // the exact "online but roster=0" symptom. Log once/5s.
-                for c in conns.values_mut() {
-                    if c.punched && !c.hold.is_empty() && now - c.last_hold_warn > Duration::from_secs(5)
-                    {
-                        c.last_hold_warn = now;
-                        let oldest = c.hold.keys().min().copied().unwrap_or(0);
-                        warn!(
-                            "seq stall: {} unreachable (expected {} got-hold {} oldest {})",
-                            c.peer_id, c.recv_next, c.hold.len(), oldest
-                        );
+                // Stalled in-order stream: a non-empty hold map that stops
+                // moving means sequenced frames are stuck waiting for a gap
+                // that will never close — the two sides' seq counters have
+                // diverged (e.g. only one side went through the peer-lost
+                // reset). Presences stop, the roster prunes, yet PINGs keep
+                // the conn alive — the exact "online but roster=0" symptom.
+                // Log while it builds; after STALL_RECOVER ask the peer to
+                // resync (F_RESET) and reset our own stream state too.
+                for (addr, c) in conns.iter_mut() {
+                    if !c.punched {
+                        continue;
                     }
+                    let Some(since) = c.stall_since else { continue };
+                    if now - c.last_seen > Duration::from_secs(5) {
+                        continue; // silent peer — the dead-check below owns this conn
+                    }
+                    if now - since < STALL_RECOVER {
+                        if now - c.last_hold_warn > Duration::from_secs(5) {
+                            c.last_hold_warn = now;
+                            let oldest = c.hold.keys().min().copied().unwrap_or(0);
+                            warn!(
+                                "seq stall: {} unreachable (expected {} got-hold {} oldest {})",
+                                c.peer_id, c.recv_next, c.hold.len(), oldest
+                            );
+                        }
+                        continue;
+                    }
+                    warn!(
+                        "seq stall with {} unresolved for {}s — resetting stream state",
+                        c.peer_id,
+                        (now - since).as_secs()
+                    );
+                    send_frame(&socket, *addr, &build_frame(F_RESET, 0, &[]));
+                    c.last_reset = now;
+                    reset_stream(c);
                 }
 
                 // Membership change: re-punch before anything flows again.
@@ -415,6 +452,12 @@ pub(crate) async fn run_transport(
                         .unwrap_or_default();
                         let _ = socket.send_to(&bind, server).await;
                         for addr in dead {
+                            // If the peer is actually alive (we were the only
+                            // one who saw silence), tell it to drop its seq
+                            // state too — otherwise its sender counter would
+                            // sit ahead of our fresh recv frontier and every
+                            // frame would be misfiled as a duplicate.
+                            send_frame(&socket, addr, &build_frame(F_RESET, 0, &[]));
                             if let Some(c) = conns.get_mut(&addr) {
                                 let peer_id = c.peer_id.clone();
                                 *c = new_conn(peer_id, addr, now);
@@ -440,7 +483,46 @@ fn new_conn(peer_id: String, addr: SocketAddr, now: Instant) -> PeerConn {
         last_ping: now,
         last_req: now - PUNCH_EVERY, // fire immediately
         last_hold_warn: now - Duration::from_secs(10),
+        stall_oldest: 0,
+        stall_since: None,
+        last_reset: now - Duration::from_secs(10), // cooldown already expired
     }
+}
+
+/// Drop all sequence-numbered stream state, keeping the punch. Sent (F_RESET)
+/// when the two sides' seq counters have diverged — e.g. only one side went
+/// through the peer-lost reset, so one side's sender counter sits ahead of the
+/// other's fresh receive frontier and every frame is misfiled (held forever or
+/// dropped as a "duplicate"). After both sides reset, numbering starts from 1
+/// on each and stays consistent. In-flight frames are dropped — party traffic
+/// is idempotent snapshots (presence, absolute-position actions), so losing a
+/// beat beats stalling forever.
+fn reset_stream(conn: &mut PeerConn) {
+    conn.my_seq = 0;
+    conn.unacked.clear();
+    conn.recv_next = 1;
+    conn.hold.clear();
+    conn.stall_since = None;
+}
+
+/// Expire room members on the hub. A member that stopped rebinding is gone no
+/// matter which address it sat at — the old `|| addr != from` escape hatch
+/// kept ghosts forever, and since the hub keeps pushing them as punch targets
+/// while `all_punched` requires every target, one ghost could wedge new
+/// joiners into eternal "connecting". The binder's own address is always
+/// reset: a restart under the same address carries a new peer id, and the old
+/// identity must not linger as an unpunchable duplicate target. Returns the
+/// number of dropped entries.
+fn expire_room_members(
+    members: &mut HashMap<String, (SocketAddr, Instant)>,
+    from: SocketAddr,
+    now: Instant,
+) -> usize {
+    let before = members.len();
+    members.retain(|_, (addr, seen)| {
+        addr != &from && now.duration_since(*seen) < HUB_MEMBER_EXPIRE
+    });
+    before - members.len()
 }
 
 fn apply_bound(
@@ -541,6 +623,16 @@ async fn handle_frame(
                     }
                 }
             } // seq < recv_next => duplicate, just re-ack below
+            // Stall bookkeeping: track when the oldest held seq last changed.
+            match conn.hold.keys().min().copied() {
+                Some(oldest) => {
+                    if conn.stall_since.is_none() || oldest != conn.stall_oldest {
+                        conn.stall_oldest = oldest;
+                        conn.stall_since = Some(now);
+                    }
+                }
+                None => conn.stall_since = None,
+            }
             send_frame(socket, from, &build_frame(F_ACK, conn.recv_next.wrapping_sub(1), &[]));
         }
         F_ACK => {
@@ -565,6 +657,22 @@ async fn handle_frame(
                     conn.last_seen = now;
                 }
             }
+        }
+        F_RESET => {
+            let Some(conn) = conns.get_mut(&from) else { return };
+            if !conn.punched {
+                return;
+            }
+            conn.last_seen = now;
+            // Cooldown guards the reply loop: both sides reset and answer,
+            // and each must ignore the other's echo of its own request.
+            if now - conn.last_reset < Duration::from_secs(2) {
+                return;
+            }
+            conn.last_reset = now;
+            info!("stream reset from {} — resyncing sequence state", conn.peer_id);
+            reset_stream(conn);
+            send_frame(socket, from, &build_frame(F_RESET, 0, &[]));
         }
         _ => {}
     }
@@ -627,4 +735,128 @@ fn frame_req(key: &[u8; 32], peer_id: &str) -> Vec<u8> {
 
 fn frame_ok(key: &[u8; 32], peer_id: &str) -> Vec<u8> {
     sealed_who(key, F_OK, peer_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_expires_silent_members() {
+        let a: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let b: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+        let now = Instant::now();
+        let mut members = HashMap::new();
+        // Live member at another address: kept.
+        members.insert("live".to_string(), (b, now - Duration::from_secs(10)));
+        // Ghost that went silent at another address: dropped (was kept
+        // forever by the old `|| addr != from` escape hatch).
+        members.insert(
+            "ghost".to_string(),
+            (a, now - Duration::from_secs(90)),
+        );
+        // Stale identity at the binder's own address (restart under the same
+        // address carries a new peer id): dropped immediately.
+        members.insert(
+            "restarted".to_string(),
+            (a, now - Duration::from_secs(2)),
+        );
+        let expired = expire_room_members(&mut members, a, now);
+        assert_eq!(expired, 2);
+        assert_eq!(members.len(), 1);
+        assert!(members.contains_key("live"));
+    }
+
+    #[test]
+    fn reset_stream_clears_sequence_state() {
+        let now = Instant::now();
+        let mut c = new_conn("peer".into(), "1.2.3.4:5".parse().unwrap(), now);
+        c.punched = true;
+        c.my_seq = 42;
+        c.recv_next = 500;
+        c.hold.insert(501, Message::Seek { from: "p".into(), t: 1.0 });
+        c.unacked.push_back((42, vec![0u8], now, now));
+        c.stall_since = Some(now);
+        reset_stream(&mut c);
+        assert_eq!(c.my_seq, 0);
+        assert_eq!(c.recv_next, 1);
+        assert!(c.hold.is_empty());
+        assert!(c.unacked.is_empty());
+        assert!(c.stall_since.is_none());
+        assert!(c.punched, "the punch itself must survive a stream reset");
+    }
+
+    /// F_RESET from a punched peer resyncs the conn and answers with its own
+    /// F_RESET, so both sides converge regardless of who initiated.
+    #[tokio::test]
+    async fn f_reset_resyncs_conn_and_replies() {
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a_addr = sock_a.local_addr().unwrap();
+        let key = [7u8; 32];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+        let mut conns = HashMap::new();
+        let mut c = new_conn("peer-a".into(), a_addr, Instant::now());
+        c.punched = true;
+        c.recv_next = 400;
+        c.my_seq = 10;
+        conns.insert(a_addr, c);
+
+        sock_a
+            .send_to(&build_frame(F_RESET, 0, &[]), sock_b.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = sock_b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, a_addr);
+        handle_frame(
+            &sock_b, &key, "peer-b", &tx, &mut conns, from, &buf[..n], Instant::now(),
+        )
+        .await;
+
+        let c = conns.get(&a_addr).unwrap();
+        assert_eq!(c.recv_next, 1);
+        assert_eq!(c.my_seq, 0);
+        assert!(c.punched);
+
+        // The reply is a bare F_RESET frame.
+        let (n2, rfrom) = sock_a.recv_from(&mut buf).await.unwrap();
+        assert_eq!(rfrom, sock_b.local_addr().unwrap());
+        assert_eq!(n2, 9);
+        assert_eq!(&buf[4], &F_RESET);
+    }
+
+    /// Out-of-order DATA arms the stall clock; in-order delivery disarms it.
+    #[tokio::test]
+    async fn data_stall_bookkeeping_tracks_hold() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer: SocketAddr = "127.0.0.1:65000".parse().unwrap();
+        let key = [9u8; 32];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+
+        let mut conns = HashMap::new();
+        let mut c = new_conn("peer".into(), peer, Instant::now());
+        c.punched = true;
+        conns.insert(peer, c);
+
+        let env = protocol::encode_message(&key, &Message::Seek { from: "p".into(), t: 3.0 });
+        // seq 2 while recv_next=1 → held, stall armed with oldest=2.
+        let frame = build_frame(F_DATA, 2, &env);
+        handle_frame(&sock, &key, "me", &tx, &mut conns, peer, &frame, Instant::now()).await;
+        {
+            let c = conns.get(&peer).unwrap();
+            assert_eq!(c.recv_next, 1);
+            assert!(c.hold.contains_key(&2));
+            assert_eq!(c.stall_oldest, 2);
+            assert!(c.stall_since.is_some());
+        }
+        // seq 1 closes the gap → hold drains, stall disarmed.
+        let frame = build_frame(F_DATA, 1, &env);
+        handle_frame(&sock, &key, "me", &tx, &mut conns, peer, &frame, Instant::now()).await;
+        let c = conns.get(&peer).unwrap();
+        assert_eq!(c.recv_next, 3);
+        assert!(c.hold.is_empty());
+        assert!(c.stall_since.is_none());
+    }
 }
