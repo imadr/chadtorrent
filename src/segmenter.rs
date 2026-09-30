@@ -499,6 +499,9 @@ struct SegmentSplitter {
     seg_start: Option<u64>,
     /// baseMediaDecodeTime of the most recent fragment.
     last_tfdt: u64,
+    /// Presentation time (tfdt + first composition offset) of the most recent
+    /// fragment — matches the browser's buffered timeline, unlike the raw tfdt.
+    last_pts: u64,
     timescale: u32,
     /// The video track's id — tfdt values are per-track in the track's own
     /// timescale, so we must read the video traf's tfdt, not just any.
@@ -517,6 +520,7 @@ impl SegmentSplitter {
             init_done: false,
             seg_start: None,
             last_tfdt: 0,
+            last_pts: 0,
             timescale: 0,
             video_track_id: 0,
             next_n: 1,
@@ -549,8 +553,10 @@ impl SegmentSplitter {
         match &box_.typ {
             b"moof" => {
                 self.pending.extend_from_slice(&box_.raw);
-                if let Some(tfdt) = parse_moof_tfdt(box_.body(), self.video_track_id) {
+                if let Some((tfdt, pts0)) = parse_moof_video_start(box_.body(), self.video_track_id)
+                {
                     self.last_tfdt = tfdt;
+                    self.last_pts = pts0;
                 }
             }
             b"mdat" => {
@@ -558,8 +564,11 @@ impl SegmentSplitter {
                 self.pending.clear();
                 self.current.extend_from_slice(&box_.raw);
                 if self.timescale > 0 {
-                    let start = *self.seg_start.get_or_insert(self.last_tfdt);
-                    let span = (self.last_tfdt.saturating_sub(start)) as f64 / self.timescale as f64;
+                    // Segment boundaries in PRESENTATION time: the manifest's
+                    // `t` must match where the browser actually buffers the
+                    // media, or the pump's coverage check misfires.
+                    let start = *self.seg_start.get_or_insert(self.last_pts);
+                    let span = (self.last_pts.saturating_sub(start)) as f64 / self.timescale as f64;
                     if span >= SEG_TARGET_SECS {
                         self.close_segment().await?;
                     }
@@ -697,8 +706,15 @@ fn child_boxes(body: &[u8]) -> Vec<([u8; 4], &[u8])> {
     out
 }
 
-/// `baseMediaDecodeTime` of `track_id` inside a moof.
-fn parse_moof_tfdt(moof_body: &[u8], track_id: u32) -> Option<u64> {
+/// (tfdt, first-sample composition time) of the video track's first traf in a
+/// moof. The segment's presentation-time start is tfdt + cts0: the raw tfdt is
+/// the first DECODE time, which sits below the first presentation time by the
+/// B-frame reordering delay (x265: ~0.2s). Recording the raw tfdt made the
+/// manifest's segment times systematically earlier than the browser's buffered
+/// timeline, so the client's coverage check (`timeCovered(t + 0.05)`) sat
+/// inside the gap and re-appended the same fragment every poll — Chrome
+/// ignores duplicate fragments, Firefox wedges.
+fn parse_moof_video_start(moof_body: &[u8], track_id: u32) -> Option<(u64, u64)> {
     for (typ, raw) in child_boxes(moof_body) {
         if typ != *b"traf" {
             continue;
@@ -711,33 +727,85 @@ fn parse_moof_tfdt(moof_body: &[u8], track_id: u32) -> Option<u64> {
         };
         let mut this_traf_id: Option<u32> = None;
         let mut tfdt: Option<u64> = None;
+        let mut cts0: Option<i64> = None;
         for (t2, r2) in child_boxes(&raw[hdr..]) {
-            if t2 == *b"tfhd" {
-                let body = &r2[8..];
-                if body.len() >= 8 {
-                    this_traf_id = Some(u32::from_be_bytes(body[4..8].try_into().unwrap()));
+            match t2 {
+                x if x == *b"tfhd" => {
+                    let body = &r2[8..];
+                    if body.len() >= 8 {
+                        this_traf_id = Some(u32::from_be_bytes(body[4..8].try_into().unwrap()));
+                    }
                 }
-            } else if t2 == *b"tfdt" {
-                let body = &r2[8..];
-                if body.len() < 8 {
-                    continue;
-                }
-                let version = body[0];
-                tfdt = Some(if version == 1 {
-                    if body.len() < 12 {
+                x if x == *b"tfdt" => {
+                    let body = &r2[8..];
+                    if body.len() < 8 {
                         continue;
                     }
-                    u64::from_be_bytes(body[4..12].try_into().unwrap())
-                } else {
-                    u32::from_be_bytes(body[4..8].try_into().unwrap()) as u64
-                });
+                    let version = body[0];
+                    tfdt = Some(if version == 1 {
+                        if body.len() < 12 {
+                            continue;
+                        }
+                        u64::from_be_bytes(body[4..12].try_into().unwrap())
+                    } else {
+                        u32::from_be_bytes(body[4..8].try_into().unwrap()) as u64
+                    });
+                }
+                x if x == *b"trun" => {
+                    if cts0.is_none() {
+                        cts0 = parse_trun_first_cts(&r2[8..]);
+                    }
+                }
+                _ => {}
             }
         }
         if this_traf_id == Some(track_id) {
-            return tfdt;
+            let tfdt = tfdt?;
+            let pts = tfdt as i64 + cts0.unwrap_or(0);
+            return Some((tfdt, pts.max(0) as u64));
         }
     }
     None
+}
+
+/// composition_time_offset of the FIRST sample in a trun (0 when the trun
+/// carries no cts field). trun per-sample columns are [duration][size]
+/// [flags][cts]; the first sample's cts is the first entry of the cts column.
+fn parse_trun_first_cts(body: &[u8]) -> Option<i64> {
+    if body.len() < 8 {
+        return None;
+    }
+    let version = body[0] & 1;
+    let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
+    let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    let mut p = 8usize;
+    if flags & 0x000001 != 0 {
+        p += 4; // data_offset
+    }
+    if flags & 0x000004 != 0 {
+        p += 4; // first_sample_flags
+    }
+    if flags & 0x000800 == 0 {
+        return Some(0); // no per-sample cts field
+    }
+    // ffmpeg emits the per-sample table ROW-major (each sample's fields
+    // interleaved, verified against real output), so sample 0's cts sits
+    // right after sample 0's duration/size/flags — no sample-count stride.
+    let mut off = p;
+    for f in [0x000100u32, 0x000200, 0x000400] {
+        if flags & f != 0 {
+            off += 4;
+        }
+    }
+    if off + 4 > body.len() {
+        return None;
+    }
+    let raw = u32::from_be_bytes(body[off..off + 4].try_into().unwrap());
+    Some(if version == 1 {
+        raw as i32 as i64
+    } else {
+        raw as i64
+    })
 }
 
 /// (track_id, timescale) of the video track (or the first track) from an
@@ -871,19 +939,38 @@ mod tests {
 
     #[test]
     fn tfdt_parse_by_track() {
-        let mk = |track: u32, t: u32| {
+        let mk = |track: u32, t: u32, cts: i32| {
             let mut tfhd = vec![0u8]; // version 0
             tfhd.extend_from_slice(&[0, 0, 0]); // flags
             tfhd.extend_from_slice(&track.to_be_bytes());
             let mut tfdt = vec![0u8]; // version 0
             tfdt.extend_from_slice(&[0, 0, 0]); // flags
             tfdt.extend_from_slice(&t.to_be_bytes());
-            box_bytes(b"traf", &[box_bytes(b"tfhd", &tfhd), box_bytes(b"tfdt", &tfdt)].concat())
+            // trun v0, flags 0x000A01 (data_offset + size + cts), ROW-major:
+            // sample0 = [size][cts], sample1 = [size][cts]
+            let mut trun = vec![0u8];
+            trun.extend_from_slice(&0x000A01u32.to_be_bytes()[1..]);
+            trun.extend_from_slice(&2u32.to_be_bytes()); // 2 samples
+            trun.extend_from_slice(&100i32.to_be_bytes()); // data_offset
+            trun.extend_from_slice(&50u32.to_be_bytes()); // sample 0 size
+            trun.extend_from_slice(&(cts as i32).to_be_bytes()); // sample 0 cts
+            trun.extend_from_slice(&60u32.to_be_bytes()); // sample 1 size
+            trun.extend_from_slice(&0u32.to_be_bytes()); // sample 1 cts
+            box_bytes(
+                b"traf",
+                &[box_bytes(b"tfhd", &tfhd), box_bytes(b"tfdt", &tfdt), box_bytes(b"trun", &trun)]
+                    .concat(),
+            )
         };
-        let moof = box_bytes(b"moof", &[mk(1, 48000), mk(2, 2600)].concat());
-        assert_eq!(parse_moof_tfdt(&moof[8..], 1), Some(48000));
-        assert_eq!(parse_moof_tfdt(&moof[8..], 2), Some(2600));
-        assert_eq!(parse_moof_tfdt(&moof[8..], 3), None);
+        let moof = box_bytes(
+            b"moof",
+            &[mk(1, 48000, 3344), mk(2, 2600, 0)].concat(),
+        );
+        // segment start = first sample PRESENTATION time (tfdt + cts), not the
+        // raw decode time — the manifest must match the browser's timeline.
+        assert_eq!(parse_moof_video_start(&moof[8..], 1), Some((48000, 51344)));
+        assert_eq!(parse_moof_video_start(&moof[8..], 2), Some((2600, 2600)));
+        assert_eq!(parse_moof_video_start(&moof[8..], 3), None);
     }
 
     #[test]

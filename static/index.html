@@ -1694,6 +1694,7 @@ async function pumpLoop(gen, id) {
     pumpLog.push({ at: Date.now(), stage, n: n || 0 });
     if (pumpLog.length > 14) pumpLog.shift();
   };
+  const recentAppends = new Map(); // n -> last append time (churn guard)
   while (gen === segGen) {
     const anchor = pendSeek != null ? pendSeek : (v.currentTime || 0);
     const want = [];
@@ -1714,7 +1715,22 @@ async function pumpLoop(gen, id) {
       // partially dropped).
       if (t >= anchor + SEG_AHEAD || end <= anchor - 2) continue;
       const cEnd = Math.min(end, anchor + SEG_AHEAD);
-      if (timeCovered(t + 0.05) && timeCovered(cEnd - 0.05)) continue;
+      // Boundary slack: the appended media ends ~0.2s before the successor's
+      // recorded start (the B-frame decode/presentation offset at the cut),
+      // so a plain end-check "fails" forever and re-appends the same fragment
+      // in a tight loop — 250 duplicate appends/s with the spinner hidden on
+      // each, which is precisely the duplicate-append bombardment that wedges
+      // Firefox's MSE. A segment whose start is covered and which was
+      // appended recently is done; the 10s expiry + start-check still
+      // re-fetch it after genuine eviction.
+      if (timeCovered(t + 0.05)) {
+        const last = recentAppends.get(n);
+        if (last && Date.now() - last < 10000) continue;
+        if (timeCovered(cEnd - 0.3)) {
+          recentAppends.set(n, Date.now());
+          continue;
+        }
+      }
       want.push([n, t]);
     }
 
@@ -1732,6 +1748,7 @@ async function pumpLoop(gen, id) {
       } catch (e) { mark('append-error', n); return segFatal(e); }
       appendingSince = 0;
       mark('appended', n);
+      recentAppends.set(n, Date.now());
       appendsTotal++;
       lastAppendAt = Date.now();
       appended = true;
@@ -1764,8 +1781,11 @@ async function pumpLoop(gen, id) {
         const t = pendSeek; pendSeek = null; pendSeekAt = 0;
         try { v.currentTime = t; } catch (e) {}
       }
-      // Never clear the spinner while the seek target still has no data.
-      if (pendSeek == null) hideBuf();
+      // Never clear the spinner while the seek target still has no data —
+      // and never while the element is starving (a duplicate-append burst
+      // must not hide the buffering overlay, the 400ms sync loop re-asserts
+      // it, but don't fight it in the first place).
+      if (pendSeek == null && v.readyState >= 3) hideBuf();
       if (firstPlay) { firstPlay = false; if (v.paused && !partyHoldPlay) v.play().catch(() => {}); }
       continue;
     }
@@ -2091,6 +2111,74 @@ v.addEventListener('playing', () => {
   }
   hideBuf();
 });
+
+/* Authoritative overlay sync: the hide paths above (canplay/playing/pump
+ * append) can fire while the playhead still has nothing to play — Firefox
+ * emits canplay without usable future data after buffer eviction, and a
+ * decoder wedge freezes with the spinner long gone. Re-assert the truth a
+ * few times a second instead of trusting event order: the generic
+ * 'Buffering…' overlay is visible exactly when we want to play but the
+ * playhead has no data. Explicit overlays (errors, party waits) untouched. */
+let wedgeSince = 0, wedgeLastT = -1, wedgeSkips = [];
+setInterval(() => {
+  if ($('player-modal').hidden) { wedgeSince = 0; wedgeLastT = -1; return; }
+  const b = $('buf'), span = b.querySelector('span');
+  const generic = !b.hidden && span.textContent === 'Buffering…';
+  const starving = pendSeek != null || (!v.paused && segSb && v.readyState < 3);
+  if (starving) {
+    if (b.hidden || generic) showBufProgress();
+  } else if (generic) {
+    hideBuf();
+  }
+  // Decoder wedge: we want to play, data IS covered at the playhead, and the
+  // clock hasn't moved for 4s — no event will come. First rebuild the session
+  // at the playhead; if it wedges again near the same spot, skip forward to
+  // the next segment start (a decoder that chokes on specific frames never
+  // un-wedges by itself, and skipping beats a permanent freeze).
+  if (!v.paused && pendSeek == null && segSb && !v.ended
+      && timeCovered((v.currentTime || 0) + 0.25)) {
+    const t = v.currentTime || 0;
+    if (Math.abs(t - wedgeLastT) < 0.01) {
+      if (!wedgeSince) wedgeSince = Date.now();
+      else if (Date.now() - wedgeSince > 4000) {
+        wedgeSince = 0;
+        wedgeLastT = -1;
+        wedgeSkips = wedgeSkips.filter(w => Date.now() - w.at < 60000);
+        const recent = wedgeSkips.find(w => Math.abs(w.t - t) < 5);
+        if (recent) {
+          const next = nextSegStart(t);
+          if (next != null) {
+            console.warn('[ct] decoder wedge persists at', t, '— skipping to segment at', next);
+            wedgeSkips.push({ t: next, at: Date.now() });
+            seekTo(next + 0.25);
+            return;
+          }
+        } else {
+          wedgeSkips.push({ t, at: Date.now() });
+          console.warn('[ct] decoder wedge: data covered but stalled at', t, '— rebuilding session');
+          bufDump('wedge');
+          recoverSession();
+          return;
+        }
+      }
+    } else {
+      wedgeSince = 0;
+    }
+    wedgeLastT = t;
+  } else {
+    wedgeSince = 0;
+    wedgeLastT = -1;
+  }
+}, 400);
+
+function nextSegStart(t) {
+  if (!segInfo) return null;
+  let best = null;
+  for (const [, st] of segInfo.segs) {
+    if (st > t + 0.5 && (best === null || st < best)) best = st;
+  }
+  return best;
+}
 v.addEventListener('loadedmetadata', () => {
   if (v.duration && isFinite(v.duration) && (!fullDur || v.duration > fullDur)) fullDur = v.duration;
 });
