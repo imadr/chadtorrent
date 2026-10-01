@@ -1451,11 +1451,20 @@ async function doSearch(q) {
  * with progress shown, never a dead session). */
 const SEG_KEEP_BEHIND = 30;   // seconds of played media to keep buffered
 const SEG_AHEAD = 60;         // seconds to keep buffered ahead of the playhead
+const SEG_GAP = 5;            // max seconds between a segment start and the buffered end (Firefox)
 let segAbort = null, segMs = null, segBlobUrl = null, segSb = null, segGen = 0;
 let segInfo = null;           // { mime, done, segs: Map(n -> t) }
 let segEosDone = false;
 let appendsTotal = 0;
 let resumeAt = 0;
+/* Firefox's MSE only accepts a strictly contiguous chain from the stream head.
+ * Measured on Firefox 156 with an HEVC stream: a gap append, a second coded
+ * frame group and a first append at a shifted timestampOffset are ALL silently
+ * discarded (updateend fires, buffered stays empty, no error), while appending
+ * segments 1..N in order is perfect. Chrome accepts discontinuous appends, so
+ * on Firefox the pump builds one ordered chain and a seek outside the buffer
+ * rebuilds the session. */
+const FF_CHAIN = /firefox/i.test(navigator.userAgent);
 // Uncovered seek target we must restore after the data lands. Browsers clamp
 // currentTime writes to the seekable range; when the manifest had no duration
 // (Infinity until endOfStream) the seekable range ends at the buffered edge,
@@ -1670,21 +1679,34 @@ function timeCovered(t) {
  * Capped at 3 attempts per minute; past that we stop trying and leave the
  * diagnostics in the console. */
 let recoveries = [];
-async function recoverSession() {
+let seekRebuilds = [];
+async function recoverSession(at) {
   const now = Date.now();
-  recoveries = recoveries.filter(r => now - r < 60000);
-  if (recoveries.length >= 3) {
-    console.error('[ct] recovery attempted 3x in the last minute — giving up (see [ct] dumps above)');
-    return;
+  if (at != null) {
+    // Firefox back-seek rebuild: user intent, not a crash loop — own (looser)
+    // cap so normal seeking never hits the crash-recovery limit.
+    seekRebuilds = seekRebuilds.filter(r => now - r < 60000);
+    if (seekRebuilds.length >= 10) {
+      console.error('[ct] seek rebuild 10x in the last minute — giving up');
+      return;
+    }
+    seekRebuilds.push(now);
+  } else {
+    recoveries = recoveries.filter(r => now - r < 60000);
+    if (recoveries.length >= 3) {
+      console.error('[ct] recovery attempted 3x in the last minute — giving up (see [ct] dumps above)');
+      return;
+    }
+    recoveries.push(now);
   }
-  recoveries.push(now);
-  const t = v.currentTime || 0;
+  const t = at != null ? at : (v.currentTime || 0);
   showBuf('Recovering…');
   segGen++;                 // invalidate old loops
   teardownSeg();
   resumeAt = t;
   await startSegSession();
 }
+function recoverSessionAt(t) { recoverSession(t); }
 
 async function pumpLoop(gen, id) {
   let firstPlay = true;
@@ -1695,6 +1717,7 @@ async function pumpLoop(gen, id) {
     if (pumpLog.length > 14) pumpLog.shift();
   };
   const recentAppends = new Map(); // n -> last append time (churn guard)
+  let ffStallSeg = 0, ffStall = 0; // consecutive appends the browser dropped
   while (gen === segGen) {
     const anchor = pendSeek != null ? pendSeek : (v.currentTime || 0);
     const want = [];
@@ -1710,6 +1733,24 @@ async function pumpLoop(gen, id) {
       const end = i + 1 < arr.length
         ? arr[i + 1][1]
         : (segInfo.done ? (fullDur || t + 60) : t + 60);
+      if (FF_CHAIN) {
+        // One segment per pass, in stream order, and ONLY to extend the front.
+        // Firefox rejects a fragment that does not continue the buffered end,
+        // and one that OVERLAPS the buffer replaces the overlap instead of
+        // merging (measured: an 80s chain collapsed to 3s). So anything at or
+        // before the buffered end is either present or unreachable, and asking
+        // for it again is always wrong. A hole behind the front can only be
+        // filled by a session rebuild — see the back-seek in seekTo.
+        if (t >= anchor + SEG_AHEAD) break;
+        const fb = segSb ? segSb.buffered : null;
+        if (fb && fb.length) {
+          const fe = fb.end(fb.length - 1);
+          if (t <= fe + 0.05) continue;        // already buffered (or evicted)
+          if (t > fe + SEG_GAP) break;         // a hole we cannot bridge
+        }
+        want.push([n, t]);
+        break;
+      }
       // A segment is wanted when it OVERLAPS the playhead window AND the
       // SourceBuffer does not actually cover it (evicted / never appended /
       // partially dropped).
@@ -1735,7 +1776,7 @@ async function pumpLoop(gen, id) {
     }
 
     let appended = false;
-    for (const [n] of want) {
+    for (const [n, t] of want) {
       if (gen !== segGen) return;
       mark('fetching', n);
       const buf = await fetchSegBuf(id, 'seg/' + n);
@@ -1752,13 +1793,26 @@ async function pumpLoop(gen, id) {
       appendsTotal++;
       lastAppendAt = Date.now();
       appended = true;
+      // The append resolved but the segment's start is still not buffered =>
+      // the browser dropped the fragment. Re-requesting it in a tight loop is
+      // exactly the duplicate-append bombardment that wedges Firefox's MSE, so
+      // count the misses and back off instead of spinning.
+      if (FF_CHAIN) {
+        const missed = segSb && segSb.buffered.length && !timeCovered(t + 0.05);
+        if (missed) {
+          ffStallSeg = ffStallSeg === n ? ffStallSeg : n;
+          ffStall++;
+          if (ffStall === 5) { console.warn('[ct] segment', n, 'dropped by the browser 5x — see the dump above'); bufDump('append-stalled'); }
+          if (ffStall > 3) await segSleep(500);
+        } else if (ffStall && ffStallSeg === n) { ffStallSeg = 0; ffStall = 0; }
+      }
     }
     if (!appended) {
       mark('idle', 0);
       // starved silently? playhead at the buffered edge, nothing appended for
       // 15s while we should be fetching -> dump context (no spinner logic here,
       // just diagnostics)
-      const be = (() => { try { const b = sb.buffered; return b.length ? b.end(b.length - 1) : 0; } catch (e) { return 0; } })();
+      const be = (() => { try { const b = segSb.buffered; return b.length ? b.end(b.length - 1) : 0; } catch (e) { return 0; } })();
       if (!v.paused && be - v.currentTime < 10 && Date.now() - lastAppendAt > 15000
           && (!bufferingSince || Date.now() - bufferingSince > 15000)) {
         bufferingSince = bufferingSince || Date.now();
@@ -1786,8 +1840,17 @@ async function pumpLoop(gen, id) {
       // must not hide the buffering overlay, the 400ms sync loop re-asserts
       // it, but don't fight it in the first place).
       if (pendSeek == null && v.readyState >= 3) hideBuf();
-      if (firstPlay) { firstPlay = false; if (v.paused && !partyHoldPlay) v.play().catch(() => {}); }
       continue;
+    }
+
+    if (firstPlay && pendSeek == null && v.paused && !partyHoldPlay) {
+      // Start playback once, from either path: with a resume point the chain
+      // can reach its lookahead target before the pending seek resolves, so the
+      // append branch is not the only place this can happen. Keep retrying
+      // until it actually starts — a play() issued before the element has data
+      // can be rejected, and a one-shot attempt leaves a resumed session paused.
+      v.play().catch(() => {});
+      if (!v.paused) firstPlay = false;
     }
 
     await evictBehind();
@@ -1839,6 +1902,13 @@ function evictBehind() {
   return new Promise((res) => {
     const sb = segSb;
     if (!sb || sb.updating) return res();
+    // Firefox keeps the whole stream in ONE coded frame group, so remove()
+    // does not carve a hole — it drops the ENTIRE buffer, and the next append
+    // has to start over from the head (measured: an 80s chain reduced to 3s,
+    // then a non-contiguous re-append storm). Firefox also never evicts on its
+    // own, so its memory is bounded by resetting the session instead — see the
+    // window handling in startSegSession.
+    if (FF_CHAIN) return res();
     try {
       const b = sb.buffered;
       const cut = Math.max(0, (v.currentTime || 0) - SEG_KEEP_BEHIND);
@@ -1853,6 +1923,15 @@ function evictBehind() {
 function seekTo(globalT, partyOrigin) {
   if (fullDur && globalT > fullDur) globalT = fullDur;
   if (globalT < 0) globalT = 0;
+  // Firefox back-seek into evicted territory: the chain can only extend
+  // forward from the buffered end, so a target behind the buffered start can
+  // never be reached — rebuild the session at the target (the fresh session
+  // chains from the stream head up to it).
+  if (FF_CHAIN && segSb && segSb.buffered.length && globalT < segSb.buffered.start(0) - 2) {
+    console.warn('[ct] back-seek to', globalT, 'behind buffered start — rebuilding session');
+    recoverSessionAt(globalT);
+    return;
+  }
   // A party-originated seek lands in an 'seeked' event we must not echo back
   // to the party. Arm the credit on EVERY party seek, even a no-op-looking
   // one: Chrome fires 'seeked' for same-position currentTime writes too
@@ -1871,12 +1950,19 @@ function seekTo(globalT, partyOrigin) {
     pendSeek = null;
     pendSeekAt = 0;
     hideBuf();
+    v.currentTime = globalT;
   } else {
     pendSeek = globalT;
     pendSeekAt = Date.now();
     showBufProgress();
+    // Firefox DISCARDS an append that lands entirely behind the playhead: with
+    // the chain built from the stream head, moving currentTime to an uncovered
+    // resume point first (e.g. 31s in on a fresh session) would drop every
+    // segment until the target is buffered, so the buffer could never grow and
+    // the pump re-appended the same fragment forever. Leave the playhead where
+    // it is and let the pump apply the seek once the target is buffered.
+    if (!FF_CHAIN) v.currentTime = globalT;
   }
-  v.currentTime = globalT;
 }
 
 /* Persist the playback position for the current torrent (per torrent file,
