@@ -2043,7 +2043,7 @@ async function playTorrent(item, file) {
     stopPlayback();
     hideBuf();
     showBuf(e.noWC
-      ? 'This browser cannot play this file: no ' + (e.codec || 'codec') + ' decoder in WebCodecs (try Chrome).'
+      ? 'This browser cannot play this file: no ' + (e.codec || 'codec') + ' decoder in WebCodecs.'
       : 'Playback error: ' + e.message);
     return;
   }
