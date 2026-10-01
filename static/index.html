@@ -203,7 +203,6 @@
   #player-modal[hidden] { display: none; }
   .pwrap { position: relative; width: 100vw; height: 100vh; background: #000; }
   #player { display: block; width: 100vw; height: 100vh; background: #000; pointer-events: none; object-fit: contain; }
-  #playerMSE { display: none; width: 100vw; height: 100vh; background: #000; object-fit: contain; }
   body.cursor-none, body.cursor-none * { cursor: none !important; }
   .buf { position: absolute; left: 0; right: 0; top: 0; bottom: 0; z-index: 5; display: flex; flex-direction: column; gap: 12px;
          align-items: center; justify-content: center; background: rgba(0,0,0,.45); pointer-events: none; }
@@ -377,7 +376,6 @@
 <div class="modal" id="player-modal" hidden>
   <div class="pwrap" id="videowrap">
     <canvas id="player"></canvas>
-    <video id="playerMSE" style="display:none"></video>
     <div class="suboverlay" id="suboverlay" hidden><span></span></div>
     <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span></div>
     <div class="subsync" id="subsync" hidden>
@@ -532,42 +530,29 @@ const $ = (id) => document.getElementById(id);
 const v = new EventTarget();
 {
   const def = (name, get, set) => Object.defineProperty(v, name, { get, set: set || undefined, configurable: true });
-  const inMSE = () => P.mode === 'mse' && pmse;
-  def('currentTime', () => inMSE() ? pmse.currentTime : P.lastT, (t) => {
-    if (inMSE()) { try { pmse.currentTime = +t || 0; } catch (e) {} }
-    else seekTo(+t || 0);
-  });
+  def('currentTime', () => P.lastT, (t) => seekTo(+t || 0));
   def('duration', () => fullDur);
-  def('paused', () => inMSE() ? pmse.paused : P.paused);
-  def('ended', () => inMSE() ? pmse.ended : P.endedFired);
-  def('readyState', () => inMSE() ? pmse.readyState : ((P.id && P.vdec) ? 4 : 0));
+  def('paused', () => P.paused);
+  def('ended', () => P.endedFired);
+  def('readyState', () => (P.id && P.vdec) ? 4 : 0);
   def('networkState', () => 2);
-  def('error', () => inMSE() ? pmse.error : P.err);
+  def('error', () => P.err);
   def('volume', () => P.vol, (x) => {
     P.vol = Math.min(1, Math.max(0, +x || 0));
-    if (inMSE()) { pmse.volume = P.vol; pmse.muted = P.muted; }
-    else if (P.gain) P.gain.gain.value = P.muted ? 0 : P.vol;
+    if (P.gain) P.gain.gain.value = P.muted ? 0 : P.vol;
     v.dispatchEvent(new Event('volumechange'));
   });
   def('muted', () => P.muted, (b) => {
     P.muted = !!b;
-    if (inMSE()) { pmse.muted = P.muted; }
-    else if (P.gain) P.gain.gain.value = P.muted ? 0 : P.vol;
+    if (P.gain) P.gain.gain.value = P.muted ? 0 : P.vol;
     v.dispatchEvent(new Event('volumechange'));
   });
   def('playbackRate', () => 1, () => {});
   def('seekable', () => ({ length: 1, start: () => 0, end: () => fullDur || 0 }));
-  def('buffered', () => inMSE() ? pmse.buffered : ({ length: 1, start: () => 0, end: () => P.fedUntil || 0 }));
+  def('buffered', () => ({ length: 1, start: () => 0, end: () => P.fedUntil || 0 }));
   def('textTracks', () => []);
-  v.play = () => {
-    if (inMSE()) return pmse.play();
-    playerPlay();
-    return Promise.resolve();
-  };
-  v.pause = () => {
-    if (inMSE()) { pmse.pause(); return; }
-    playerPause();
-  };
+  v.play = () => { playerPlay(); return Promise.resolve(); };
+  v.pause = () => playerPause();
   v.load = () => {};
   v.style = { cssText: '' };   // fullscreen styling writes here; layout comes from CSS
 }
@@ -1488,594 +1473,6 @@ async function doSearch(q) {
   }
 }
 
-/* ---------- MSE fallback ----------
- * Firefox ships no WebCodecs HEVC decoder (VideoDecoder rejects every hvc1/
- * hev1 configuration while MSE plays the same file fine), so when the browser
- * cannot decode the codec directly this engine takes over: MediaSource +
- * SourceBuffer chain playback with all its documented quirks. Everything else
- * runs on the WebCodecs engine below. */
-let pmse = null;   // the real <video> element behind the MSE fallback
-
-function mseModeOn() {
-  P.mode = 'mse';
-  pmse = pmse || $('playerMSE');
-  if (!pmse._bridged) {
-    for (const ty of ['play','pause','ended','seeked','timeupdate','waiting','playing','canplay','stalled','loadedmetadata','volumechange']) {
-      pmse.addEventListener(ty, () => v.dispatchEvent(new Event(ty)));
-    }
-    pmse._bridged = true;
-  }
-  pmse.style.display = 'block';
-  $('player').style.display = 'none';
-}
-
-/* ---------- MSE segment player ----------
- * One pipeline for every item state. The server splits the file (finished or
- * still-downloading, never re-encoded) into fragmented-MP4 segments; the
- * client appends them to a SourceBuffer and lets the <video> element drive
- * everything. Seeking is a plain v.currentTime write: instant when the data
- * is buffered, otherwise the pump fetches the segment containing the target
- * and playback resumes once it lands (live download frontier => real wait
- * with progress shown, never a dead session). */
-const MSE_KEEP_BEHIND = 30;   // seconds of played media to keep buffered
-const MSE_AHEAD = 60;         // seconds to keep buffered ahead of the playhead
-const MSE_GAP = 5;            // max seconds between a segment start and the buffered end (Firefox)
-let segMs = null, segBlobUrl = null, segSb = null;
-let segInfo = null;           // { mime, done, segs: Map(n -> t) }
-let segEosDone = false;
-let appendsTotal = 0;
-/* Firefox's MSE only accepts a strictly contiguous chain from the stream head.
- * Measured on Firefox 156 with an HEVC stream: a gap append, a second coded
- * frame group and a first append at a shifted timestampOffset are ALL silently
- * discarded (updateend fires, buffered stays empty, no error), while appending
- * segments 1..N in order is perfect. Chrome accepts discontinuous appends, so
- * on Firefox the pump builds one ordered chain and a seek outside the buffer
- * rebuilds the session. */
-const FF_CHAIN = /firefox/i.test(navigator.userAgent);
-let appendingSince = 0;
-/* diagnostics: rolling pump trace, dumped to the console ONLY when buffering */
-let pumpLog = [], lastAppendAt = 0;
-function bufDumpMSE(kind) {
-  const ranges = (b) => { const o = []; try { for (let i = 0; i < b.length; i++) o.push([+b.start(i).toFixed(2), +b.end(i).toFixed(2)]); } catch (e) {} return o; };
-  let sbRanges = [], sbErr = null;
-  try { sbRanges = ranges(segSb.buffered); sbErr = segSb && segSb.error ? segSb.error.name : null; } catch (e) {}
-  console.warn('[ct] ' + kind, JSON.parse(JSON.stringify({
-    at: new Date().toISOString(), time: +v.currentTime.toFixed(2), paused: v.paused,
-    readyState: v.readyState, networkState: v.networkState,
-    videoBuffered: ranges(v.buffered), sbBuffered: sbRanges, sbUpdating: segSb && segSb.updating, sbErr,
-    seekable: ranges(v.seekable),
-    msReady: segMs && segMs.readyState,
-    manifest: segInfo && { done: segInfo.done, segments: segInfo.segs.size },
-    appendsTotal,
-    segForCurrentTime: (function () {
-      if (!segInfo) return null;
-      let found = null;
-      for (const [n, t] of segInfo.segs) if (t <= v.currentTime + 0.3 && (!found || n > found.n)) found = { n, t };
-      return found && { n: found.n, t: found.t, appended: timeCovered(found.t + 0.05) };
-    })(),
-    lastAppendAgoMs: lastAppendAt ? Date.now() - lastAppendAt : null,
-    pump: window.__pump,
-    recentPump: pumpLog.slice(-14),
-    activeSub: activeSub,
-    tracks: [...v.textTracks].map(t => ({ label: t.label.slice(0, 30), mode: t.mode })),
-  })));
-}
-
-
-async function startMSE() {
-  const gen = ++segGen;
-  const id = currentId;
-  mseModeOn();
-  segMs = new MediaSource();
-  segBlobUrl = URL.createObjectURL(segMs);
-  segAbort = new AbortController();
-  segEosDone = false;
-  appendsTotal = 0;
-
-  await new Promise((res, rej) => {
-    const timer = setTimeout(() => rej(new Error('MediaSource timed out')), 5000);
-    segMs.addEventListener('sourceopen', () => { clearTimeout(timer); res(); }, { once: true });
-    segMs.addEventListener('error', () => { clearTimeout(timer); rej(new Error('MediaSource failed')); }, { once: true });
-    pmse.src = segBlobUrl;
-  });
-  if (gen !== segGen) return;
-
-  // Manifest: MIME + duration + which segments exist. Poll until the first
-  // segment is cut — for a still-downloading torrent that means waiting for
-  // the head pieces, which is exactly the buffering we want to show.
-  let info = null;
-  for (;;) {
-    if (gen !== segGen) return;
-    try {
-      info = await api('/api/library/' + id + '/stream' + segFileQ());
-    } catch (e) {
-      throw new Error(String(e.message || e).includes('not found') ? 'Item is gone' : 'Server unreachable');
-    }
-    if (info.error) throw new Error(info.error);
-    if (info.state === 'error') throw new Error('Torrent failed to download');
-    // Same mid-recut gate as the WebCodecs engine: a ready item waits for its
-    // fresh cut instead of chaining truncated files.
-    const ready = ((items.find(i => i.id === id) || {}).state === 'ready');
-    if (info.mime && info.segments.length && (info.done || !ready)) break;
-    await segSleep(500);
-  }
-  if (gen !== segGen) return;
-
-  fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
-  segInfo = { mime: info.mime, done: !!info.done, segs: new Map(info.segments.map(s => [s.n, s.t])) };
-
-  // The declared codec must be actually decodable. NEVER fall back to a fake
-  // avc1 SourceBuffer for an hvc1 stream: appending HEVC fragments into an
-  // AVC-declared buffer silently wedges the element at 'Loading…' (Firefox
-  // without HEVC support) or poisons later appends (v.error). Surface it.
-  try {
-    segSb = segMs.addSourceBuffer(segInfo.mime);
-  } catch (e) {
-    return segFatal(new Error('This browser cannot play this file: unsupported codec ' + segInfo.mime + ' — ' + (e.message || e)));
-  }
-
-  // Init segment (ftyp+moov); retry until the segmenter has written it.
-  for (;;) {
-    if (gen !== segGen) return;
-    const init = await fetchSegBuf(id, 'init');
-    if (init) {
-      try { await appendBuf(init); } catch (e) { return segFatal(e); }
-      break;
-    }
-    await segSleep(500);
-  }
-  if (gen !== segGen) return;
-  // Fragmented MP4 has no embedded duration (it stays Infinity until
-  // endOfStream) and Firefox clamps currentTime writes to the seekable range
-  // — so pin the duration from the manifest, or mid-movie seeks silently
-  // snap back to the buffered edge.
-  if (fullDur) { try { segMs.duration = fullDur; } catch (e) {} }
-
-  // Fire-and-forget, but never silently: a rejected pump/poller is a real
-  // playback failure and must surface (an unhandled rejection would stall
-  // invisibly at 'Loading…').
-  manifestPoller(gen, id).catch(e => segFatal(e));
-  pumpLoop(gen, id).catch(e => segFatal(e));
-  // restore the playhead after a session recovery
-  // Restore the saved playhead (or the recovery point). Goes through seekTo
-  // so an undownloaded resume point shows the spinner and pendSeek kicks in.
-  // In a watch party the party position wins: start where everyone is
-  // (anchor), and if the party is paused don't auto-play on data arrival.
-  if (partyPlayerActive() && partyAnchor) {
-    partyHoldPlay = !partyAnchor.playing;
-    if (partyAnchor.t > 0.5) seekTo(partyAnchor.t);
-    resumeAt = 0;
-  } else if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
-  // restore the subtitle choice for this item's new session (applySubTrack
-  // pulls the saved sync offset from storage too); explicit "None" wins.
-  const subPick = subPickStore()[currentId];
-  if (subPick) { activeSub = { id: currentId, name: subPick }; applySubTrack(); }
-  else activeSub = null;
-}
-
-// Debug hook: inspect live session state from the console.
-window.__segMSE = () => ({
-  gen: segGen, segInfo, appendsTotal,
-  sbUpdating: segSb && segSb.updating,
-  sbErr: segSb && segSb.error && segSb.error.name,
-  msReady: segMs && segMs.readyState,
-  vErr: v.error && (v.error.code + ' ' + v.error.message),
-  pump: window.__pump,
-  sb: segSb,
-  vBufLen: v.buffered && v.buffered.length,
-  sbBufLen: segSb && segSb.buffered && segSb.buffered.length,
-  sbBuf: (() => { try { const b = segSb && segSb.buffered; return b && b.length ? [b.start(0), b.end(b.length-1)] : null; } catch (e) { return 'err'; } })(),
-  vPaused: v.paused, vTime: v.currentTime,
-});
-
-async function manifestPoller(gen, id) {
-  while (gen === segGen) {
-    await segSleep(1000);
-    if (gen !== segGen) return;
-    // stuck-append watchdog: setInterval survives background-tab throttling
-    // (unlike the 12s appendBuf timer), so recovery works even for a
-    // backgrounded player
-    if (appendingSince && segSb && segSb.updating && Date.now() - appendingSince > 12000) {
-      console.error('[ct] append stuck', Date.now() - appendingSince, 'ms — rebuilding session at playhead');
-      await recoverSession();
-      return;
-    }
-    let info = null;
-    try {
-      info = await api('/api/library/' + id + '/stream' + segFileQ());
-    } catch (e) { continue; }
-    if (gen !== segGen) return;
-    if (info.error) { segFatal(new Error(info.error)); return; }
-    if (info.duration && isFinite(info.duration) && (!fullDur || info.duration > fullDur)) fullDur = info.duration;
-    if (segInfo) {
-      segInfo.done = !!info.done;
-      for (const s of info.segments) segInfo.segs.set(s.n, s.t);
-    }
-    if (!fullDur && info.duration && isFinite(info.duration)) {
-      fullDur = info.duration;
-      if (segMs) { try { segMs.duration = fullDur; } catch (e) {} }
-    }
-  }
-}
-
-/* Is media time `t` actually covered by the SourceBuffer? The pump trusts
- * ONLY this — browsers (Firefox) may silently evict buffered-ahead data, so
- * "we appended it earlier" means nothing. */
-function timeCovered(t) {
-  try {
-    const b = segSb.buffered;
-    for (let i = 0; i < b.length; i++) {
-      if (t >= b.start(i) - 0.05 && t <= b.end(i) + 0.05) return true;
-    }
-  } catch (e) {}
-  return false;
-}
-
-/* Full session rebuild at the current playhead — used by the poller watchdog
- * when an append never completes (Firefox can wedge SourceBuffer.updating).
- * Capped at 3 attempts per minute; past that we stop trying and leave the
- * diagnostics in the console. */
-let recoveries = [];
-let seekRebuilds = [];
-async function recoverSession(at) {
-  const now = Date.now();
-  if (at != null) {
-    // Firefox back-seek rebuild: user intent, not a crash loop — own (looser)
-    // cap so normal seeking never hits the crash-recovery limit.
-    seekRebuilds = seekRebuilds.filter(r => now - r < 60000);
-    if (seekRebuilds.length >= 10) {
-      console.error('[ct] seek rebuild 10x in the last minute — giving up');
-      return;
-    }
-    seekRebuilds.push(now);
-  } else {
-    recoveries = recoveries.filter(r => now - r < 60000);
-    if (recoveries.length >= 3) {
-      console.error('[ct] recovery attempted 3x in the last minute — giving up (see [ct] dumps above)');
-      return;
-    }
-    recoveries.push(now);
-  }
-  const t = at != null ? at : (v.currentTime || 0);
-  showBuf('Recovering…');
-  segGen++;                 // invalidate old loops
-  try { teardownMSE(); } catch (e) {}
-  resumeAt = t;
-  await startMSE();
-}
-function recoverSessionAt(t) { recoverSession(t); }
-
-async function pumpLoop(gen, id) {
-  let firstPlay = true;
-  window.__pump = { stage: 'start', n: 0, at: Date.now() };
-  const mark = (stage, n) => {
-    window.__pump.stage = stage; window.__pump.n = n || 0; window.__pump.at = Date.now();
-    pumpLog.push({ at: Date.now(), stage, n: n || 0 });
-    if (pumpLog.length > 14) pumpLog.shift();
-  };
-  const recentAppends = new Map(); // n -> last append time (churn guard)
-  let ffStallSeg = 0, ffStall = 0; // consecutive appends the browser dropped
-  while (gen === segGen) {
-    const anchor = pendSeek != null ? pendSeek : (v.currentTime || 0);
-    const want = [];
-    const arr = [...segInfo.segs.entries()].sort((a, b) => a[0] - b[0]);
-    for (let i = 0; i < arr.length; i++) {
-      const [n, t] = arr[i];
-      // The last existing segment's true end is unknown until its successor
-      // is cut. NEVER let it span to fullDur: on a live torrent that phantom
-      // range "covers" any seek target past the frontier, so the pump would
-      // re-append the frontier segment forever (hammering hideBuf and killing
-      // the buffering overlay). Segments are cut at ~10-20s; 60s is a safe
-      // ceiling for the estimate.
-      const end = i + 1 < arr.length
-        ? arr[i + 1][1]
-        : (segInfo.done ? (fullDur || t + 60) : t + 60);
-      if (FF_CHAIN) {
-        // One segment per pass, in stream order, and ONLY to extend the front.
-        // Firefox rejects a fragment that does not continue the buffered end,
-        // and one that OVERLAPS the buffer replaces the overlap instead of
-        // merging (measured: an 80s chain collapsed to 3s). So anything at or
-        // before the buffered end is either present or unreachable, and asking
-        // for it again is always wrong. A hole behind the front can only be
-        // filled by a session rebuild — see the back-seek in seekTo.
-        if (t >= anchor + MSE_AHEAD) break;
-        const fb = segSb ? segSb.buffered : null;
-        if (fb && fb.length) {
-          const fe = fb.end(fb.length - 1);
-          if (t <= fe + 0.05) continue;        // already buffered (or evicted)
-          if (t > fe + MSE_GAP) break;         // a hole we cannot bridge
-        }
-        want.push([n, t]);
-        break;
-      }
-      // A segment is wanted when it OVERLAPS the playhead window AND the
-      // SourceBuffer does not actually cover it (evicted / never appended /
-      // partially dropped).
-      if (t >= anchor + MSE_AHEAD || end <= anchor - 2) continue;
-      const cEnd = Math.min(end, anchor + MSE_AHEAD);
-      // Boundary slack: the appended media ends ~0.2s before the successor's
-      // recorded start (the B-frame decode/presentation offset at the cut),
-      // so a plain end-check "fails" forever and re-appends the same fragment
-      // in a tight loop — 250 duplicate appends/s with the spinner hidden on
-      // each, which is precisely the duplicate-append bombardment that wedges
-      // Firefox's MSE. A segment whose start is covered and which was
-      // appended recently is done; the 10s expiry + start-check still
-      // re-fetch it after genuine eviction.
-      if (timeCovered(t + 0.05)) {
-        const last = recentAppends.get(n);
-        if (last && Date.now() - last < 10000) continue;
-        if (timeCovered(cEnd - 0.3)) {
-          recentAppends.set(n, Date.now());
-          continue;
-        }
-      }
-      want.push([n, t]);
-    }
-
-    let appended = false;
-    for (const [n, t] of want) {
-      if (gen !== segGen) return;
-      mark('fetching', n);
-      const buf = await fetchSegBuf(id, 'seg/' + n);
-      if (gen !== segGen) return;
-      if (buf === null) { mark('404', n); break; } // vanished? treat as frontier, poller refills
-      mark('appending', n);
-      appendingSince = Date.now();
-      try {
-        await appendBuf(buf);
-      } catch (e) { mark('append-error', n); return segFatal(e); }
-      appendingSince = 0;
-      mark('appended', n);
-      recentAppends.set(n, Date.now());
-      appendsTotal++;
-      lastAppendAt = Date.now();
-      appended = true;
-      // The append resolved but the segment's start is still not buffered =>
-      // the browser dropped the fragment. Re-requesting it in a tight loop is
-      // exactly the duplicate-append bombardment that wedges Firefox's MSE, so
-      // count the misses and back off instead of spinning.
-      if (FF_CHAIN) {
-        const missed = segSb && segSb.buffered.length && !timeCovered(t + 0.05);
-        if (missed) {
-          ffStallSeg = ffStallSeg === n ? ffStallSeg : n;
-          ffStall++;
-          if (ffStall === 5) { console.warn('[ct] segment', n, 'dropped by the browser 5x — see the dump above'); bufDumpMSE('append-stalled'); }
-          if (ffStall > 3) await segSleep(500);
-        } else if (ffStall && ffStallSeg === n) { ffStallSeg = 0; ffStall = 0; }
-      }
-    }
-    if (!appended) {
-      mark('idle', 0);
-      // starved silently? playhead at the buffered edge, nothing appended for
-      // 15s while we should be fetching -> dump context (no spinner logic here,
-      // just diagnostics)
-      const be = (() => { try { const b = segSb.buffered; return b.length ? b.end(b.length - 1) : 0; } catch (e) { return 0; } })();
-      if (!v.paused && be - v.currentTime < 10 && Date.now() - lastAppendAt > 15000
-          && (!bufferingSince || Date.now() - bufferingSince > 15000)) {
-        bufferingSince = bufferingSince || Date.now();
-        bufDumpMSE('pump-starved');
-      }
-    }
-
-    if (appended) {
-      // Data is flowing again: never leave the party reporting "buffering"
-      // because a transient starve flag was set. Only the playback-events
-      // recovery path clears it otherwise, and that never fires when the
-      // pump quietly catches up without an actual element stall.
-      if (bufferingSince) {
-        console.warn('[ct] pump recovered after ' + (Date.now() - bufferingSince) + ' ms');
-        bufferingSince = 0;
-      }
-      // Target of a clamped seek now buffered? Re-issue it — the original
-      // currentTime write snapped back to the buffered edge.
-      if (pendSeek != null && timeCovered(pendSeek + 0.05)) {
-        const t = pendSeek; pendSeek = null; pendSeekAt = 0;
-        try { v.currentTime = t; } catch (e) {}
-      }
-      // Never clear the spinner while the seek target still has no data —
-      // and never while the element is starving (a duplicate-append burst
-      // must not hide the buffering overlay, the 400ms sync loop re-asserts
-      // it, but don't fight it in the first place).
-      if (pendSeek == null && v.readyState >= 3) hideBuf();
-      continue;
-    }
-
-    if (firstPlay && pendSeek == null && v.paused && !partyHoldPlay) {
-      // Start playback once, from either path: with a resume point the chain
-      // can reach its lookahead target before the pending seek resolves, so the
-      // append branch is not the only place this can happen. Keep retrying
-      // until it actually starts — a play() issued before the element has data
-      // can be rejected, and a one-shot attempt leaves a resumed session paused.
-      v.play().catch(() => {});
-      if (!v.paused) firstPlay = false;
-    }
-
-    await evictBehind();
-    if (gen !== segGen) return;
-    // End of movie: everything appended => close the stream.
-    if (segInfo.done && !segEosDone && segInfo.segs.size && fullDur &&
-        timeCovered(fullDur - 0.3)) {
-      segEosDone = true;
-      try { if (segMs.readyState === 'open') segMs.endOfStream(); } catch (e) {}
-    }
-    await segSleep(300);
-  }
-}
-
-function appendBuf(data) {
-  return new Promise((resolve, reject) => {
-    const sb = segSb;
-    if (!sb) return reject(new Error('no SourceBuffer'));
-    const arm = () => {
-      const onEnd = () => { cleanup(); resolve(); };
-      const onErr = () => {
-        cleanup();
-        const err = sb.error ? (sb.error.name + ': ' + (sb.error.message || '')) : '';
-        reject(new Error('Append failed — your browser likely cannot decode this file. ' + err));
-      };
-      const cleanup = () => { sb.removeEventListener('updateend', onEnd); sb.removeEventListener('error', onErr); };
-      sb.addEventListener('updateend', onEnd);
-      sb.addEventListener('error', onErr);
-      try { sb.appendBuffer(data); } catch (e) { cleanup(); reject(e); }
-    };
-    if (sb.updating) {
-      const onUpd = () => { sb.removeEventListener('updateend', onUpd); arm(); };
-      sb.addEventListener('updateend', onUpd);
-    } else arm();
-  });
-}
-
-function evictBehind() {
-  return new Promise((res) => {
-    const sb = segSb;
-    if (!sb || sb.updating) return res();
-    // Firefox keeps the whole stream in ONE coded frame group, so remove()
-    // does not carve a hole — it drops the ENTIRE buffer, and the next append
-    // has to start over from the head (measured: an 80s chain reduced to 3s,
-    // then a non-contiguous re-append storm). Firefox also never evicts on its
-    // own, so its memory is bounded by resetting the session instead — see the
-    // window handling in startSegSession.
-    if (FF_CHAIN) return res();
-    try {
-      const b = sb.buffered;
-      const cut = Math.max(0, (v.currentTime || 0) - MSE_KEEP_BEHIND);
-      if (!b.length || b.start(0) >= cut) return res();
-      const onEnd = () => { sb.removeEventListener('updateend', onEnd); res(); };
-      sb.addEventListener('updateend', onEnd);
-      sb.remove(b.start(0), cut);
-    } catch (e) { res(); }
-  });
-}
-
-function seekMSE(globalT, partyOrigin) {
-  if (fullDur && globalT > fullDur) globalT = fullDur;
-  if (globalT < 0) globalT = 0;
-  // Firefox back-seek into evicted territory: the chain can only extend
-  // forward from the buffered end, so a target behind the buffered start can
-  // never be reached — rebuild the session at the target (the fresh session
-  // chains from the stream head up to it).
-  if (FF_CHAIN && segSb && segSb.buffered.length && globalT < segSb.buffered.start(0) - 2) {
-    console.warn('[ct] back-seek to', globalT, 'behind buffered start — rebuilding session');
-    recoverSessionAt(globalT);
-    return;
-  }
-  // A party-originated seek lands in an 'seeked' event we must not echo back
-  // to the party. Arm the credit on EVERY party seek, even a no-op-looking
-  // one: Chrome fires 'seeked' for same-position currentTime writes too
-  // (proven live — an unarmed same-position apply ping-ponged between two
-  // members forever). Stale credits self-expire in partyConsume.
-  if (partyOrigin) partyArm('seek');
-  // Target buffered -> native seek, instant. Target NOT buffered (e.g. past
-  // the download frontier) -> show the spinner RIGHT HERE, synchronously.
-  // No browser event ever fires while a seek waits for data (pending seeks
-  // don't emit 'waiting'), so we must not rely on one. The pump clears it
-  // via hideBuf() once the data is appended and playback can continue.
-  // pendSeek remembers the target in case the browser clamps the
-  // currentTime write back to the buffered edge (unpinned duration); the
-  // pump re-issues the seek when the target becomes buffered.
-  if (timeCovered(globalT + 0.05)) {
-    pendSeek = null;
-    pendSeekAt = 0;
-    hideBuf();
-    v.currentTime = globalT;
-  } else {
-    pendSeek = globalT;
-    pendSeekAt = Date.now();
-    showBufProgress();
-    // Firefox DISCARDS an append that lands entirely behind the playhead: with
-    // the chain built from the stream head, moving currentTime to an uncovered
-    // resume point first (e.g. 31s in on a fresh session) would drop every
-    // segment until the target is buffered, so the buffer could never grow and
-    // the pump re-appended the same fragment forever. Leave the playhead where
-    // it is and let the pump apply the seek once the target is buffered.
-    if (!FF_CHAIN) v.currentTime = globalT;
-  }
-}
-
-/* Persist the playback position for the current torrent (per torrent file,
- * not per movie). Realtime-only: called from a throttled timeupdate hook, so
- * whatever the video is showing is always what gets saved. No per-event saves
- * (seek / close / ended) — a hard kill loses at most the current second. */
-function teardownMSE() {
-  P.mode = null;
-  if (pmse) { pmse.style.display = 'none'; }
-  $('player').style.display = 'block';
-  pendSeek = null;
-  if (segAbort) { segAbort.abort(); segAbort = null; }
-  if (segSb) { try { segSb.abort(); } catch (e) {} segSb = null; }
-  if (segBlobUrl) { URL.revokeObjectURL(segBlobUrl); segBlobUrl = null; }
-  segMs = null;
-  segInfo = null;
-  segEosDone = false;
-  if (pmse) {
-    try { pmse.pause(); } catch (e) {}
-    try { pmse.removeAttribute('src'); pmse.load(); } catch (e) {}
-  }
-}
-
-
-let w2Since = 0, w2LastT = -1, w2Skips = [];
-setInterval(() => {
-  if (P.mode !== 'mse') { w2Since = 0; w2LastT = -1; return; }
-  if ($('player-modal').hidden) { w2Since = 0; w2LastT = -1; return; }
-  const b = $('buf'), span = b.querySelector('span');
-  const generic = !b.hidden && span.textContent === 'Buffering…';
-  const starving = pendSeek != null || (!v.paused && segSb && v.readyState < 3);
-  if (starving) {
-    if (b.hidden || generic) showBufProgress();
-  } else if (generic) {
-    hideBuf();
-  }
-  // Decoder wedge: we want to play, data IS covered at the playhead, and the
-  // clock hasn't moved for 4s — no event will come. First rebuild the session
-  // at the playhead; if it wedges again near the same spot, skip forward to
-  // the next segment start (a decoder that chokes on specific frames never
-  // un-wedges by itself, and skipping beats a permanent freeze).
-  if (!v.paused && pendSeek == null && segSb && !v.ended
-      && timeCovered((v.currentTime || 0) + 0.25)) {
-    const t = v.currentTime || 0;
-    if (Math.abs(t - w2LastT) < 0.01) {
-      if (!w2Since) w2Since = Date.now();
-      else if (Date.now() - w2Since > 4000) {
-        w2Since = 0;
-        w2LastT = -1;
-        w2Skips = w2Skips.filter(w => Date.now() - w.at < 60000);
-        const recent = w2Skips.find(w => Math.abs(w.t - t) < 5);
-        if (recent) {
-          const next = nextSegStartMSE(t);
-          if (next != null) {
-            console.warn('[ct] decoder wedge persists at', t, '— skipping to segment at', next);
-            w2Skips.push({ t: next, at: Date.now() });
-            seekTo(next + 0.25);
-            return;
-          }
-        } else {
-          w2Skips.push({ t, at: Date.now() });
-          console.warn('[ct] decoder wedge: data covered but stalled at', t, '— rebuilding session');
-          bufDump('wedge');
-          recoverSession();
-          return;
-        }
-      }
-    } else {
-      w2Since = 0;
-    }
-    w2LastT = t;
-  } else {
-    w2Since = 0;
-    w2LastT = -1;
-  }
-}, 400);
-
-function nextSegStartMSE(t) {
-  if (!segInfo) return null;
-  let best = null;
-  for (const [, st] of segInfo.segs) {
-    if (st > t + 0.5 && (best === null || st < best)) best = st;
-  }
-  return best;
-}
-
 /* ---------- WebCodecs segment player ----------
  * Same server pipeline (ffmpeg -c copy -> fragmented MP4 segments, one path
  * for every item state), new client: the fragments are demuxed in JS and the
@@ -2405,7 +1802,7 @@ function drawTick() {
 /* State machine: runs on a timer (survives background-tab throttling, like the
  * old <video> timeupdate did — parties and playhead saving rely on it). */
 setInterval(() => {
-  if (!P.id || P.mode !== 'wc') return;   // the MSE engine drives these events itself
+  if (!P.id) return;
   P.lastT = mediaNow();
   if (performance.now() - lastTU > 250) {
     lastTU = performance.now();
@@ -2592,13 +1989,11 @@ async function startEngine() {
   }
   P.vcfg = vcfg;
   if (!vcfg) {
-    const err = new Error('This browser cannot decode ' + codecs.v + ' via WebCodecs');
+    const err = new Error('no WebCodecs decoder for ' + codecs.v);
     err.noWC = true;
+    err.codec = codecs.v;
     throw err;
   }
-  P.mode = 'wc';
-  if (pmse) pmse.style.display = 'none';
-  $('player').style.display = 'block';
 
   if (atr) {
     const acfgs = [
@@ -2645,23 +2040,12 @@ async function playTorrent(item, file) {
     await startEngine();
   } catch (e) {
     if (e.name === 'AbortError') return;
-    if (!e.noWC) {
-      hideBuf();
-      showBuf('Playback error: ' + e.message);
-      return;
-    }
-    // No WebCodecs decoder for this codec (Firefox + HEVC) — the browser's own
-    // media pipeline is the only decoder it has. Run the MSE fallback.
-    try { teardownWC(); } catch (e) {}
-    showBuf('Loading…');
-    try {
-      await startMSE();
-    } catch (e2) {
-      if (e2.name === 'AbortError') return;
-      hideBuf();
-      showBuf('Playback error: ' + e2.message);
-      return;
-    }
+    stopPlayback();
+    hideBuf();
+    showBuf(e.noWC
+      ? 'This browser cannot play this file: no ' + (e.codec || 'codec') + ' decoder in WebCodecs (try Chrome).'
+      : 'Playback error: ' + e.message);
+    return;
   }
   if (!P.id) return;
   // Restore the saved playhead (or the party anchor). Goes through seekTo so
@@ -2684,7 +2068,6 @@ async function playTorrent(item, file) {
 function seekTo(globalT, partyOrigin) {
   if (fullDur && globalT > fullDur) globalT = fullDur;
   if (globalT < 0) globalT = 0;
-  if (P.mode === 'mse') return seekMSE(globalT, partyOrigin);
   // A party-originated seek lands in a 'seeked' event we must not echo back
   // to the party (stale credits self-expire in partyConsume).
   if (partyOrigin) partyArm('seek');
@@ -2805,7 +2188,6 @@ function bufDump(kind) {
 function stopPlayback() {
   segGen++;
   teardownWC();
-  teardownMSE();
   if (activeSub) ssSaveDelay(); // persist any un-committed sync offset
   subPanelOpen = false;
   const sp = $('subpanel'); if (sp) sp.classList.remove('open');
@@ -3004,7 +2386,6 @@ v.addEventListener('playing', () => {
  * playhead has no data. Explicit overlays (errors, party waits) untouched. */
 let wedgeSince = 0, wedgeLastT = -1;
 setInterval(() => {
-  if (P.mode !== 'wc') { wedgeSince = 0; wedgeLastT = -1; return; }
   if ($('player-modal').hidden) { wedgeSince = 0; wedgeLastT = -1; return; }
   const b = $('buf'), span = b.querySelector('span');
   const generic = !b.hidden && span.textContent === 'Buffering…';
