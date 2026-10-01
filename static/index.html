@@ -203,6 +203,7 @@
   #player-modal[hidden] { display: none; }
   .pwrap { position: relative; width: 100vw; height: 100vh; background: #000; }
   #player { display: block; width: 100vw; height: 100vh; background: #000; pointer-events: none; object-fit: contain; }
+  #playerMSE { display: none; width: 100vw; height: 100vh; background: #000; object-fit: contain; }
   body.cursor-none, body.cursor-none * { cursor: none !important; }
   .buf { position: absolute; left: 0; right: 0; top: 0; bottom: 0; z-index: 5; display: flex; flex-direction: column; gap: 12px;
          align-items: center; justify-content: center; background: rgba(0,0,0,.45); pointer-events: none; }
@@ -375,7 +376,8 @@
 
 <div class="modal" id="player-modal" hidden>
   <div class="pwrap" id="videowrap">
-    <video id="player"></video>
+    <canvas id="player"></canvas>
+    <video id="playerMSE" style="display:none"></video>
     <div class="suboverlay" id="suboverlay" hidden><span></span></div>
     <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span></div>
     <div class="subsync" id="subsync" hidden>
@@ -523,7 +525,52 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const v = $('player');
+/* Player facade: the whole UI (controls, seek bar, subtitles, parties) talks to
+ * this object exactly like it talked to the old <video> element — same
+ * properties, same methods, same DOM events. Behind it sits the WebCodecs
+ * engine (see the player section further down). */
+const v = new EventTarget();
+{
+  const def = (name, get, set) => Object.defineProperty(v, name, { get, set: set || undefined, configurable: true });
+  const inMSE = () => P.mode === 'mse' && pmse;
+  def('currentTime', () => inMSE() ? pmse.currentTime : P.lastT, (t) => {
+    if (inMSE()) { try { pmse.currentTime = +t || 0; } catch (e) {} }
+    else seekTo(+t || 0);
+  });
+  def('duration', () => fullDur);
+  def('paused', () => inMSE() ? pmse.paused : P.paused);
+  def('ended', () => inMSE() ? pmse.ended : P.endedFired);
+  def('readyState', () => inMSE() ? pmse.readyState : ((P.id && P.vdec) ? 4 : 0));
+  def('networkState', () => 2);
+  def('error', () => inMSE() ? pmse.error : P.err);
+  def('volume', () => P.vol, (x) => {
+    P.vol = Math.min(1, Math.max(0, +x || 0));
+    if (inMSE()) { pmse.volume = P.vol; pmse.muted = P.muted; }
+    else if (P.gain) P.gain.gain.value = P.muted ? 0 : P.vol;
+    v.dispatchEvent(new Event('volumechange'));
+  });
+  def('muted', () => P.muted, (b) => {
+    P.muted = !!b;
+    if (inMSE()) { pmse.muted = P.muted; }
+    else if (P.gain) P.gain.gain.value = P.muted ? 0 : P.vol;
+    v.dispatchEvent(new Event('volumechange'));
+  });
+  def('playbackRate', () => 1, () => {});
+  def('seekable', () => ({ length: 1, start: () => 0, end: () => fullDur || 0 }));
+  def('buffered', () => inMSE() ? pmse.buffered : ({ length: 1, start: () => 0, end: () => P.fedUntil || 0 }));
+  def('textTracks', () => []);
+  v.play = () => {
+    if (inMSE()) return pmse.play();
+    playerPlay();
+    return Promise.resolve();
+  };
+  v.pause = () => {
+    if (inMSE()) { pmse.pause(); return; }
+    playerPause();
+  };
+  v.load = () => {};
+  v.style = { cssText: '' };   // fullscreen styling writes here; layout comes from CSS
+}
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, dlState = {};
 // Per-torrent file lists for the TV-show UI (episode picker, per-file skip).
@@ -1441,6 +1488,27 @@ async function doSearch(q) {
   }
 }
 
+/* ---------- MSE fallback ----------
+ * Firefox ships no WebCodecs HEVC decoder (VideoDecoder rejects every hvc1/
+ * hev1 configuration while MSE plays the same file fine), so when the browser
+ * cannot decode the codec directly this engine takes over: MediaSource +
+ * SourceBuffer chain playback with all its documented quirks. Everything else
+ * runs on the WebCodecs engine below. */
+let pmse = null;   // the real <video> element behind the MSE fallback
+
+function mseModeOn() {
+  P.mode = 'mse';
+  pmse = pmse || $('playerMSE');
+  if (!pmse._bridged) {
+    for (const ty of ['play','pause','ended','seeked','timeupdate','waiting','playing','canplay','stalled','loadedmetadata','volumechange']) {
+      pmse.addEventListener(ty, () => v.dispatchEvent(new Event(ty)));
+    }
+    pmse._bridged = true;
+  }
+  pmse.style.display = 'block';
+  $('player').style.display = 'none';
+}
+
 /* ---------- MSE segment player ----------
  * One pipeline for every item state. The server splits the file (finished or
  * still-downloading, never re-encoded) into fragmented-MP4 segments; the
@@ -1449,14 +1517,13 @@ async function doSearch(q) {
  * is buffered, otherwise the pump fetches the segment containing the target
  * and playback resumes once it lands (live download frontier => real wait
  * with progress shown, never a dead session). */
-const SEG_KEEP_BEHIND = 30;   // seconds of played media to keep buffered
-const SEG_AHEAD = 60;         // seconds to keep buffered ahead of the playhead
-const SEG_GAP = 5;            // max seconds between a segment start and the buffered end (Firefox)
-let segAbort = null, segMs = null, segBlobUrl = null, segSb = null, segGen = 0;
+const MSE_KEEP_BEHIND = 30;   // seconds of played media to keep buffered
+const MSE_AHEAD = 60;         // seconds to keep buffered ahead of the playhead
+const MSE_GAP = 5;            // max seconds between a segment start and the buffered end (Firefox)
+let segMs = null, segBlobUrl = null, segSb = null;
 let segInfo = null;           // { mime, done, segs: Map(n -> t) }
 let segEosDone = false;
 let appendsTotal = 0;
-let resumeAt = 0;
 /* Firefox's MSE only accepts a strictly contiguous chain from the stream head.
  * Measured on Firefox 156 with an HEVC stream: a gap append, a second coded
  * frame group and a first append at a shifted timestampOffset are ALL silently
@@ -1465,19 +1532,10 @@ let resumeAt = 0;
  * on Firefox the pump builds one ordered chain and a seek outside the buffer
  * rebuilds the session. */
 const FF_CHAIN = /firefox/i.test(navigator.userAgent);
-// Uncovered seek target we must restore after the data lands. Browsers clamp
-// currentTime writes to the seekable range; when the manifest had no duration
-// (Infinity until endOfStream) the seekable range ends at the buffered edge,
-// so a frontier-past seek would silently snap back and be lost.
-let pendSeek = null;
-/* Wall-clock ms when pendSeek was armed — a seek into undownloaded territory
- * is normal for a moment; only a seek STUCK for >2s means "buffering" for the
- * party (a fast seek within cached segments must not pause everyone). */
-let pendSeekAt = 0;
 let appendingSince = 0;
 /* diagnostics: rolling pump trace, dumped to the console ONLY when buffering */
-let pumpLog = [], lastAppendAt = 0, bufferingSince = 0;
-function bufDump(kind) {
+let pumpLog = [], lastAppendAt = 0;
+function bufDumpMSE(kind) {
   const ranges = (b) => { const o = []; try { for (let i = 0; i < b.length; i++) o.push([+b.start(i).toFixed(2), +b.end(i).toFixed(2)]); } catch (e) {} return o; };
   let sbRanges = [], sbErr = null;
   try { sbRanges = ranges(segSb.buffered); sbErr = segSb && segSb.error ? segSb.error.name : null; } catch (e) {}
@@ -1503,35 +1561,11 @@ function bufDump(kind) {
   })));
 }
 
-const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function playTorrent(item, file) {
-  stopPlayback();
-  currentId = item.id;
-  currentFile = file || null;
-  // Resume per torrent FILE (per torrent for the default file).
-  const fl = currentFile ? (fileLists.get(String(item.id)) || []).find(f => f.path === currentFile) : null;
-  resumeAt = Math.max(0, fl ? (fl.playhead || 0) : (item.playhead || 0));
-  if (currentMovie) {
-    let path = movieRoute() + '/' + torrentSlug(item);
-    if (currentFile) path += '/' + fileSlug(currentFile);
-    pushRoute(path);
-  }
-  $('player-modal').hidden = false;
-  $('ctrl').style.display = 'block';
-  showBuf('Loading…');
-  try {
-    await startSegSession();
-  } catch (e) {
-    if (e.name === 'AbortError') return;
-    hideBuf();
-    showBuf('Playback error: ' + e.message);
-  }
-}
-
-async function startSegSession() {
+async function startMSE() {
   const gen = ++segGen;
   const id = currentId;
+  mseModeOn();
   segMs = new MediaSource();
   segBlobUrl = URL.createObjectURL(segMs);
   segAbort = new AbortController();
@@ -1542,7 +1576,7 @@ async function startSegSession() {
     const timer = setTimeout(() => rej(new Error('MediaSource timed out')), 5000);
     segMs.addEventListener('sourceopen', () => { clearTimeout(timer); res(); }, { once: true });
     segMs.addEventListener('error', () => { clearTimeout(timer); rej(new Error('MediaSource failed')); }, { once: true });
-    v.src = segBlobUrl;
+    pmse.src = segBlobUrl;
   });
   if (gen !== segGen) return;
 
@@ -1559,7 +1593,10 @@ async function startSegSession() {
     }
     if (info.error) throw new Error(info.error);
     if (info.state === 'error') throw new Error('Torrent failed to download');
-    if (info.mime && info.segments.length) break;
+    // Same mid-recut gate as the WebCodecs engine: a ready item waits for its
+    // fresh cut instead of chaining truncated files.
+    const ready = ((items.find(i => i.id === id) || {}).state === 'ready');
+    if (info.mime && info.segments.length && (info.done || !ready)) break;
     await segSleep(500);
   }
   if (gen !== segGen) return;
@@ -1617,7 +1654,7 @@ async function startSegSession() {
 }
 
 // Debug hook: inspect live session state from the console.
-window.__seg = () => ({
+window.__segMSE = () => ({
   gen: segGen, segInfo, appendsTotal,
   sbUpdating: segSb && segSb.updating,
   sbErr: segSb && segSb.error && segSb.error.name,
@@ -1702,9 +1739,9 @@ async function recoverSession(at) {
   const t = at != null ? at : (v.currentTime || 0);
   showBuf('Recovering…');
   segGen++;                 // invalidate old loops
-  teardownSeg();
+  try { teardownMSE(); } catch (e) {}
   resumeAt = t;
-  await startSegSession();
+  await startMSE();
 }
 function recoverSessionAt(t) { recoverSession(t); }
 
@@ -1741,12 +1778,12 @@ async function pumpLoop(gen, id) {
         // before the buffered end is either present or unreachable, and asking
         // for it again is always wrong. A hole behind the front can only be
         // filled by a session rebuild — see the back-seek in seekTo.
-        if (t >= anchor + SEG_AHEAD) break;
+        if (t >= anchor + MSE_AHEAD) break;
         const fb = segSb ? segSb.buffered : null;
         if (fb && fb.length) {
           const fe = fb.end(fb.length - 1);
           if (t <= fe + 0.05) continue;        // already buffered (or evicted)
-          if (t > fe + SEG_GAP) break;         // a hole we cannot bridge
+          if (t > fe + MSE_GAP) break;         // a hole we cannot bridge
         }
         want.push([n, t]);
         break;
@@ -1754,8 +1791,8 @@ async function pumpLoop(gen, id) {
       // A segment is wanted when it OVERLAPS the playhead window AND the
       // SourceBuffer does not actually cover it (evicted / never appended /
       // partially dropped).
-      if (t >= anchor + SEG_AHEAD || end <= anchor - 2) continue;
-      const cEnd = Math.min(end, anchor + SEG_AHEAD);
+      if (t >= anchor + MSE_AHEAD || end <= anchor - 2) continue;
+      const cEnd = Math.min(end, anchor + MSE_AHEAD);
       // Boundary slack: the appended media ends ~0.2s before the successor's
       // recorded start (the B-frame decode/presentation offset at the cut),
       // so a plain end-check "fails" forever and re-appends the same fragment
@@ -1802,7 +1839,7 @@ async function pumpLoop(gen, id) {
         if (missed) {
           ffStallSeg = ffStallSeg === n ? ffStallSeg : n;
           ffStall++;
-          if (ffStall === 5) { console.warn('[ct] segment', n, 'dropped by the browser 5x — see the dump above'); bufDump('append-stalled'); }
+          if (ffStall === 5) { console.warn('[ct] segment', n, 'dropped by the browser 5x — see the dump above'); bufDumpMSE('append-stalled'); }
           if (ffStall > 3) await segSleep(500);
         } else if (ffStall && ffStallSeg === n) { ffStallSeg = 0; ffStall = 0; }
       }
@@ -1816,7 +1853,7 @@ async function pumpLoop(gen, id) {
       if (!v.paused && be - v.currentTime < 10 && Date.now() - lastAppendAt > 15000
           && (!bufferingSince || Date.now() - bufferingSince > 15000)) {
         bufferingSince = bufferingSince || Date.now();
-        bufDump('pump-starved');
+        bufDumpMSE('pump-starved');
       }
     }
 
@@ -1865,16 +1902,6 @@ async function pumpLoop(gen, id) {
   }
 }
 
-async function fetchSegBuf(id, name) {
-  const r = await fetch('/mse/' + id + '/' + name + segFileQ(), { signal: segAbort ? segAbort.signal : undefined });
-  if (r.status === 404) return null;
-  if (!r.ok) {
-    console.error('[ct] segment fetch failed:', name, 'HTTP', r.status);
-    throw new Error('Segment fetch failed (' + r.status + ')');
-  }
-  return await r.arrayBuffer();
-}
-
 function appendBuf(data) {
   return new Promise((resolve, reject) => {
     const sb = segSb;
@@ -1911,7 +1938,7 @@ function evictBehind() {
     if (FF_CHAIN) return res();
     try {
       const b = sb.buffered;
-      const cut = Math.max(0, (v.currentTime || 0) - SEG_KEEP_BEHIND);
+      const cut = Math.max(0, (v.currentTime || 0) - MSE_KEEP_BEHIND);
       if (!b.length || b.start(0) >= cut) return res();
       const onEnd = () => { sb.removeEventListener('updateend', onEnd); res(); };
       sb.addEventListener('updateend', onEnd);
@@ -1920,7 +1947,7 @@ function evictBehind() {
   });
 }
 
-function seekTo(globalT, partyOrigin) {
+function seekMSE(globalT, partyOrigin) {
   if (fullDur && globalT > fullDur) globalT = fullDur;
   if (globalT < 0) globalT = 0;
   // Firefox back-seek into evicted territory: the chain can only extend
@@ -1969,6 +1996,742 @@ function seekTo(globalT, partyOrigin) {
  * not per movie). Realtime-only: called from a throttled timeupdate hook, so
  * whatever the video is showing is always what gets saved. No per-event saves
  * (seek / close / ended) — a hard kill loses at most the current second. */
+function teardownMSE() {
+  P.mode = null;
+  if (pmse) { pmse.style.display = 'none'; }
+  $('player').style.display = 'block';
+  pendSeek = null;
+  if (segAbort) { segAbort.abort(); segAbort = null; }
+  if (segSb) { try { segSb.abort(); } catch (e) {} segSb = null; }
+  if (segBlobUrl) { URL.revokeObjectURL(segBlobUrl); segBlobUrl = null; }
+  segMs = null;
+  segInfo = null;
+  segEosDone = false;
+  if (pmse) {
+    try { pmse.pause(); } catch (e) {}
+    try { pmse.removeAttribute('src'); pmse.load(); } catch (e) {}
+  }
+}
+
+
+let w2Since = 0, w2LastT = -1, w2Skips = [];
+setInterval(() => {
+  if (P.mode !== 'mse') { w2Since = 0; w2LastT = -1; return; }
+  if ($('player-modal').hidden) { w2Since = 0; w2LastT = -1; return; }
+  const b = $('buf'), span = b.querySelector('span');
+  const generic = !b.hidden && span.textContent === 'Buffering…';
+  const starving = pendSeek != null || (!v.paused && segSb && v.readyState < 3);
+  if (starving) {
+    if (b.hidden || generic) showBufProgress();
+  } else if (generic) {
+    hideBuf();
+  }
+  // Decoder wedge: we want to play, data IS covered at the playhead, and the
+  // clock hasn't moved for 4s — no event will come. First rebuild the session
+  // at the playhead; if it wedges again near the same spot, skip forward to
+  // the next segment start (a decoder that chokes on specific frames never
+  // un-wedges by itself, and skipping beats a permanent freeze).
+  if (!v.paused && pendSeek == null && segSb && !v.ended
+      && timeCovered((v.currentTime || 0) + 0.25)) {
+    const t = v.currentTime || 0;
+    if (Math.abs(t - w2LastT) < 0.01) {
+      if (!w2Since) w2Since = Date.now();
+      else if (Date.now() - w2Since > 4000) {
+        w2Since = 0;
+        w2LastT = -1;
+        w2Skips = w2Skips.filter(w => Date.now() - w.at < 60000);
+        const recent = w2Skips.find(w => Math.abs(w.t - t) < 5);
+        if (recent) {
+          const next = nextSegStartMSE(t);
+          if (next != null) {
+            console.warn('[ct] decoder wedge persists at', t, '— skipping to segment at', next);
+            w2Skips.push({ t: next, at: Date.now() });
+            seekTo(next + 0.25);
+            return;
+          }
+        } else {
+          w2Skips.push({ t, at: Date.now() });
+          console.warn('[ct] decoder wedge: data covered but stalled at', t, '— rebuilding session');
+          bufDump('wedge');
+          recoverSession();
+          return;
+        }
+      }
+    } else {
+      w2Since = 0;
+    }
+    w2LastT = t;
+  } else {
+    w2Since = 0;
+    w2LastT = -1;
+  }
+}, 400);
+
+function nextSegStartMSE(t) {
+  if (!segInfo) return null;
+  let best = null;
+  for (const [, st] of segInfo.segs) {
+    if (st > t + 0.5 && (best === null || st < best)) best = st;
+  }
+  return best;
+}
+
+/* ---------- WebCodecs segment player ----------
+ * Same server pipeline (ffmpeg -c copy -> fragmented MP4 segments, one path
+ * for every item state), new client: the fragments are demuxed in JS and the
+ * samples go straight to VideoDecoder/AudioDecoder (WebCodecs). Video frames
+ * are painted onto the canvas; audio is scheduled on a WebAudio timeline
+ * which doubles as the master clock. There is NO browser media buffer at all:
+ * no SourceBuffer quota, no keyframe-group eviction rules, no per-browser
+ * append quirks. A seek is just "reset the decoders, fetch the segment that
+ * contains the target, decode from its first sync sample" — instant once the
+ * data exists, a real wait with the spinner while the torrent downloads it. */
+const SEG_AHEAD = 45;         // seconds of media to keep fetched+queued ahead
+const SEG_MAX_VQ = 30;        // decoded video frames held before backpressure
+let segGen = 0;               // session generation; bumped on every reset
+let resumeAt = 0;
+let pendSeek = null, pendSeekAt = 0;  // pending seek target (party buffering rule)
+let bufferingSince = 0;
+let segAbort = null;
+const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const P = {
+  id: null, tracks: null, segs: new Map(), segMaxN: 0, done: false,
+  vdec: null, adec: null,
+  vq: [], aq: [],             // decoded, not yet shown/played
+  chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
+  fetchN: 1, fedUntil: 0, eof: false, endedFired: false, needKey: false,
+  ctx: null, gain: null, nextAt: 0,
+  anchor: null,               // {ctx, media} — media time at the end of the last scheduled audio buffer
+  // (window.__ac/__vc counters are temporary sink diagnostics)
+  paused: true,
+  lastT: 0, flow: 0,          // flow = performance.now() of the last painted frame
+  vol: 1, muted: false, err: null, tickOn: false, canplaySent: false,
+};
+
+/* Master clock. Audio is scheduled ahead on the WebAudio timeline; the
+ * playhead interpolates linearly towards the end of the last scheduled buffer.
+ * Suspending the AudioContext on pause freezes ctx.currentTime and therefore
+ * the playhead, for free. */
+function mediaNow() {
+  if (!P.anchor || !P.ctx) return P.lastT;
+  const behind = P.anchor.ctx - P.ctx.currentTime;
+  return behind <= 0 ? P.anchor.media : Math.max(0, P.anchor.media - behind);
+}
+
+/* ---- minimal ISO-BMFF reader (enough for ffmpeg's fragmented MP4) ---- */
+function mp4Tag(d, o) { return String.fromCharCode(d.getUint8(o), d.getUint8(o + 1), d.getUint8(o + 2), d.getUint8(o + 3)); }
+function* mp4Boxes(d, start, end) {
+  let o = start;
+  while (o + 8 <= end) {
+    let sz = d.getUint32(o), hdr = 8;
+    if (sz === 1) { sz = Number(d.getBigUint64(o + 8)); hdr = 16; }
+    else if (sz === 0) sz = end - o;
+    if (sz < hdr || o + sz > end) break;
+    yield { ty: mp4Tag(d, o + 4), off: o, hdr, size: sz, end: o + sz };
+    o += sz;
+  }
+}
+function mp4Find(d, start, end, ty) { for (const b of mp4Boxes(d, start, end)) if (b.ty === ty) return b; return null; }
+
+/* init.mp4 -> Map(trackId -> {kind, codec4cc, desc, timescale, w, h, rate, ch, trex}) */
+function parseInit(buf) {
+  const d = new DataView(buf);
+  const moov = mp4Find(d, 0, buf.byteLength, 'moov');
+  if (!moov) throw new Error('bad init segment (no moov)');
+  const trex = new Map();
+  for (const b of mp4Boxes(d, moov.off + moov.hdr, moov.end)) {
+    if (b.ty !== 'trex') continue;
+    const bo = b.off + b.hdr;
+    trex.set(d.getUint32(bo + 4), {
+      dur: d.getUint32(bo + 12), size: d.getUint32(bo + 16), flags: d.getUint32(bo + 20),
+    });
+  }
+  const tracks = new Map();
+  for (const trak of mp4Boxes(d, moov.off + moov.hdr, moov.end)) {
+    if (trak.ty !== 'trak') continue;
+    const tkhd = mp4Find(d, trak.off + trak.hdr, trak.end, 'tkhd');
+    const mdia = mp4Find(d, trak.off + trak.hdr, trak.end, 'mdia');
+    if (!mdia) continue;
+    const mdhd = mp4Find(d, mdia.off + mdia.hdr, mdia.end, 'mdhd');
+    const hdlr = mp4Find(d, mdia.off + mdia.hdr, mdia.end, 'hdlr');
+    const minf = mp4Find(d, mdia.off + mdia.hdr, mdia.end, 'minf');
+    const stbl = minf ? mp4Find(d, minf.off + minf.hdr, minf.end, 'stbl') : null;
+    if (!tkhd || !mdhd || !hdlr || !stbl) continue;
+    const kind = mp4Tag(d, hdlr.off + hdlr.hdr + 8);
+    if (kind !== 'vide' && kind !== 'soun') continue;
+    const tId = d.getUint32(tkhd.off + tkhd.hdr + (d.getUint8(tkhd.off + tkhd.hdr) ? 20 : 12));
+    const tsOff = mdhd.off + mdhd.hdr + (d.getUint8(mdhd.off + mdhd.hdr) ? 20 : 12);
+    const timescale = d.getUint32(tsOff);
+    const dimOff = tkhd.off + tkhd.hdr + (d.getUint8(tkhd.off + tkhd.hdr) ? 88 : 76);
+    const tr = {
+      kind: kind === 'vide' ? 'video' : 'audio',
+      id: tId, timescale,
+      w: d.getUint32(dimOff) >>> 16, h: d.getUint32(dimOff + 4) >>> 16,
+      rate: 0, ch: 0, desc: null, codec4cc: '',
+      trex: trex.get(tId) || { dur: 0, size: 0, flags: 0 },
+    };
+    const stsd = mp4Find(d, stbl.off + stbl.hdr, stbl.end, 'stsd');
+    if (stsd) {
+      const e = stsd.off + stsd.hdr + 8;   // first sample entry
+      tr.codec4cc = mp4Tag(d, e + 4);
+      // Children of the sample entry. VisualSampleEntry: hdr 8 + SampleEntry 8
+      // + fixed fields 62 (incl. the 32-byte compressorname) = 86. Audio:
+      // hdr 8 + SampleEntry 8 + channel/rate fields 20 = 36.
+      const co = e + (tr.kind === 'video' ? 86 : 36);
+      if (tr.kind === 'audio') {
+        tr.ch = d.getUint16(e + 24);
+        tr.rate = d.getUint32(e + 32) >>> 16;
+      }
+      for (const c of mp4Boxes(d, co, e + d.getUint32(e))) {
+        if (c.ty === 'hvcC' || c.ty === 'avcC') {
+          tr.desc = new Uint8Array(buf, c.off + 8, c.size - 8).slice();
+        } else if (c.ty === 'esds') {
+          // walk the descriptor tree for the DecSpecificInfo (tag 0x05). It
+          // lives NESTED inside the DecoderConfigDescriptor (0x04), which
+          // itself sits in the ES descriptor (0x03) — descend into those
+          // containers instead of skipping over them.
+          let o = c.off + c.hdr + 4;
+          while (o < c.end) {
+            const tagB = d.getUint8(o); o++;
+            let len = 0, xb;
+            do { xb = d.getUint8(o++); len = (len << 7) | (xb & 0x7f); } while (xb & 0x80);
+            if (tagB === 0x05) { tr.desc = new Uint8Array(buf, o, len).slice(); break; }
+            if (tagB === 0x04) {           // DecoderConfigDescriptor: skip its
+              o += 13;                     // fixed 13B header, then descend
+              continue;
+            }
+            if (tagB === 0x03) {           // ES descriptor: skip ES_ID + flags first
+              const fl = d.getUint8(o + 2);
+              o += 3 + ((fl & 0x80) ? 2 : 0) + ((fl & 0x40) ? 1 : 0) + ((fl & 0x20) ? 2 : 0);
+              continue;
+            }
+            o += len;
+          }
+        }
+      }
+    }
+    tracks.set(tId, tr);
+  }
+  return tracks;
+}
+
+/* one fragmented segment -> Map(trackId -> [{dts, pts, dur, size, key, off}]) */
+function parseSeg(buf, tracks) {
+  const d = new DataView(buf);
+  const out = new Map();
+  for (const top of mp4Boxes(d, 0, buf.byteLength)) {
+    if (top.ty !== 'moof') continue;
+    for (const traf of mp4Boxes(d, top.off + top.hdr, top.end)) {
+      if (traf.ty !== 'traf') continue;
+      let trackId = 0, defDur = 0, defSize = 0, defFlags = 0, baseTime = 0;
+      const runs = [];
+      for (const c of mp4Boxes(d, traf.off + traf.hdr, traf.end)) {
+        const bo = c.off + c.hdr;
+        if (c.ty === 'tfhd') {
+          const f = d.getUint32(bo);
+          trackId = d.getUint32(bo + 4);
+          let o = bo + 8;
+          if (f & 0x01) o += 8;                 // base_data_offset (unused: default-base-is-moof)
+          if (f & 0x02) o += 4;
+          if (f & 0x08) { defDur = d.getUint32(o); o += 4; }
+          if (f & 0x10) { defSize = d.getUint32(o); o += 4; }
+          if (f & 0x20) { defFlags = d.getUint32(o); o += 4; }
+        } else if (c.ty === 'tfdt') {
+          baseTime = d.getUint8(bo) ? Number(d.getBigUint64(bo + 4)) : d.getUint32(bo + 4);
+        } else if (c.ty === 'trun') {
+          const hdr32 = d.getUint32(bo), ver = hdr32 >>> 24, f = hdr32 & 0xffffff;
+          const n = d.getUint32(bo + 4);
+          let o = bo + 8, dataOff = null, firstFlags = null;
+          if (f & 0x001) { dataOff = d.getInt32(o); o += 4; }
+          if (f & 0x004) { firstFlags = d.getUint32(o); o += 4; }
+          const smp = [];
+          for (let i = 0; i < n; i++) {
+            let dur = 0, size = 0, flags = 0, cts = 0;
+            if (f & 0x100) { dur = d.getUint32(o); o += 4; }
+            if (f & 0x200) { size = d.getUint32(o); o += 4; }
+            if (f & 0x400) { flags = d.getUint32(o); o += 4; }
+            if (f & 0x800) { cts = ver ? d.getInt32(o) : d.getUint32(o); o += 4; }
+            smp.push({ dur, size, flags, cts });
+          }
+          runs.push({ dataOff, firstFlags, smp });
+        }
+      }
+      const tr = tracks.get(trackId);
+      if (!tr) continue;
+      const def = tr.trex;
+      let dts = baseTime;
+      const list = [];
+      for (const run of runs) {
+        let pos = run.dataOff != null ? top.off + run.dataOff : -1;
+        for (let i = 0; i < run.smp.length; i++) {
+          const r = run.smp[i];
+          const dur = r.dur || def.dur || 1, size = r.size || def.size;
+          const flags = (i === 0 && run.firstFlags != null) ? run.firstFlags : (r.flags || def.flags);
+          list.push({ dts, pts: dts + r.cts, dur, size, key: (flags & 0x10000) === 0, off: pos });
+          dts += dur;
+          pos += size;
+        }
+      }
+      if (!out.has(trackId)) out.set(trackId, []);
+      out.get(trackId).push(...list);
+    }
+  }
+  return out;
+}
+
+function segToChunks(buf, parsed) {
+  const u8 = new Uint8Array(buf);
+  const res = { V: [], A: [] };
+  for (const [tid, samples] of parsed) {
+    const tr = P.tracks.get(tid);
+    if (!tr) continue;
+    const dst = tr.kind === 'video' ? res.V : res.A;
+    for (const s of samples) {
+      if (s.off < 0 || s.off + s.size > u8.length || !s.size) continue;
+      const ts = Math.round((tr.kind === 'video' ? s.pts : s.dts) * 1e6 / tr.timescale);
+      dst.push({ data: u8.slice(s.off, s.off + s.size), ts, durUs: Math.max(1, Math.round(s.dur * 1e6 / tr.timescale)), key: s.key });
+    }
+  }
+  return res;   // kept in trun (= decode) order on purpose
+}
+
+function parseMime(mime) {
+  const m = /codecs="([^"]+)"/.exec(mime || '');
+  const parts = m ? m[1].split(',') : [];
+  return { v: (parts[0] || '').trim(), a: (parts[1] || '').trim() };
+}
+
+async function fetchSegBuf(id, name) {
+  const r = await fetch('/mse/' + id + '/' + name + segFileQ(), { signal: segAbort ? segAbort.signal : undefined });
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    console.error('[ct] segment fetch failed:', name, 'HTTP', r.status);
+    throw new Error('Segment fetch failed (' + r.status + ')');
+  }
+  return await r.arrayBuffer();
+}
+
+function onDecErr(which) {
+  return (e) => segFatal(new Error('Decoder error (' + which + '): ' + (e.message || e)));
+}
+/* Decoder factories. Every seek closes the old decoders and builds fresh
+ * ones; the output callbacks capture their own decoder, so any output from a
+ * superseded generation is closed instead of queued. (A time-based purge
+ * window cannot work here: a local pipeline decodes the first segments faster
+ * than any safe window, and dropping that audio freezes the clock.) */
+function mkVdec() {
+  const dec = new VideoDecoder({
+    output: (frame) => {
+      if (P.vdec !== dec) { try { frame.close(); } catch (e) {} return; }
+      P.vq.push(frame);
+    },
+    error: (e) => { if (P.vdec === dec) onDecErr('video')(e); },
+  });
+  return dec;
+}
+function mkAdec() {
+  const dec = new AudioDecoder({
+    output: (ad) => {
+      if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
+      P.aq.push(ad);
+    },
+    error: (e) => { if (P.adec === dec) onDecErr('audio')(e); },
+  });
+  return dec;
+}
+
+function audioBufferOf(ad) {
+  try {
+    const n = ad.numberOfFrames, chs = ad.numberOfChannels;
+    const buf = P.ctx.createBuffer(chs, n, ad.sampleRate);
+    for (let p = 0; p < chs; p++) {
+      const f = new Float32Array(n);
+      try { ad.copyTo(f, { planeIndex: p, format: 'f32-planar' }); }
+      catch (e) { ad.copyTo(f, { planeIndex: p }); }
+      buf.copyToChannel(f, p);
+    }
+    ad.close();
+    return buf;
+  } catch (e) { try { ad.close(); } catch (_e) {} return null; }
+}
+
+/* Move decoded audio onto the WebAudio timeline. The schedule position doubles
+ * as the playhead anchor — see mediaNow(). */
+function pumpAudio() {
+  if (!P.ctx || P.ctx.state !== 'running' || !P.adec) return;
+  if (P.nextAt < P.ctx.currentTime) P.nextAt = P.ctx.currentTime + 0.01;
+  while (P.aq.length && P.nextAt < P.ctx.currentTime + 0.6) {
+    const ad = P.aq.shift();
+    const buf = audioBufferOf(ad);
+    if (!buf) continue;
+    const src = P.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(P.gain);
+    src.start(P.nextAt);
+    P.anchor = { ctx: P.nextAt + buf.duration, media: ad.timestamp / 1e6 + buf.duration };
+    P.nextAt += buf.duration;
+  }
+}
+
+function paint(frame) {
+  const cv = $('player');
+  if (cv.width !== frame.displayWidth || cv.height !== frame.displayHeight) {
+    cv.width = frame.displayWidth; cv.height = frame.displayHeight;
+  }
+  cv.getContext('2d').drawImage(frame, 0, 0);
+}
+
+let lastTU = 0, wasWaiting = false;
+/* Render loop: present the newest frame at or before the playhead. rAF only —
+ * drawing stops in background tabs, which is fine (nothing to look at). */
+function drawTick() {
+  if (!P.id) { P.tickOn = false; return; }
+  requestAnimationFrame(drawTick);
+  const t = mediaNow();
+  let draw = null;
+  while (P.vq.length && P.vq[0].timestamp / 1e6 <= t + 0.004) {
+    if (draw) draw.close();
+    draw = P.vq.shift();
+  }
+  if (draw) {
+    paint(draw);
+    draw.close();
+    P.flow = performance.now();
+    if (!P.canplaySent) { P.canplaySent = true; v.dispatchEvent(new Event('canplay')); }
+  }
+  while (P.vq.length && P.vq[0].timestamp / 1e6 < t - 0.6) P.vq.shift().close();
+}
+/* State machine: runs on a timer (survives background-tab throttling, like the
+ * old <video> timeupdate did — parties and playhead saving rely on it). */
+setInterval(() => {
+  if (!P.id || P.mode !== 'wc') return;   // the MSE engine drives these events itself
+  P.lastT = mediaNow();
+  if (performance.now() - lastTU > 250) {
+    lastTU = performance.now();
+    v.dispatchEvent(new Event('timeupdate'));
+  }
+  pumpAudio();
+  const playing = !P.paused && P.ctx && P.ctx.state === 'running';
+  const flowing = playing && P.anchor && P.anchor.ctx > P.ctx.currentTime + 0.02;
+  if (playing && !flowing && !P.eof) {
+    if (!wasWaiting) { wasWaiting = true; v.dispatchEvent(new Event('waiting')); }
+  } else if (wasWaiting) {
+    wasWaiting = false;
+    v.dispatchEvent(new Event('playing'));
+  }
+  // pending seek: resolved once a decoded frame at/after the target exists
+  if (pendSeek != null && P.vq.length && P.vq[0].timestamp / 1e6 >= pendSeek - 0.05) {
+    pendSeek = null; pendSeekAt = 0;
+    v.dispatchEvent(new Event('seeked'));
+  }
+  // end of the stream: manifest complete, everything fed, everything played
+  if (P.eof && !P.endedFired && !P.vq.length && !P.aq.length && P.chunksV.length === 0 && P.chunksA.length === 0
+      && P.anchor && P.anchor.ctx <= P.ctx.currentTime + 0.02) {
+    P.endedFired = true;
+    v.dispatchEvent(new Event('ended'));
+  }
+}, 250);
+
+async function refreshManifest(gen, id) {
+  try {
+    const info = await api('/api/library/' + id + '/stream' + segFileQ());
+    if (gen !== segGen || !info || info.error) return;
+    if (info.duration && isFinite(info.duration) && info.duration > fullDur) fullDur = info.duration;
+    P.done = !!info.done;
+    for (const s of info.segments) if (!P.segs.has(s.n)) P.segs.set(s.n, s.t);
+    if (info.segments.length) P.segMaxN = info.segments[info.segments.length - 1].n;
+  } catch (e) {}
+}
+
+/* Sequential feeder: fetch segment N, demux, queue chunks for the decoders.
+ * Headroom caps keep decoded memory tiny (a couple of MB of frames), and the
+ * lookahead keeps the fetch window SEG_AHEAD ahead of the playhead. */
+async function feedLoop(gen, id) {
+  // Decode audio first (it drives the clock), video when there is headroom,
+  // and FETCH whenever the lookahead needs it — a full video queue must never
+  // block fetching, or the audio runs dry, the clock pins, and the video
+  // queue can never drain again (measured: session freezes ~45s in).
+  while (gen === segGen && P.id === id) {
+    if (P.chunksA.length && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
+      P.adec.decode(P.chunksA.shift());
+      continue;
+    }
+    if (P.chunksV.length && P.vdec && P.vdec.state === 'configured' && P.vdec.decodeQueueSize < 16 && P.vq.length < SEG_MAX_VQ) {
+      P.vdec.decode(P.chunksV.shift());
+      continue;
+    }
+    const t = P.segs.get(P.fetchN);
+    if (t === undefined) {
+      if (P.done) { P.eof = true; return; }
+      await refreshManifest(gen, id);
+      await segSleep(400);
+      continue;
+    }
+    if (t >= mediaNow() + SEG_AHEAD) { await segSleep(200); continue; }
+    const buf = await fetchSegBuf(id, 'seg/' + P.fetchN);
+    if (gen !== segGen || P.id !== id) return;
+    if (!buf) { await refreshManifest(gen, id); await segSleep(400); continue; }
+    const ch = segToChunks(buf, parseSeg(buf, P.tracks));
+    for (const c of ch.V) {
+      if (P.needKey && !c.key) continue;
+      P.needKey = false;
+      P.chunksV.push(new EncodedVideoChunk({ type: c.key ? 'key' : 'delta', timestamp: c.ts, duration: c.durUs, data: c.data }));
+    }
+    for (const c of ch.A) {
+      P.chunksA.push(new EncodedAudioChunk({ type: 'key', timestamp: c.ts, duration: c.durUs, data: c.data }));
+    }
+    const next = P.segs.get(P.fetchN + 1);
+    P.fedUntil = next != null ? next : (P.done && fullDur ? fullDur : t + 60);
+    P.fetchN++;
+  }
+}
+
+function segContaining(t) {
+  let n = 1, best = 1;
+  for (const [k, st] of P.segs) {
+    if (st <= t + 0.01 && k >= best) { best = k; n = k; }
+  }
+  return n;
+}
+
+function playerPlay() {
+  if (!P.id) return;
+  if (P.ctx) { P.ctx.resume().catch(() => {}); }
+  if (P.paused) { P.paused = false; v.dispatchEvent(new Event('play')); }
+}
+function playerPause() {
+  if (P.ctx && P.ctx.state === 'running') P.ctx.suspend();
+  if (!P.paused) { P.paused = true; v.dispatchEvent(new Event('pause')); }
+}
+
+async function startEngine() {
+  const gen = ++segGen;
+  const id = P.id;
+  if (segAbort) segAbort.abort();
+  segAbort = new AbortController();
+
+  // Manifest: codecs + duration + which segments exist. Poll until the first
+  // segment is cut — for a still-downloading torrent that means waiting for
+  // the head pieces, which is exactly the buffering we want to show.
+  let info = null;
+  for (;;) {
+    if (gen !== segGen || P.id !== id) return;
+    try { info = await api('/api/library/' + id + '/stream' + segFileQ()); }
+    catch (e) { throw new Error(String(e.message || e).includes('not found') ? 'Item is gone' : 'Server unreachable'); }
+    if (info.error) throw new Error(info.error);
+    if (info.state === 'error') throw new Error('Torrent failed to download');
+    // A ready item's cache is re-cut on server start; joining mid-recut means
+    // reading init/segments that are being rewritten (truncated chain, dead
+    // session). Wait for the cut to finish; downloading items have no such
+    // moment and use the frontier as always.
+    const ready = ((items.find(i => i.id === id) || {}).state === 'ready');
+    if (info.mime && info.segments.length && (info.done || !ready)) break;
+    await segSleep(500);
+  }
+  if (gen !== segGen || P.id !== id) return;
+  fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
+  P.done = !!info.done;
+  P.segs = new Map(info.segments.map(s => [s.n, s.t]));
+  P.segMaxN = info.segments.length ? info.segments[info.segments.length - 1].n : 0;
+  const codecs = parseMime(info.mime);
+
+  // init segment: sample tables + codec description (hvcC/avcC/esds)
+  let initBuf = null;
+  for (;;) {
+    if (gen !== segGen || P.id !== id) return;
+    initBuf = await fetchSegBuf(id, 'init');
+    if (initBuf) break;
+    await segSleep(500);
+  }
+  if (gen !== segGen || P.id !== id) return;
+  const trks = parseInit(initBuf);
+  P.tracks = trks;
+  const vtr = [...trks.values()].find(t => t.kind === 'video');
+  const atr = [...trks.values()].find(t => t.kind === 'audio');
+  if (!vtr) throw new Error('no video track');
+
+  P.ctx = new (window.AudioContext || window.webkitAudioContext)();
+  P.gain = P.ctx.createGain();
+  P.gain.gain.value = P.muted ? 0 : P.vol;
+  P.gain.connect(P.ctx.destination);
+  P.nextAt = 0;
+
+  // isConfigSupported lies for HEVC on Firefox (hangs / false-negatives) while
+  // decodingInfo says supported — so configure candidates directly and treat a
+  // sync throw or an async error callback as "this combination is not it".
+  const dot = codecs.v.indexOf('.');
+  const base = dot > 0 ? codecs.v.slice(dot) : '';
+  const cands = [];
+  if (vtr.desc) {
+    cands.push({ codec: 'hvc1' + base, description: vtr.desc });
+    cands.push({ codec: 'hev1' + base, description: vtr.desc });
+  }
+  cands.push({ codec: 'hvc1' + base });
+  cands.push({ codec: 'hev1' + base });
+  let vcfg = null;
+  for (const c of cands) {
+    c.optimizeForLatency = true;
+    if (vtr.w && vtr.h) { c.codedWidth = vtr.w; c.codedHeight = vtr.h; }
+    let failed = false;
+    let cerr = () => {};
+    const dec = new VideoDecoder({
+      output: (f) => { if (P.vdec === dec) P.vq.push(f); else { try { f.close(); } catch (e) {} } },
+      error: (e) => cerr(e),
+    });
+    P.vdec = dec;
+    try { dec.configure(c); } catch (e) {}
+    await segSleep(250);   // give an async reject time to surface
+    if (failed || dec.state !== 'configured') {
+      failed = false; cerr = () => {};
+      try { dec.close(); } catch (e) {}
+      continue;
+    }
+    vcfg = c;
+    break;
+  }
+  P.vcfg = vcfg;
+  if (!vcfg) {
+    const err = new Error('This browser cannot decode ' + codecs.v + ' via WebCodecs');
+    err.noWC = true;
+    throw err;
+  }
+  P.mode = 'wc';
+  if (pmse) pmse.style.display = 'none';
+  $('player').style.display = 'block';
+
+  if (atr) {
+    const acfgs = [
+      { codec: codecs.a || 'mp4a.40.2', sampleRate: atr.rate || 48000, numberOfChannels: atr.ch || 2, description: atr.desc },
+      { codec: codecs.a || 'mp4a.40.2', sampleRate: atr.rate || 48000, numberOfChannels: atr.ch || 2 },
+    ];
+    for (const a of acfgs) {
+      const dec = mkAdec();
+      P.adec = dec;
+      try {
+        dec.configure(a);
+        await segSleep(120);
+        if (dec.state === 'configured') { P.acfg = a; break; }
+      } catch (e) {}
+      try { dec.close(); } catch (_e) {}
+      P.adec = null;
+    }
+    if (!P.adec) console.warn('[ct] audio decode unavailable — video only');
+  }
+
+  v.dispatchEvent(new Event('loadedmetadata'));
+  P.canplaySent = false;
+  if (!P.tickOn) { P.tickOn = true; requestAnimationFrame(drawTick); }
+  feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
+}
+
+async function playTorrent(item, file) {
+  stopPlayback();
+  currentId = item.id;
+  currentFile = file || null;
+  // Resume per torrent FILE (per torrent for the default file).
+  const fl = currentFile ? (fileLists.get(String(item.id)) || []).find(f => f.path === currentFile) : null;
+  resumeAt = Math.max(0, fl ? (fl.playhead || 0) : (item.playhead || 0));
+  if (currentMovie) {
+    let path = movieRoute() + '/' + torrentSlug(item);
+    if (currentFile) path += '/' + fileSlug(currentFile);
+    pushRoute(path);
+  }
+  $('player-modal').hidden = false;
+  $('ctrl').style.display = 'block';
+  showBuf('Loading…');
+  P.id = item.id;
+  try {
+    await startEngine();
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    if (!e.noWC) {
+      hideBuf();
+      showBuf('Playback error: ' + e.message);
+      return;
+    }
+    // No WebCodecs decoder for this codec (Firefox + HEVC) — the browser's own
+    // media pipeline is the only decoder it has. Run the MSE fallback.
+    try { teardownWC(); } catch (e) {}
+    showBuf('Loading…');
+    try {
+      await startMSE();
+    } catch (e2) {
+      if (e2.name === 'AbortError') return;
+      hideBuf();
+      showBuf('Playback error: ' + e2.message);
+      return;
+    }
+  }
+  if (!P.id) return;
+  // Restore the saved playhead (or the party anchor). Goes through seekTo so
+  // an undownloaded resume point shows the spinner until the data lands.
+  // In a watch party the party position wins: start where everyone is, and if
+  // the party is paused don't auto-play on data arrival.
+  if (partyPlayerActive() && partyAnchor) {
+    partyHoldPlay = !partyAnchor.playing;
+    if (partyAnchor.t > 0.5) seekTo(partyAnchor.t);
+    resumeAt = 0;
+  } else if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
+  if (!partyHoldPlay) v.play();
+  // restore the subtitle choice for this item (applySubTrack pulls the saved
+  // sync offset from storage too); explicit "None" wins.
+  const subPick = subPickStore()[currentId];
+  if (subPick) { activeSub = { id: currentId, name: subPick }; applySubTrack(); }
+  else activeSub = null;
+}
+
+function seekTo(globalT, partyOrigin) {
+  if (fullDur && globalT > fullDur) globalT = fullDur;
+  if (globalT < 0) globalT = 0;
+  if (P.mode === 'mse') return seekMSE(globalT, partyOrigin);
+  // A party-originated seek lands in a 'seeked' event we must not echo back
+  // to the party (stale credits self-expire in partyConsume).
+  if (partyOrigin) partyArm('seek');
+  if (!P.id) { P.lastT = globalT; return; }
+  const gen = ++segGen;
+  if (segAbort) { segAbort.abort(); }
+  segAbort = new AbortController();
+  P.fetchN = segContaining(globalT);
+  P.needKey = true;                     // decode from the first sync sample
+  P.eof = false; P.endedFired = false;
+  P.chunksV.length = 0; P.chunksA.length = 0;
+  for (const f of P.vq) { try { f.close(); } catch (e) {} }
+  P.vq.length = 0;
+  for (const a of P.aq) { try { a.close(); } catch (e) {} }
+  P.aq.length = 0;
+  P.anchor = null; P.nextAt = 0;
+  P.lastT = globalT;
+  pendSeek = globalT; pendSeekAt = Date.now();
+  // orphan buffers already scheduled on the old gain node (they would keep
+  // playing the pre-seek audio for a fraction of a second)
+  if (P.ctx && P.gain) {
+    try { P.gain.disconnect(); } catch (e) {}
+    P.gain = P.ctx.createGain();
+    P.gain.gain.value = P.muted ? 0 : P.vol;
+    P.gain.connect(P.ctx.destination);
+  }
+  // reset() leaves a decoder 'unconfigured' and re-configuring in place is
+  // flaky across browsers — recreate both decoders fresh instead. Cheap
+  // (hardware decode session re-init is ~ms) and deterministic.
+  try { if (P.vdec) P.vdec.close(); } catch (e) {}
+  P.vdec = mkVdec();
+  if (P.vcfg) { try { P.vdec.configure(P.vcfg); } catch (e) {} }
+  try { if (P.adec) P.adec.close(); } catch (e) {}
+  P.adec = null;
+  if (P.acfg) {
+    P.adec = mkAdec();
+    try { P.adec.configure(P.acfg); } catch (e) {}
+  }
+  showBufProgress();
+  const id = P.id;
+  feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
+}
+
+/* Persist the playback position for the current torrent (per torrent file,
+ * not per movie). Realtime-only: called from a throttled timeupdate hook, so
+ * whatever the video is showing is always what gets saved. No per-event saves
+ * (seek / close / ended) — a hard kill loses at most the current second. */
 function savePlayhead(t) {
   if (currentId == null) return;
   const id = currentId;
@@ -1990,25 +2753,59 @@ function segFatal(e) {
   showBuf('Playback error: ' + (e.message || e));
 }
 
-function teardownSeg() {
-  pendSeek = null;
+function teardownWC() {
+  pendSeek = null; pendSeekAt = 0;
   if (segAbort) { segAbort.abort(); segAbort = null; }
-  if (segSb) { try { segSb.abort(); } catch (e) {} segSb = null; }
-  if (segBlobUrl) { URL.revokeObjectURL(segBlobUrl); segBlobUrl = null; }
-  segMs = null;
-  segInfo = null;
-  segEosDone = false;
-  v.pause();
-  v.removeAttribute('src');
-  v.load();
+  P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
+  P.eof = false; P.endedFired = false; P.needKey = false;
+  P.chunksV.length = 0; P.chunksA.length = 0;
+  for (const f of P.vq) { try { f.close(); } catch (e) {} }
+  P.vq.length = 0;
+  for (const a of P.aq) { try { a.close(); } catch (e) {} }
+  P.aq.length = 0;
+  if (P.vdec) { try { P.vdec.close(); } catch (e) {} P.vdec = null; }
+  if (P.adec) { try { P.adec.close(); } catch (e) {} P.adec = null; }
+  if (P.gain) { try { P.gain.disconnect(); } catch (e) {} P.gain = null; }
+  if (P.ctx) { const c = P.ctx; P.ctx = null; c.close().catch(() => {}); }
+  P.anchor = null; P.nextAt = 0; P.paused = true; P.lastT = 0; P.flow = 0;
+  P.fetchN = 1; P.fedUntil = 0; P.tickOn = false; P.canplaySent = false;
+  wasWaiting = false;
   const ov = $('suboverlay');
   if (ov) { ov.hidden = true; ov.firstElementChild.textContent = ''; }
   subRenderStop();
+  const cv = $('player');
+  if (cv.getContext) { const g = cv.getContext('2d'); if (g) g.clearRect(0, 0, cv.width || 1, cv.height || 1); }
+}
+
+// Debug hook: inspect live engine state from the console.
+window.__seg = () => ({
+  gen: segGen, fetchN: P.fetchN, fedUntil: +P.fedUntil.toFixed(2), done: P.done, eof: P.eof,
+  vq: P.vq.length, aq: P.aq.length, pendV: P.chunksV.length, pendA: P.chunksA.length,
+  vdecQ: P.vdec && P.vdec.decodeQueueSize, adecQ: P.adec && P.adec.decodeQueueSize,
+  vdecState: P.vdec && P.vdec.state, adecState: P.adec && P.adec.state, chunks: [P.chunksV.length, P.chunksA.length],
+  ctx: P.ctx && P.ctx.state, anchor: P.anchor && { ctx: +P.anchor.ctx.toFixed(2), media: +P.anchor.media.toFixed(2) },
+  clock: +mediaNow().toFixed(2), paused: P.paused, lastT: +P.lastT.toFixed(2),
+  flowAgo: P.flow ? performance.now() - P.flow : null, pendSeek,
+});
+
+function bufDump(kind) {
+  console.warn('[ct] ' + kind, JSON.parse(JSON.stringify({
+    at: new Date().toISOString(), time: +P.lastT.toFixed(2), paused: P.paused,
+    clock: +mediaNow().toFixed(2), anchor: P.anchor, flowAgo: P.flow ? performance.now() - P.flow : null,
+    fetchN: P.fetchN, fedUntil: P.fedUntil, done: P.done, eof: P.eof, pendSeek,
+    vq: P.vq.length, aq: P.aq.length, pendV: P.chunksV.length, pendA: P.chunksA.length,
+    vdecQ: P.vdec && P.vdec.decodeQueueSize, adecQ: P.adec && P.adec.decodeQueueSize,
+  vdecState: P.vdec && P.vdec.state, adecState: P.adec && P.adec.state, chunks: [P.chunksV.length, P.chunksA.length],
+    vdecState: P.vdec && P.vdec.state, adecState: P.adec && P.adec.state,
+    ctxState: P.ctx && P.ctx.state,
+    activeSub,
+  })));
 }
 
 function stopPlayback() {
   segGen++;
-  teardownSeg();
+  teardownWC();
+  teardownMSE();
   if (activeSub) ssSaveDelay(); // persist any un-committed sync offset
   subPanelOpen = false;
   const sp = $('subpanel'); if (sp) sp.classList.remove('open');
@@ -2205,51 +3002,32 @@ v.addEventListener('playing', () => {
  * few times a second instead of trusting event order: the generic
  * 'Buffering…' overlay is visible exactly when we want to play but the
  * playhead has no data. Explicit overlays (errors, party waits) untouched. */
-let wedgeSince = 0, wedgeLastT = -1, wedgeSkips = [];
+let wedgeSince = 0, wedgeLastT = -1;
 setInterval(() => {
+  if (P.mode !== 'wc') { wedgeSince = 0; wedgeLastT = -1; return; }
   if ($('player-modal').hidden) { wedgeSince = 0; wedgeLastT = -1; return; }
   const b = $('buf'), span = b.querySelector('span');
   const generic = !b.hidden && span.textContent === 'Buffering…';
-  const starving = pendSeek != null || (!v.paused && segSb && v.readyState < 3);
+  const starving = pendSeek != null || (!P.paused && P.id && (!P.flow || performance.now() - P.flow > 1500));
   if (starving) {
     if (b.hidden || generic) showBufProgress();
   } else if (generic) {
     hideBuf();
   }
-  // Decoder wedge: we want to play, data IS covered at the playhead, and the
-  // clock hasn't moved for 4s — no event will come. First rebuild the session
-  // at the playhead; if it wedges again near the same spot, skip forward to
-  // the next segment start (a decoder that chokes on specific frames never
-  // un-wedges by itself, and skipping beats a permanent freeze).
-  if (!v.paused && pendSeek == null && segSb && !v.ended
-      && timeCovered((v.currentTime || 0) + 0.25)) {
-    const t = v.currentTime || 0;
-    if (Math.abs(t - wedgeLastT) < 0.01) {
+  // Engine wedge: we want to play, a seek is not pending, yet nothing has been
+  // painted for 4s — nudge by re-seeking a hair forward (rebuilds the decode
+  // pipeline). A genuine decoder error surfaces through onDecErr instead.
+  if (!P.paused && P.id && !P.eof && pendSeek == null && P.flow && performance.now() - P.flow > 4000) {
+    const t = P.lastT;
+    if (Math.abs(t - wedgeLastT) < 0.05) {
       if (!wedgeSince) wedgeSince = Date.now();
       else if (Date.now() - wedgeSince > 4000) {
         wedgeSince = 0;
-        wedgeLastT = -1;
-        wedgeSkips = wedgeSkips.filter(w => Date.now() - w.at < 60000);
-        const recent = wedgeSkips.find(w => Math.abs(w.t - t) < 5);
-        if (recent) {
-          const next = nextSegStart(t);
-          if (next != null) {
-            console.warn('[ct] decoder wedge persists at', t, '— skipping to segment at', next);
-            wedgeSkips.push({ t: next, at: Date.now() });
-            seekTo(next + 0.25);
-            return;
-          }
-        } else {
-          wedgeSkips.push({ t, at: Date.now() });
-          console.warn('[ct] decoder wedge: data covered but stalled at', t, '— rebuilding session');
-          bufDump('wedge');
-          recoverSession();
-          return;
-        }
+        console.warn('[ct] engine wedged at', t, '— nudging');
+        bufDump('wedge');
+        seekTo(t + 0.25);
       }
-    } else {
-      wedgeSince = 0;
-    }
+    } else wedgeSince = 0;
     wedgeLastT = t;
   } else {
     wedgeSince = 0;
@@ -2258,9 +3036,8 @@ setInterval(() => {
 }, 400);
 
 function nextSegStart(t) {
-  if (!segInfo) return null;
   let best = null;
-  for (const [, st] of segInfo.segs) {
+  for (const [, st] of P.segs) {
     if (st > t + 0.5 && (best === null || st < best)) best = st;
   }
   return best;
