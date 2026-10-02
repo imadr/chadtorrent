@@ -550,11 +550,40 @@ const v = new EventTarget();
   def('playbackRate', () => 1, () => {});
   def('seekable', () => ({ length: 1, start: () => 0, end: () => fullDur || 0 }));
   def('buffered', () => ({ length: 1, start: () => 0, end: () => P.fedUntil || 0 }));
-  def('textTracks', () => []);
+  def('videoWidth', () => { const c = $('player'); return c ? c.width : 0; });
+  def('videoHeight', () => { const c = $('player'); return c ? c.height : 0; });
+  def('clientWidth', () => { const c = $('player'); return c ? c.clientWidth : 0; });
+  def('clientHeight', () => { const c = $('player'); return c ? c.clientHeight : 0; });
+  def('textTracks', () => (typeof vSubTrack !== 'undefined' && vSubTrack) ? [vSubTrack] : []);
   v.play = () => { playerPlay(); return Promise.resolve(); };
   v.pause = () => playerPause();
   v.load = () => {};
+  // Firefox blocks an AudioContext created outside a user gesture: resume()
+  // called seconds after the click (our session builds asynchronously) is
+  // silently rejected and the context stays suspended — the clock pins and
+  // video freezes on one frame. Any real input counts as a gesture, so
+  // resume on the first one; captures during the initial row click too.
+  // NEVER while paused: pumpAudio only checks ctx.state, so a stray
+  // click/keypress must not silently resume playback under a paused UI
+  // (measured: "pause, then audio comes back by itself" — any pointerdown
+  // was un-suspending the context with P.paused still true).
+  const anyInputResume = () => { if (P.ctx && P.ctx.state === 'suspended' && !P.paused) P.ctx.resume().catch(() => {}); };
+  document.addEventListener('pointerdown', anyInputResume, true);
+  document.addEventListener('keydown', anyInputResume, true);
   v.style = { cssText: '' };   // fullscreen styling writes here; layout comes from CSS
+  // The facade is not a DOM node, but parts of the UI still reach for element
+  // geometry and methods on it: control-visibility on mousemove needs
+  // getBoundingClientRect, the subtitle overlay letterboxes against
+  // clientWidth/Height + videoWidth/Height. Delegate geometry to the real
+  // canvas; appendChild/querySelectorAll park any stray child on a detached
+  // host instead of throwing (nothing renders children of the facade).
+  v.getBoundingClientRect = () => {
+    const c = $('player');
+    return c ? c.getBoundingClientRect() : { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+  };
+  const vhost = document.createElement('div');
+  v.appendChild = (el) => vhost.appendChild(el);
+  v.querySelectorAll = (sel) => vhost.querySelectorAll(sel);
 }
 const wrap = $('videowrap');
 var items = [], currentId = null, seeking = false, currentMovie = null, dlState = {};
@@ -1498,6 +1527,8 @@ const P = {
   vq: [], aq: [],             // decoded, not yet shown/played
   chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
   fetchN: 1, fedUntil: 0, eof: false, endedFired: false, needKey: false,
+  seekFloor: 0,               // after a seek: drop decoded outputs older than this
+  aStepUs: 0,                 // container's per-packet audio duration (clock truth)
   ctx: null, gain: null, nextAt: 0,
   anchor: null,               // {ctx, media} — media time at the end of the last scheduled audio buffer
   // (window.__ac/__vc counters are temporary sink diagnostics)
@@ -1612,11 +1643,16 @@ function parseInit(buf) {
   }
   return tracks;
 }
-
-/* one fragmented segment -> Map(trackId -> [{dts, pts, dur, size, key, off}]) */
+/* one fragmented segment -> Map(trackId -> [{dts, pts, dur, size, key, off}])
+ * ffmpeg's trun often carries NO per-sample durations (and no trex default):
+ * dts then only ticks by 1 per sample, which compresses timestamps to garbage
+ * inside a fragment (only each traf's tfdt base is real). The true implicit
+ * per-sample duration falls out of consecutive trafs of the same track:
+ * next.base - this.base == this.count * dur. So: pass 1 collects traf
+ * records, pass 2 derives each track's implicit duration and emits samples. */
 function parseSeg(buf, tracks) {
   const d = new DataView(buf);
-  const out = new Map();
+  const trafs = [];   // {top, trackId, base, runs, defDur, defSize, defFlags}
   for (const top of mp4Boxes(d, 0, buf.byteLength)) {
     if (top.ty !== 'moof') continue;
     for (const traf of mp4Boxes(d, top.off + top.hdr, top.end)) {
@@ -1654,25 +1690,54 @@ function parseSeg(buf, tracks) {
           runs.push({ dataOff, firstFlags, smp });
         }
       }
-      const tr = tracks.get(trackId);
-      if (!tr) continue;
-      const def = tr.trex;
-      let dts = baseTime;
-      const list = [];
-      for (const run of runs) {
-        let pos = run.dataOff != null ? top.off + run.dataOff : -1;
+      trafs.push({ top, trackId, base: baseTime, runs, defDur, defSize, defFlags });
+    }
+  }
+  const out = new Map();
+  const byTrack = new Map();
+  for (const t of trafs) {
+    if (!tracks.has(t.trackId)) continue;
+    if (!byTrack.has(t.trackId)) byTrack.set(t.trackId, []);
+    byTrack.get(t.trackId).push(t);
+  }
+  for (const [trackId, list] of byTrack) {
+    const tr = tracks.get(trackId);
+    const def = tr.trex;
+    // explicit durations anywhere (per-sample or trex default)?
+    let anyDur = def.dur > 0;
+    if (!anyDur) {
+      outer: for (const t of list) for (const run of t.runs) for (const r of run.smp) if (r.dur > 0) { anyDur = true; break outer; }
+    }
+    let idur = 0;
+    if (!anyDur) {
+      for (let i = 0; i + 1 < list.length; i++) {
+        const n = list[i].runs.reduce((a, r) => a + r.smp.length, 0);
+        if (n > 0 && list[i + 1].base > list[i].base) {
+          const dur = Math.round((list[i + 1].base - list[i].base) / n);
+          if (dur > 0 && (!idur || idur === dur)) idur = dur;
+        }
+      }
+      // single traf / no derivable pair: AAC frame sizes are the only audio
+      // this pipeline carries (1024 LC, 2048 HE per container); video falls
+      // back to 1-tick (its pts comes right from cts anyway).
+      if (!idur) idur = tr.kind === 'audio' ? 2048 : 1;
+    }
+    const samples = [];
+    for (const t of list) {
+      let dts = t.base;
+      for (const run of t.runs) {
+        let pos = run.dataOff != null ? t.top.off + run.dataOff : -1;
         for (let i = 0; i < run.smp.length; i++) {
           const r = run.smp[i];
-          const dur = r.dur || def.dur || 1, size = r.size || def.size;
-          const flags = (i === 0 && run.firstFlags != null) ? run.firstFlags : (r.flags || def.flags);
-          list.push({ dts, pts: dts + r.cts, dur, size, key: (flags & 0x10000) === 0, off: pos });
+          const dur = idur || r.dur || t.defDur || 1, size = r.size || t.defSize;
+          const flags = (i === 0 && run.firstFlags != null) ? run.firstFlags : (r.flags || t.defFlags);
+          samples.push({ dts, pts: dts + r.cts, dur, size, key: (flags & 0x10000) === 0, off: pos });
           dts += dur;
           pos += size;
         }
       }
-      if (!out.has(trackId)) out.set(trackId, []);
-      out.get(trackId).push(...list);
     }
+    out.set(trackId, samples);
   }
   return out;
 }
@@ -1684,10 +1749,21 @@ function segToChunks(buf, parsed) {
     const tr = P.tracks.get(tid);
     if (!tr) continue;
     const dst = tr.kind === 'video' ? res.V : res.A;
+    let prevTs = -1;
     for (const s of samples) {
       if (s.off < 0 || s.off + s.size > u8.length || !s.size) continue;
       const ts = Math.round((tr.kind === 'video' ? s.pts : s.dts) * 1e6 / tr.timescale);
-      dst.push({ data: u8.slice(s.off, s.off + s.size), ts, durUs: Math.max(1, Math.round(s.dur * 1e6 / tr.timescale)), key: s.key });
+      const durUs = Math.max(1, Math.round(s.dur * 1e6 / tr.timescale));
+      if (tr.kind === 'audio') {
+        // Container timing truth: the step between successive packet
+        // timestamps (trun often writes no per-sample durations — the 1-tick
+        // default would make durUs garbage). Used by pumpAudio as the clock's
+        // media step.
+        const step = prevTs >= 0 ? ts - prevTs : durUs;
+        if (step > 1000 && step < 1000000) P.aStepUs = step;
+        prevTs = ts;
+      }
+      dst.push({ data: u8.slice(s.off, s.off + s.size), ts, durUs, key: s.key });
     }
   }
   return res;   // kept in trun (= decode) order on purpose
@@ -1697,6 +1773,41 @@ function parseMime(mime) {
   const m = /codecs="([^"]+)"/.exec(mime || '');
   const parts = m ? m[1].split(',') : [];
   return { v: (parts[0] || '').trim(), a: (parts[1] || '').trim() };
+}
+
+/* Implicit-SBR HE-AAC: the container (and its esds) carries a plain LC
+ * AudioSpecificConfig at the core rate, expecting the decoder to sniff SBR.
+ * A WebCodecs decoder that doesn't sniff it outputs half-rate audio whose
+ * per-packet duration is 2x the container step — timing drift and wrong
+ * pitch. Rewrite the ASC as explicit SBR (AOT 5 + doubled sampling rate, the
+ * LC config verbatim after the 13-bit header) so the decoder outputs the
+ * full-rate stream the container timing assumes. Returns null when the ASC
+ * is not a rewriting candidate (already SBR, escape/non-table rate, PCE...).
+ */
+const ASC_FREQS = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+function ascExplicitSbr(asc) {
+  if (!asc || asc.length < 2) return null;
+  const bits = [];
+  for (const b of asc) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
+  const rd = (n) => { let x = 0; for (let i = 0; i < n && bits.length; i++) x = x * 2 + bits.shift(); return x; };
+  const aot = rd(5);
+  if (aot !== 2 && aot !== 5) return null;          // only LC (implicit) is worth rewriting
+  const fi = rd(4);
+  const rate = fi === 15 ? rd(24) : (ASC_FREQS[fi] || 0);
+  const ch = rd(4);
+  const idx = ASC_FREQS.indexOf(rate), ext = ASC_FREQS.indexOf(rate * 2);
+  if (aot === 5 || !rate || !ch || ch > 6 || idx < 0 || ext < 0) return null;
+  const out = [];
+  const wr = (x, n) => { for (let i = n - 1; i >= 0; i--) out.push((x >> i) & 1); };
+  wr(5, 5);          // audioObjectType = 5 (SBR)
+  wr(idx, 4);        // core (container) rate
+  wr(ch, 4);         // channelConfig
+  wr(ext, 4);        // extensionSamplingFrequencyIndex = 2x rate
+  out.push(...bits); // remainder of the LC config (GA part) verbatim
+  while (out.length % 8) out.push(0);
+  const bytes = new Uint8Array(out.length / 8);
+  for (let i = 0; i < bytes.length; i++) for (let j = 0; j < 8; j++) bytes[i] = bytes[i] * 2 + out[i * 8 + j];
+  return { asc: bytes, outRate: rate * 2 };
 }
 
 async function fetchSegBuf(id, name) {
@@ -1716,11 +1827,21 @@ function onDecErr(which) {
  * ones; the output callbacks capture their own decoder, so any output from a
  * superseded generation is closed instead of queued. (A time-based purge
  * window cannot work here: a local pipeline decodes the first segments faster
- * than any safe window, and dropping that audio freezes the clock.) */
+ * than any safe window, and dropping that audio freezes the clock.)
+ *
+ * The seek floor: after a seek we must still DECODE from the segment's first
+ * keyframe (reference chain), but outputs before the target are useless —
+ * queueing them fills vq/aq with frames the clock will only reach seconds
+ * later, backpressure-throttling the decode to playback speed and keeping the
+ * spinner up for the whole segment tail (measured: seek to 1114.5, clock
+ * re-anchored at the segment start 1106.6, pendSeek unresolved ~8s). Closing
+ * them lets the keyframe→target tail decode at full speed; the first KEPT
+ * output is already at the target. */
 function mkVdec() {
   const dec = new VideoDecoder({
     output: (frame) => {
       if (P.vdec !== dec) { try { frame.close(); } catch (e) {} return; }
+      if (P.seekFloor && frame.timestamp / 1e6 < P.seekFloor) { try { frame.close(); } catch (e) {} return; }
       P.vq.push(frame);
     },
     error: (e) => { if (P.vdec === dec) onDecErr('video')(e); },
@@ -1730,12 +1851,31 @@ function mkVdec() {
 function mkAdec() {
   const dec = new AudioDecoder({
     output: (ad) => {
+      if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
+      if (P.seekFloor && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 < P.seekFloor) { try { ad.close(); } catch (e) {} return; }
       P.aq.push(ad);
     },
-    error: (e) => { if (P.adec === dec) onDecErr('audio')(e); },
+    error: (e) => { if (P.adec === dec) onAudioDecErr(e); },
   });
   return dec;
+}
+/* Some AAC streams decode for a moment and then hit "encoding not supported"
+ * mid-stream (measured: Firefox + a 22kHz HE-AAC stream with implicit SBR
+ * dies ~6 packets in under the description-based LC config, while a
+ * description-less half-rate config decodes the same stream cleanly). On a
+ * runtime audio error, rotate to the next config and resume from the
+ * playhead; exhausting every config stops playback with an error — audio-less
+ * video is never an acceptable outcome. */
+function onAudioDecErr(e) {
+  if (!P.id) return;
+  if (P.acfgs && P.acfgIdx < P.acfgs.length - 1) {
+    P.acfgIdx++;
+    console.warn('[ct] audio decoder failed (' + (e.message || e) + ') — retrying with audio config ' + (P.acfgIdx + 1) + '/' + P.acfgs.length);
+    seekTo(P.lastT);
+    return;
+  }
+  segFatal(new Error('Audio decode failed: ' + (e.message || e)));
 }
 
 function audioBufferOf(ad) {
@@ -1750,23 +1890,40 @@ function audioBufferOf(ad) {
     }
     ad.close();
     return buf;
-  } catch (e) { try { ad.close(); } catch (_e) {} return null; }
+  } catch (e) { (window.__abufErr = window.__abufErr || []).push(String(e.message || e).slice(0, 80) + ' | fmt=' + ad.format + ' sr=' + ad.sampleRate + ' ch=' + ad.numberOfChannels); try { ad.close(); } catch (_e) {} return null; }
 }
 
 /* Move decoded audio onto the WebAudio timeline. The schedule position doubles
- * as the playhead anchor — see mediaNow(). */
+ * as the playhead anchor — see mediaNow(). Wall time advances by each buffer's
+ * real duration (that is what the DAC plays), but MEDIA time advances by the
+ * container's per-packet step: if a decoder config makes buffers shorter or
+ * longer than the container step (implicit-SBR rotations do exactly that),
+ * deriving the anchor from buf.duration would make the clock drift away from
+ * the demuxed timestamps — video and subtitles with it. The container is the
+ * timeline. */
 function pumpAudio() {
   if (!P.ctx || P.ctx.state !== 'running' || !P.adec) return;
+  // Right after a seek, hold the clock until a kept video frame exists.
+  // Audio re-anchors the playhead at the target the moment it is scheduled,
+  // while the video pipeline is still chewing through the keyframe→target
+  // decode tail — the clock then outruns video, every late frame is painted
+  // in a burst or closed unseen, and playback limps behind the audio for
+  // seconds (the "seeks make it laggy again" + desync report). Holding the
+  // schedule costs ≤250ms (pendSeek clears seekFloor once the first kept
+  // frame lands) and audio+video then start at the target together.
+  if (P.seekFloor && !P.vq.length) return;
   if (P.nextAt < P.ctx.currentTime) P.nextAt = P.ctx.currentTime + 0.01;
-  while (P.aq.length && P.nextAt < P.ctx.currentTime + 0.6) {
+  while (P.aq.length && P.nextAt < P.ctx.currentTime + 1.5) {
     const ad = P.aq.shift();
+    const ts = ad.timestamp / 1e6;
+    const step = P.aStepUs ? P.aStepUs / 1e6 : (ad.duration != null && isFinite(ad.duration) ? ad.duration / 1e6 : 0);
     const buf = audioBufferOf(ad);
     if (!buf) continue;
     const src = P.ctx.createBufferSource();
     src.buffer = buf;
     src.connect(P.gain);
     src.start(P.nextAt);
-    P.anchor = { ctx: P.nextAt + buf.duration, media: ad.timestamp / 1e6 + buf.duration };
+    P.anchor = { ctx: P.nextAt + buf.duration, media: ts + (step || buf.duration) };
     P.nextAt += buf.duration;
   }
 }
@@ -1785,6 +1942,7 @@ let lastTU = 0, wasWaiting = false;
 function drawTick() {
   if (!P.id) { P.tickOn = false; return; }
   requestAnimationFrame(drawTick);
+  pumpAudio();   // rAF-driven too: a janky 250ms interval must never starve the schedule
   const t = mediaNow();
   let draw = null;
   while (P.vq.length && P.vq[0].timestamp / 1e6 <= t + 0.004) {
@@ -1793,6 +1951,9 @@ function drawTick() {
   }
   if (draw) {
     paint(draw);
+    // diagnostic ring buffer: last paint times vs playhead (window.__paints)
+    (window.__paints = window.__paints || []).push({ at: Math.round(performance.now()), clock: +t.toFixed(2), fts: +(draw.timestamp / 1e6).toFixed(2) });
+    if (window.__paints.length > 400) window.__paints.splice(0, 100);
     draw.close();
     P.flow = performance.now();
     if (!P.canplaySent) { P.canplaySent = true; v.dispatchEvent(new Event('canplay')); }
@@ -1818,8 +1979,13 @@ setInterval(() => {
     v.dispatchEvent(new Event('playing'));
   }
   // pending seek: resolved once a decoded frame at/after the target exists
-  if (pendSeek != null && P.vq.length && P.vq[0].timestamp / 1e6 >= pendSeek - 0.05) {
-    pendSeek = null; pendSeekAt = 0;
+  // (the seek floor keeps everything older than target-0.35s out of vq, so
+  // the first queued frame qualifies; the audio arm covers streams whose
+  // video decode lags but whose clock already crossed the target)
+  if (pendSeek != null
+      && ((P.vq.length && P.vq[0].timestamp / 1e6 >= pendSeek - 0.4)
+          || (P.anchor && P.anchor.media > pendSeek))) {
+    pendSeek = null; pendSeekAt = 0; P.seekFloor = 0;
     v.dispatchEvent(new Event('seeked'));
   }
   // end of the stream: manifest complete, everything fed, everything played
@@ -1849,13 +2015,15 @@ async function feedLoop(gen, id) {
   // and FETCH whenever the lookahead needs it — a full video queue must never
   // block fetching, or the audio runs dry, the clock pins, and the video
   // queue can never drain again (measured: session freezes ~45s in).
+  // Batches per pass: after a seek the backlog is thousands of chunks and a
+  // one-decode-per-pass loop re-runs every gate check per chunk for nothing.
   while (gen === segGen && P.id === id) {
-    if (P.chunksA.length && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
-      P.adec.decode(P.chunksA.shift());
+    if (P.chunksA.length && P.aq.length < 700 && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
+      for (let i = 0; i < 64 && P.chunksA.length && P.aq.length < 700 && P.adec.decodeQueueSize < 80; i++) P.adec.decode(P.chunksA.shift());
       continue;
     }
-    if (P.chunksV.length && P.vdec && P.vdec.state === 'configured' && P.vdec.decodeQueueSize < 16 && P.vq.length < SEG_MAX_VQ) {
-      P.vdec.decode(P.chunksV.shift());
+    if (P.chunksV.length && P.vdec && P.vdec.state === 'configured' && P.vdec.decodeQueueSize < 32 && P.vq.length < SEG_MAX_VQ) {
+      for (let i = 0; i < 32 && P.chunksV.length && P.vdec.decodeQueueSize < 32 && P.vq.length < SEG_MAX_VQ; i++) P.vdec.decode(P.chunksV.shift());
       continue;
     }
     const t = P.segs.get(P.fetchN);
@@ -1892,9 +2060,26 @@ function segContaining(t) {
   return n;
 }
 
+/* The AudioContext must be born inside a user gesture. Creating it lazily in
+ * startEngine (seconds after the row click, once the manifest and init
+ * segment have been fetched) is outside Firefox's gesture window: resume()
+ * is silently rejected, the clock pins, video freezes on one frame. So the
+ * synchronous part of playTorrent — still inside the click handler — creates
+ * and resumes it, and startEngine reuses whatever survived. */
+function ensureCtx() {
+  if (!P.ctx) {
+    P.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    P.gain = P.ctx.createGain();
+    P.gain.gain.value = P.muted ? 0 : P.vol;
+    P.gain.connect(P.ctx.destination);
+  }
+  if (P.ctx.state === 'suspended') P.ctx.resume().catch(() => {});
+  return P.ctx;
+}
+
 function playerPlay() {
   if (!P.id) return;
-  if (P.ctx) { P.ctx.resume().catch(() => {}); }
+  ensureCtx();
   if (P.paused) { P.paused = false; v.dispatchEvent(new Event('play')); }
 }
 function playerPause() {
@@ -1948,27 +2133,33 @@ async function startEngine() {
   const atr = [...trks.values()].find(t => t.kind === 'audio');
   if (!vtr) throw new Error('no video track');
 
-  P.ctx = new (window.AudioContext || window.webkitAudioContext)();
-  P.gain = P.ctx.createGain();
-  P.gain.gain.value = P.muted ? 0 : P.vol;
-  P.gain.connect(P.ctx.destination);
+  ensureCtx();
   P.nextAt = 0;
 
   // isConfigSupported lies for HEVC on Firefox (hangs / false-negatives) while
   // decodingInfo says supported — so configure candidates directly and treat a
   // sync throw or an async error callback as "this combination is not it".
+  // Candidate codec strings: the manifest MIME plus the actual stsd sample
+  // entry (for HEVC ffmpeg writes hev1 — in-band parameter sets — while the
+  // MIME usually says hvc1, and browsers are picky about the pairing). Each
+  // is tried with and without the codec description; the first configure()
+  // that sticks wins. The declared codec must always be among them, or H.264
+  // files would be probed as bogus hvc1/hev1 strings.
   const dot = codecs.v.indexOf('.');
   const base = dot > 0 ? codecs.v.slice(dot) : '';
+  const codecs2 = new Set([codecs.v]);
+  if (base && /^hvc1|hev1|avc1|avc3/.test(codecs.v)) codecs2.add(vtr.codec4cc + base);
   const cands = [];
-  if (vtr.desc) {
-    cands.push({ codec: 'hvc1' + base, description: vtr.desc });
-    cands.push({ codec: 'hev1' + base, description: vtr.desc });
+  for (const codec of codecs2) {
+    if (vtr.desc) cands.push({ codec, description: vtr.desc });
+    cands.push({ codec });
   }
-  cands.push({ codec: 'hvc1' + base });
-  cands.push({ codec: 'hev1' + base });
   let vcfg = null;
   for (const c of cands) {
-    c.optimizeForLatency = true;
+    // NOTE: no optimizeForLatency — that hint is for WebRTC-style realtime
+    // and disables decode pipelining/reordering; for B-frame-heavy movie
+    // H.264 it cratered real-browser decode throughput to around playback
+    // speed (laggy burst-painted video forever chasing the audio clock).
     if (vtr.w && vtr.h) { c.codedWidth = vtr.w; c.codedHeight = vtr.h; }
     let failed = false;
     let cerr = () => {};
@@ -1996,17 +2187,35 @@ async function startEngine() {
   }
 
   if (atr) {
-    const acfgs = [
-      { codec: codecs.a || 'mp4a.40.2', sampleRate: atr.rate || 48000, numberOfChannels: atr.ch || 2, description: atr.desc },
-      { codec: codecs.a || 'mp4a.40.2', sampleRate: atr.rate || 48000, numberOfChannels: atr.ch || 2 },
-    ];
-    for (const a of acfgs) {
+    const rate = atr.rate || 48000, ch = atr.ch || 2, acodec = codecs.a || 'mp4a.40.2';
+    P.acfgs = [];
+    // HE-AAC v1 declared but a plain LC ASC inside: try the explicit-SBR
+    // rewrite FIRST — it is the only config whose decoded output is the
+    // full-bandwidth stream at the container's per-packet step (see
+    // ascExplicitSbr). The declared sampleRate is the SBR output rate the
+    // ASC now carries (core × 2), which can differ from a naive doubling of
+    // the container's own rate field.
+    const sbr = acodec === 'mp4a.40.5' && atr.desc ? ascExplicitSbr(atr.desc) : null;
+    if (sbr) P.acfgs.push({ codec: acodec, sampleRate: sbr.outRate, numberOfChannels: ch, description: sbr.asc });
+    P.acfgs.push({ codec: acodec, sampleRate: rate, numberOfChannels: ch, description: atr.desc });
+    if (acodec !== 'mp4a.40.5') {
+      P.acfgs.push({ codec: acodec, sampleRate: rate, numberOfChannels: ch });
+    } else {
+      // HE-AAC, no description accepted: some decoders (Firefox) reject the
+      // description-based configs but decode cleanly with a description-less
+      // CORE-rate one. Its decoded buffers last one container step (1024
+      // frames at core rate == 2048 at output rate), so timing stays true —
+      // but only the core band is reconstructed there.
+      P.acfgs.push({ codec: acodec, sampleRate: rate / 2, numberOfChannels: ch });
+    }
+    P.acfgIdx = 0;
+    for (let i = 0; i < P.acfgs.length; i++) {
       const dec = mkAdec();
       P.adec = dec;
       try {
-        dec.configure(a);
+        dec.configure(P.acfgs[i]);
         await segSleep(120);
-        if (dec.state === 'configured') { P.acfg = a; break; }
+        if (dec.state === 'configured') { P.acfgIdx = i; break; }
       } catch (e) {}
       try { dec.close(); } catch (_e) {}
       P.adec = null;
@@ -2022,6 +2231,7 @@ async function startEngine() {
 
 async function playTorrent(item, file) {
   stopPlayback();
+  ensureCtx();   // synchronous, still inside the click gesture (see ensureCtx)
   currentId = item.id;
   currentFile = file || null;
   // Resume per torrent FILE (per torrent for the default file).
@@ -2077,6 +2287,7 @@ function seekTo(globalT, partyOrigin) {
   segAbort = new AbortController();
   P.fetchN = segContaining(globalT);
   P.needKey = true;                     // decode from the first sync sample
+  P.seekFloor = Math.max(0, globalT - 0.35);  // ...but only PRESENT from here on
   P.eof = false; P.endedFired = false;
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }
@@ -2102,9 +2313,10 @@ function seekTo(globalT, partyOrigin) {
   if (P.vcfg) { try { P.vdec.configure(P.vcfg); } catch (e) {} }
   try { if (P.adec) P.adec.close(); } catch (e) {}
   P.adec = null;
-  if (P.acfg) {
+  if (P.acfgs) {
+    const a = P.acfgs[Math.min(P.acfgIdx, P.acfgs.length - 1)];
     P.adec = mkAdec();
-    try { P.adec.configure(P.acfg); } catch (e) {}
+    try { P.adec.configure(a); } catch (e) {}
   }
   showBufProgress();
   const id = P.id;
@@ -2140,7 +2352,7 @@ function teardownWC() {
   pendSeek = null; pendSeekAt = 0;
   if (segAbort) { segAbort.abort(); segAbort = null; }
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
-  P.eof = false; P.endedFired = false; P.needKey = false;
+  P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0;
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }
   P.vq.length = 0;
@@ -2166,8 +2378,12 @@ window.__seg = () => ({
   vq: P.vq.length, aq: P.aq.length, pendV: P.chunksV.length, pendA: P.chunksA.length,
   vdecQ: P.vdec && P.vdec.decodeQueueSize, adecQ: P.adec && P.adec.decodeQueueSize,
   vdecState: P.vdec && P.vdec.state, adecState: P.adec && P.adec.state, chunks: [P.chunksV.length, P.chunksA.length],
-  ctx: P.ctx && P.ctx.state, anchor: P.anchor && { ctx: +P.anchor.ctx.toFixed(2), media: +P.anchor.media.toFixed(2) },
+  ctx: P.ctx && P.ctx.state, ctxNow: P.ctx && +P.ctx.currentTime.toFixed(2),
+  vq0: P.vq.length ? +(P.vq[0].timestamp / 1e6).toFixed(2) : null,
+  aq0: P.aq.length ? +(P.aq[0].timestamp / 1e6).toFixed(2) : null,
+  anchor: P.anchor && { ctx: +P.anchor.ctx.toFixed(2), media: +P.anchor.media.toFixed(2) },
   clock: +mediaNow().toFixed(2), paused: P.paused, lastT: +P.lastT.toFixed(2),
+  seekFloor: P.seekFloor, aStepUs: P.aStepUs, acfg: P.acfgs && P.acfgIdx,
   flowAgo: P.flow ? performance.now() - P.flow : null, pendSeek,
 });
 
@@ -2336,9 +2552,9 @@ $('seekbar').addEventListener('mousemove', seekHover);
 $('seekbar').addEventListener('mouseleave', () => { sktip.hidden = true; });
 
 /* ---------- buffering overlay ----------
- * MSE backpressure is driven natively by the SourceBuffer:
- * the browser fires 'waiting'/'stalled' when data isn't available
- * and 'playing'/'canplay' when playback resumes. */
+ * The engine fires 'waiting'/'stalled' from the 250ms state machine when the
+ * clock is not flowing (no scheduled audio ahead) and 'playing' when it
+ * recovers; seekTo decides the initial spinner itself, synchronously. */
 function showBuf(txt) {
   const b = $('buf');
   b.querySelector('span').textContent = txt || 'Buffering…';
@@ -2514,12 +2730,12 @@ function renderSubPanel() {
 }
 
 /* Subtitles are drawn by us (not the browser) so the bottom offset can move in
- * pixels and continuously in every browser. The track stays "hidden" and we
- * mirror its active cues into an absolutely-positioned overlay. */
-function subTrack() {
-  for (const t of v.textTracks) if (t.kind === 'subtitles') return t;
-  return null;
-}
+ * pixels and continuously in every browser. There is no <video> element
+ * anymore and browsers refuse to load <track> elements outside a media
+ * element (readyState stays 0 forever) — so we fetch the VTT ourselves and
+ * keep the cues in a synthetic track of standalone VTTCues. */
+let vSubTrack = null;
+function subTrack() { return vSubTrack; }
 function applySubPosition() {
   const ov = $('suboverlay');
   if (!ov) return;
@@ -2679,9 +2895,28 @@ function enableSub(name) {
 }
 function disableSub() { subPickSave(null); activeSub = null; applySubTrack(); }
 
+/* Minimal WEBVTT parser — enough for the (SRT-converted) VTT our server
+ * emits. Cue settings are ignored: we position the overlay ourselves. */
+function parseVtt(text) {
+  const cues = [];
+  const tsRe = /(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})\s*-->\s*(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2})[.,](\d{1,3})/;
+  for (const block of text.replace(/\r/g, '').split(/\n{2,}/)) {
+    if (/^(WEBVTT|NOTE|STYLE|REGION)/i.test(block)) continue;
+    const lines = block.split('\n');
+    const ti = lines.findIndex(l => tsRe.test(l));
+    if (ti < 0) continue;
+    const m = tsRe.exec(lines[ti]);
+    const sec = (h, mn, s, ms) => (+h || 0) * 3600 + (+mn || 0) * 60 + (+s || 0) + (+((ms || '0').padEnd(3, '0')) || 0) / 1000;
+    const t0 = sec(m[1], m[2], m[3], m[4]), t1 = sec(m[5], m[6], m[7], m[8]);
+    const body = lines.slice(ti + 1).join('\n').trim();
+    if (!body || !isFinite(t0) || !isFinite(t1) || t1 <= t0) continue;
+    try { cues.push(new VTTCue(t0, t1, body)); } catch (e) {}
+  }
+  return { kind: 'subtitles', mode: 'hidden', cues };
+}
+
 function applySubTrack() {
-  // drop existing subtitle tracks
-  v.querySelectorAll('track').forEach(t => t.remove());
+  vSubTrack = null;
   if (!activeSub || activeSub.id !== currentId) {
     if (ssVisible()) ssToggle(false);
     subRenderStop();
@@ -2689,29 +2924,17 @@ function applySubTrack() {
     return;
   }
   ssDelay = ssLoadDelay();
-  const track = document.createElement('track');
-  track.kind = 'subtitles';
-  track.label = activeSub.name;
-  track.srclang = (activeSub.name.match(/\.([a-z]{2})_/i) || [])[1] || '';
-  track.src = '/sub/' + currentId + '/' + encodeURIComponent(activeSub.name);
-  track.default = true;
-  v.appendChild(track);
-  // keep the browser from painting native cues; we render them ourselves
-  const hook = (tr) => {
-    if (!tr) return;
-    tr.mode = 'hidden';
-    if (!tr.__subHooked) {
-      tr.__subHooked = true;
-      tr.addEventListener('cuechange', renderActiveCues);
-    }
-    ssTrackReady(tr);
-    subRenderStart();
-    renderActiveCues();
-  };
-  track.addEventListener('load', () => { hook(track.track); applySubPosition(); });
-  // mode may need setting once the browser processed the track
-  setTimeout(() => hook(track.track), 0);
-  setTimeout(() => hook(track.track), 300);
+  const want = activeSub;
+  fetch('/sub/' + currentId + '/' + encodeURIComponent(want.name))
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+    .then(txt => {
+      if (want !== activeSub) return;    // switched away while fetching
+      vSubTrack = parseVtt(txt);
+      ssTrackReady(vSubTrack);
+      subRenderStart();
+      renderActiveCues();
+    })
+    .catch(e => console.error('subtitle load failed', e));
 }
 
 async function toggleSubsPanel(show) {
