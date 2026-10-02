@@ -2254,7 +2254,7 @@ async function playTorrent(item, file) {
     hideBuf();
     showBuf(e.noWC
       ? 'This browser cannot play this file: no ' + (e.codec || 'codec') + ' decoder in WebCodecs.'
-      : 'Playback error: ' + e.message);
+      : 'Playback error: ' + e.message, true);
     return;
   }
   if (!P.id) return;
@@ -2345,7 +2345,7 @@ function savePlayhead(t) {
 function segFatal(e) {
   stopPlayback();
   hideBuf();
-  showBuf('Playback error: ' + (e.message || e));
+  showBuf('Playback error: ' + (e.message || e), true);
 }
 
 function teardownWC() {
@@ -2555,9 +2555,13 @@ $('seekbar').addEventListener('mouseleave', () => { sktip.hidden = true; });
  * The engine fires 'waiting'/'stalled' from the 250ms state machine when the
  * clock is not flowing (no scheduled audio ahead) and 'playing' when it
  * recovers; seekTo decides the initial spinner itself, synchronously. */
-function showBuf(txt) {
+/* `err` = terminal failure (no codec, decode error): the spinner would imply
+ * "wait and it will recover", so drop it and leave only the message. */
+function showBuf(txt, err) {
   const b = $('buf');
   b.querySelector('span').textContent = txt || 'Buffering…';
+  const spin = b.querySelector('.spin');
+  if (spin) spin.hidden = !!err;
   b.hidden = false;
 }
 function hideBuf() { $('buf').hidden = true; }
