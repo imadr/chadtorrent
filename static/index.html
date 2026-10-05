@@ -896,7 +896,7 @@ function renderMovie() {
   mvSyncSel();
 }
 
-function renderTorrentRow(el, t, opts) {
+function renderTorrentRow(el, t) {
   el.className = 'row';
   el.dataset.state = t.state || '';
   const isDown = t.state === 'downloading';
@@ -931,8 +931,14 @@ function renderTorrentRow(el, t, opts) {
     txt.textContent = 'Stopped';
   }
   const canPlay = t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error';
-  if (opts && opts.clickable === false) {
-    // TV torrent header: only the episode rows below play media.
+  // TV whole-show packs are not a playable unit, so their rows must never play.
+  // This is decided by `el.dataset.pack`, a mark stamped on the element once by
+  // `renderTV` and left in place across every later re-render, rather than by a
+  // per-call option flag: `refreshRow` re-renders these same elements on each
+  // progress event and any flag argument is silently dropped there, which used
+  // to re-arm `playTorrent` on exactly the downloading/paused rows.
+  const isPack = el.dataset.pack === '1';
+  if (isPack) {
     el.style.cursor = 'default';
     el.onclick = null;
   } else {
@@ -1202,8 +1208,9 @@ function renderTV(torrentRs) {
     for (const t of torrentRs) {
       const el = document.createElement('div');
       el.dataset.id = t.id;
+      el.dataset.pack = '1';
       list.appendChild(el);
-      renderTorrentRow(el, t, { clickable: false });
+      renderTorrentRow(el, t);
     }
   }
   mvSyncSel();
