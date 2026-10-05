@@ -1532,6 +1532,8 @@ const P = {
   aTrimUs: 0,                 // AAC decoder-delay trim (native-player parity, see startEngine)
   ctx: null, gain: null, nextAt: 0,
   anchor: null,               // {ctx, media} — media time at the end of the last scheduled audio buffer
+  noAudio: false,             // no usable audio track/decoder: wall clock is the master
+  wall: null,                 // {ctx, media} — wall-master anchor (video-only mode), reset per seek
   // (window.__ac/__vc counters are temporary sink diagnostics)
   paused: true,
   lastT: 0, flow: 0,          // flow = performance.now() of the last painted frame
@@ -1541,11 +1543,38 @@ const P = {
 /* Master clock. Audio is scheduled ahead on the WebAudio timeline; the
  * playhead interpolates linearly towards the end of the last scheduled buffer.
  * Suspending the AudioContext on pause freezes ctx.currentTime and therefore
- * the playhead, for free. */
+ * the playhead, for free.
+ *
+ * Two standard handoffs (the same model mpv uses):
+ *  - audio EOF with video remaining (credits after the last audio packet):
+ *    once every audio chunk is decoded AND scheduled AND sounded, advance the
+ *    playhead by wall time past the last anchor — otherwise the clock pins at
+ *    the audio end and the video tail can never play (Django: video 1.14s
+ *    longer than audio; 'ended' never fired, the movie just froze).
+ *  - no audio track at all: the wall clock IS the master (anchored at each
+ *    seek; ctx.suspend on pause freezes it like the audio clock). */
+function audioEnded() {
+  if (!P.eof || P.chunksA.length || P.aq.length) return false;
+  if (P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize > 0) return false;
+  if (!P.anchor) return true;   // e.g. a seek past the last audio packet
+  return P.anchor.ctx <= P.ctx.currentTime + 0.02;
+}
 function mediaNow() {
-  if (!P.anchor || !P.ctx) return P.lastT;
-  const behind = P.anchor.ctx - P.ctx.currentTime;
-  return behind <= 0 ? P.anchor.media : Math.max(0, P.anchor.media - behind);
+  if (!P.ctx) return P.lastT;
+  const now = P.ctx.currentTime;
+  if (P.anchor) {
+    const behind = P.anchor.ctx - now;
+    if (behind > 0) return Math.max(0, P.anchor.media - behind);
+    if (audioEnded()) return Math.min(fullDur || Infinity, P.anchor.media + (now - P.anchor.ctx));
+    return P.anchor.media;
+  }
+  // No anchor: video-only files (always), or a seek that landed past the last
+  // audio packet (nothing will ever schedule — freeze would deadlock). While
+  // audio chunks are still pending the clock stays at the seek target (hold).
+  if (P.wall && (P.noAudio || audioEnded())) {
+    return Math.min(fullDur || Infinity, P.wall.media + Math.max(0, now - P.wall.ctx));
+  }
+  return P.lastT;
 }
 
 /* ---- minimal ISO-BMFF reader (enough for ffmpeg's fragmented MP4) ---- */
@@ -1995,8 +2024,12 @@ setInterval(() => {
   }
   pumpAudio();
   const playing = !P.paused && P.ctx && P.ctx.state === 'running';
-  const flowing = playing && P.anchor && P.anchor.ctx > P.ctx.currentTime + 0.02;
-  if (playing && !flowing && !P.eof) {
+  // 'flowing' = the master clock is advancing: audio scheduled ahead, or
+  // (video-only) frames painting, or the audio-EOF wall tail running
+  const flowing = playing && (
+    P.noAudio ? (P.flow && performance.now() - P.flow < 1500)
+              : (P.anchor && (P.anchor.ctx > P.ctx.currentTime + 0.02 || audioEnded())));
+  if (playing && !flowing && !P.eof && !audioEnded()) {
     if (!wasWaiting) { wasWaiting = true; v.dispatchEvent(new Event('waiting')); }
   } else if (wasWaiting) {
     wasWaiting = false;
@@ -2008,13 +2041,17 @@ setInterval(() => {
   // video decode lags but whose clock already crossed the target)
   if (pendSeek != null
       && ((P.vq.length && P.vq[0].timestamp / 1e6 >= pendSeek - 0.4)
-          || (P.anchor && P.anchor.media > pendSeek))) {
+          || (P.anchor && P.anchor.media > pendSeek)
+          || (P.eof && mediaNow() >= Math.min(pendSeek, (fullDur || Infinity) - 0.05)))) {
     pendSeek = null; pendSeekAt = 0; P.seekFloor = 0;
     v.dispatchEvent(new Event('seeked'));
   }
-  // end of the stream: manifest complete, everything fed, everything played
+  // end of the stream: manifest complete, everything fed, everything played.
+  // Video-only: no anchor, just all queues drained. With audio: everything
+  // decoded AND sounded (audioEnded covers decode side, anchor.ctx the sound
+  // side — during the video tail the wall clock has already drained vq).
   if (P.eof && !P.endedFired && !P.vq.length && !P.aq.length && P.chunksV.length === 0 && P.chunksA.length === 0
-      && P.anchor && P.anchor.ctx <= P.ctx.currentTime + 0.02) {
+      && (P.noAudio || audioEnded())) {
     P.endedFired = true;
     v.dispatchEvent(new Event('ended'));
   }
@@ -2052,7 +2089,17 @@ async function feedLoop(gen, id) {
     }
     const t = P.segs.get(P.fetchN);
     if (t === undefined) {
-      if (P.done) { P.eof = true; return; }
+      if (P.done) {
+        P.eof = true;
+        // EOF ≠ stop demuxing work: the decode branches above must keep
+        // running until every demuxed chunk is handed to a decoder — a movie
+        // whose video outlasts its audio froze here with minutes of chunksA
+        // undecoded (audio clock pinned, video tail unplayable, 'ended'
+        // never fired). Only leave when there is nothing left to decode.
+        if (!P.chunksA.length && !P.chunksV.length) return;
+        await segSleep(100);
+        continue;
+      }
       await refreshManifest(gen, id);
       await segSleep(400);
       continue;
@@ -2159,6 +2206,7 @@ async function startEngine() {
 
   ensureCtx();
   P.nextAt = 0;
+  P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: 0 };   // video-only master base
 
   // isConfigSupported lies for HEVC on Firefox (hangs / false-negatives) while
   // decodingInfo says supported — so configure candidates directly and treat a
@@ -2254,6 +2302,7 @@ async function startEngine() {
       P.adec = null;
     }
     if (!P.adec) console.warn('[ct] audio decode unavailable — video only');
+    P.noAudio = !P.adec;   // wall-clock master (see mediaNow)
     // AAC decoder-delay trim. Raw AAC streams start with the codec's
     // algorithmic delay (priming) baked into the first packets, and every
     // native player trims it before presenting (CoreAudio/CoreMedia and
@@ -2348,6 +2397,7 @@ function seekTo(globalT, partyOrigin) {
   for (const a of P.aq) { try { a.close(); } catch (e) {} }
   P.aq.length = 0;
   P.anchor = null; P.nextAt = 0; P.sched = []; P.lastT = globalT;
+  P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: globalT };
   pendSeek = globalT; pendSeekAt = Date.now();
   // orphan buffers already scheduled on the old gain node (they would keep
   // playing the pre-seek audio for a fraction of a second)
@@ -2414,7 +2464,7 @@ function teardownWC() {
   if (P.adec) { try { P.adec.close(); } catch (e) {} P.adec = null; }
   if (P.gain) { try { P.gain.disconnect(); } catch (e) {} P.gain = null; }
   if (P.ctx) { const c = P.ctx; P.ctx = null; c.close().catch(() => {}); }
-  P.anchor = null; P.nextAt = 0; P.sched = []; P.paused = true; P.lastT = 0; P.flow = 0;
+  P.anchor = null; P.nextAt = 0; P.sched = []; P.noAudio = false; P.wall = null; P.paused = true; P.lastT = 0; P.flow = 0;
   P.fetchN = 1; P.fedUntil = 0; P.tickOn = false; P.canplaySent = false;
   wasWaiting = false;
   const ov = $('suboverlay');
