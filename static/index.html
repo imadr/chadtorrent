@@ -1529,6 +1529,7 @@ const P = {
   fetchN: 1, fedUntil: 0, eof: false, endedFired: false, needKey: false,
   seekFloor: 0,               // after a seek: drop decoded outputs older than this
   aStepUs: 0,                 // container's per-packet audio duration (clock truth)
+  aTrimUs: 0,                 // AAC decoder-delay trim (native-player parity, see startEngine)
   ctx: null, gain: null, nextAt: 0,
   anchor: null,               // {ctx, media} — media time at the end of the last scheduled audio buffer
   // (window.__ac/__vc counters are temporary sink diagnostics)
@@ -1901,6 +1902,22 @@ function audioBufferOf(ad) {
  * deriving the anchor from buf.duration would make the clock drift away from
  * the demuxed timestamps — video and subtitles with it. The container is the
  * timeline. */
+/* Audible position: the media time actually sounding right now. The clock
+ * (mediaNow) extrapolates from the LAST scheduled buffer; this walks the
+ * schedule ring to the buffer SPANNING ctx.currentTime. Any gap between the
+ * two (adrift) is true A/V desync: video follows the clock, the ear follows
+ * this. Exposed via __seg() for live diagnosis. */
+function audibleNow() {
+  if (!P.sched || !P.sched.length || !P.ctx) return null;
+  const now = P.ctx.currentTime;
+  let last = null;
+  for (const s of P.sched) {
+    if (now >= s.cs && now < s.cs + s.dur) return s.ts + (now - s.cs) * (s.step / s.dur);
+    if (s.cs <= now) last = s;
+  }
+  return last ? last.ts + last.step : P.sched[0].ts;
+}
+
 function pumpAudio() {
   if (!P.ctx || P.ctx.state !== 'running' || !P.adec) return;
   // Right after a seek, hold the clock until a kept video frame exists.
@@ -1915,7 +1932,7 @@ function pumpAudio() {
   if (P.nextAt < P.ctx.currentTime) P.nextAt = P.ctx.currentTime + 0.01;
   while (P.aq.length && P.nextAt < P.ctx.currentTime + 1.5) {
     const ad = P.aq.shift();
-    const ts = ad.timestamp / 1e6;
+    const ts = ad.timestamp / 1e6 - P.aTrimUs / 1e6;   // minus decoder delay (native parity)
     const step = P.aStepUs ? P.aStepUs / 1e6 : (ad.duration != null && isFinite(ad.duration) ? ad.duration / 1e6 : 0);
     const buf = audioBufferOf(ad);
     if (!buf) continue;
@@ -1923,9 +1940,13 @@ function pumpAudio() {
     src.buffer = buf;
     src.connect(P.gain);
     src.start(P.nextAt);
+    (P.sched = P.sched || []).push({ cs: P.nextAt, ts, dur: buf.duration, step: step || buf.duration });
+    if (P.sched.length > 240) P.sched.splice(0, 80);
     P.anchor = { ctx: P.nextAt + buf.duration, media: ts + (step || buf.duration) };
     P.nextAt += buf.duration;
   }
+  // drop ring entries that finished sounding (keep the spanning one)
+  if (P.sched) while (P.sched.length > 1 && P.sched[0].cs + P.sched[0].dur < P.ctx.currentTime - 0.5) P.sched.shift();
 }
 
 function paint(frame) {
@@ -1951,6 +1972,9 @@ function drawTick() {
   }
   if (draw) {
     paint(draw);
+    // late-paint counter: frame presented >0.25s after its media time =
+    // decode/present starving while the audio clock ran on (true desync)
+    if (t - draw.timestamp / 1e6 > 0.25) window.__late = (window.__late || 0) + 1;
     // diagnostic ring buffer: last paint times vs playhead (window.__paints)
     (window.__paints = window.__paints || []).push({ at: Math.round(performance.now()), clock: +t.toFixed(2), fts: +(draw.timestamp / 1e6).toFixed(2) });
     if (window.__paints.length > 400) window.__paints.splice(0, 100);
@@ -2150,9 +2174,18 @@ async function startEngine() {
   const codecs2 = new Set([codecs.v]);
   if (base && /^hvc1|hev1|avc1|avc3/.test(codecs.v)) codecs2.add(vtr.codec4cc + base);
   const cands = [];
+  // Prefer a hardware decoder first (libmedia does the same): with the
+  // default 'no-preference' Chrome can pick software decode for some
+  // codecs/sizes, and software HEVC at 4K decodes below realtime — video
+  // falls perpetually behind the audio clock, which looks exactly like
+  // growing A/V desync. Plain (no-preference) variants stay in the ladder
+  // as fallback for machines with no usable hardware path.
+  const hwPrefs = ['prefer-hardware', undefined];
   for (const codec of codecs2) {
-    if (vtr.desc) cands.push({ codec, description: vtr.desc });
-    cands.push({ codec });
+    for (const hw of hwPrefs) {
+      if (vtr.desc) cands.push({ codec, description: vtr.desc, hardwareAcceleration: hw });
+      cands.push({ codec, hardwareAcceleration: hw });
+    }
   }
   let vcfg = null;
   for (const c of cands) {
@@ -2221,6 +2254,26 @@ async function startEngine() {
       P.adec = null;
     }
     if (!P.adec) console.warn('[ct] audio decode unavailable — video only');
+    // AAC decoder-delay trim. Raw AAC streams start with the codec's
+    // algorithmic delay (priming) baked into the first packets, and every
+    // native player trims it before presenting (CoreAudio/CoreMedia and
+    // ffmpeg-based players alike) — WebCodecs does NOT: decoded AudioData
+    // carries passthrough timestamps, so scheduling them as-is plays the
+    // whole track late by the delay vs the native player (measured against
+    // afconvert ground truth: LC = 2112 samples at the output rate; HE-AAC
+    // varies with the encoder's SBR framing — 2262 samples @22.05k, ~960
+    // @48k — LUT below). Shift every audio media anchor earlier by it; the
+    // priming region then maps before t=0 and is never sounded.
+    if (P.adec) {
+      let trim = 0;
+      if (acodec === 'mp4a.40.5') {
+        const lut = { 22050: 2262, 24000: 1100, 32000: 1400, 44100: 900, 48000: 960 };
+        trim = lut[rate] || Math.round(2112 * rate / 48000);   // ~44ms scaled
+      } else {
+        trim = 2112;
+      }
+      P.aTrimUs = Math.round(trim / rate * 1e6);
+    }
   }
 
   v.dispatchEvent(new Event('loadedmetadata'));
@@ -2294,8 +2347,7 @@ function seekTo(globalT, partyOrigin) {
   P.vq.length = 0;
   for (const a of P.aq) { try { a.close(); } catch (e) {} }
   P.aq.length = 0;
-  P.anchor = null; P.nextAt = 0;
-  P.lastT = globalT;
+  P.anchor = null; P.nextAt = 0; P.sched = []; P.lastT = globalT;
   pendSeek = globalT; pendSeekAt = Date.now();
   // orphan buffers already scheduled on the old gain node (they would keep
   // playing the pre-seek audio for a fraction of a second)
@@ -2352,7 +2404,7 @@ function teardownWC() {
   pendSeek = null; pendSeekAt = 0;
   if (segAbort) { segAbort.abort(); segAbort = null; }
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
-  P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0;
+  P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0; P.aTrimUs = 0;
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }
   P.vq.length = 0;
@@ -2362,7 +2414,7 @@ function teardownWC() {
   if (P.adec) { try { P.adec.close(); } catch (e) {} P.adec = null; }
   if (P.gain) { try { P.gain.disconnect(); } catch (e) {} P.gain = null; }
   if (P.ctx) { const c = P.ctx; P.ctx = null; c.close().catch(() => {}); }
-  P.anchor = null; P.nextAt = 0; P.paused = true; P.lastT = 0; P.flow = 0;
+  P.anchor = null; P.nextAt = 0; P.sched = []; P.paused = true; P.lastT = 0; P.flow = 0;
   P.fetchN = 1; P.fedUntil = 0; P.tickOn = false; P.canplaySent = false;
   wasWaiting = false;
   const ov = $('suboverlay');
@@ -2383,7 +2435,10 @@ window.__seg = () => ({
   aq0: P.aq.length ? +(P.aq[0].timestamp / 1e6).toFixed(2) : null,
   anchor: P.anchor && { ctx: +P.anchor.ctx.toFixed(2), media: +P.anchor.media.toFixed(2) },
   clock: +mediaNow().toFixed(2), paused: P.paused, lastT: +P.lastT.toFixed(2),
-  seekFloor: P.seekFloor, aStepUs: P.aStepUs, acfg: P.acfgs && P.acfgIdx,
+  aud: audibleNow() != null ? +audibleNow().toFixed(2) : null,
+  adrift: audibleNow() != null ? +(mediaNow() - audibleNow()).toFixed(3) : null,
+  late: window.__late || 0,
+  seekFloor: P.seekFloor, aStepUs: P.aStepUs, aTrimUs: P.aTrimUs, acfg: P.acfgs && P.acfgIdx,
   flowAgo: P.flow ? performance.now() - P.flow : null, pendSeek,
 });
 
