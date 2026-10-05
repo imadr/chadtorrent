@@ -1222,10 +1222,11 @@ function renderTvEpisodes(rep) {
   const eps = episodesOf(rep, tvSeason);
   if (!eps) { box.hidden = true; return; }   // loading or failed — nothing yet
   // An announced season TMDB has no episodes for yet: say so instead of
-  // indexing into an empty list.
+  // indexing into an empty list. `flex-basis:100%` makes it span the flex row
+  // (like the "No content" message) so its centered text is actually centered.
   if (!eps.length) {
     box.hidden = false;
-    box.innerHTML = '<div class="empty" style="padding:6px 0">No episodes listed yet</div>';
+    box.innerHTML = '<div class="empty" style="padding:12px 0;flex-basis:100%">No episodes listed yet</div>';
     box.onclick = null;
     tvEpisode = null;
     return;
