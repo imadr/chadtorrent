@@ -40,7 +40,7 @@ async fn start_http(
 ) -> (String, String, Arc<PartyManager>, tokio::task::AbortHandle) {
     let index_html = include_str!("../static/index.html").to_string();
     let party = PartyManager::new(library.clone());
-    let router = build_router(AppState { library, index_html, tmdb: None, subs: None, party: party.clone() });
+    let router = build_router(AppState { library, index_html, tmdb: None, meta: None, subs: None, party: party.clone() });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -104,6 +104,148 @@ async fn http_error_handling() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+
+    drop(srv);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tmdb_meta_serves_seasons_and_episodes_from_cache() {
+    use chadtorrent::metadata::{EpisodeInfo, MetaCache, SeasonEpisodes, SeasonInfo, TmdbClient};
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(&tmp.path().join("app")).await;
+
+    // Seed the cache the way a completed background sweep would have, so no
+    // TMDB request is made (the client key below is intentionally bogus).
+    let seasons = vec![
+        SeasonInfo {
+            season_number: 1,
+            name: Some("Season 1".into()),
+            episode_count: Some(2),
+            air_date: None,
+        },
+        SeasonInfo {
+            season_number: 2,
+            name: Some("Season 2".into()),
+            episode_count: Some(1),
+            air_date: None,
+        },
+    ];
+    let episodes = vec![
+        SeasonEpisodes {
+            season_number: 1,
+            episodes: (1..=2)
+                .map(|n| EpisodeInfo {
+                    episode_number: n,
+                    name: Some(format!("Ep {n}")),
+                    overview: None,
+                    still_path: None,
+                    air_date: None,
+                })
+                .collect(),
+        },
+        SeasonEpisodes {
+            season_number: 2,
+            episodes: vec![EpisodeInfo {
+                episode_number: 1,
+                name: Some("Premiere".into()),
+                overview: None,
+                still_path: None,
+                air_date: None,
+            }],
+        },
+    ];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    library
+        .db
+        .set_tmdb_meta("tv", 1396, Some("Seven noble families."), &seasons, &episodes, now)
+        .unwrap();
+
+    let meta = MetaCache::new(
+        library.db.clone(),
+        Arc::new(TmdbClient::new("bogus-key".into())),
+    );
+    let index_html = include_str!("../static/index.html").to_string();
+    let party = PartyManager::new(library.clone());
+    let router = build_router(AppState {
+        library,
+        index_html,
+        tmdb: Some(Arc::new(TmdbClient::new("bogus-key".into()))),
+        meta: Some(Arc::new(meta)),
+        subs: None,
+        party: party.clone(),
+    });
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let http = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // The detail payload carries the episode map keyed by season, which is what
+    // lets a season click paint its buttons with zero further requests.
+    let detail: serde_json::Value = client
+        .get(format!("{http}/api/meta/tv/1396"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["overview"], "Seven noble families.");
+    assert_eq!(detail["seasons"][0]["season_number"], 1);
+    assert_eq!(detail["episodes"]["1"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["episodes"]["1"][1]["name"], "Ep 2");
+    assert_eq!(detail["episodes"]["2"][0]["name"], "Premiere");
+
+    // The per-season endpoint is answered from the same cache, not TMDB.
+    let season: serde_json::Value = client
+        .get(format!("{http}/api/meta/tv/1396/season/2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(season["episodes"][0]["name"], "Premiere");
+
+    // A fresh cache short-circuits the background check: no TMDB traffic, and
+    // the caller is told nothing changed.
+    let refreshed: serde_json::Value = client
+        .post(format!("{http}/api/meta/tv/1396/refresh"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refreshed["updated"], false);
+
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tmdb_meta_routes_need_configured_key() {
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(&tmp.path().join("app")).await;
+    let (http, _ws, _party, srv) = start_http(library.clone()).await;
+    let client = reqwest::Client::new();
+
+    for (method, path) in [
+        ("GET", "/api/meta/tv/1396"),
+        ("GET", "/api/meta/tv/1396/season/1"),
+        ("POST", "/api/meta/tv/1396/refresh"),
+        ("GET", "/api/meta/movie/157336"),
+    ] {
+        let resp = match method {
+            "POST" => client.post(format!("{http}{path}")).send().await.unwrap(),
+            _ => client.get(format!("{http}{path}")).send().await.unwrap(),
+        };
+        assert_eq!(resp.status(), 400, "{method} {path}");
+    }
 
     drop(srv);
 }

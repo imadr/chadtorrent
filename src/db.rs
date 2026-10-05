@@ -136,6 +136,8 @@ impl Database {
                 tmdb_id INTEGER NOT NULL,
                 overview TEXT,
                 seasons_json TEXT NOT NULL DEFAULT '[]',
+                episodes_json TEXT NOT NULL DEFAULT '[]',
+                fetched_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (media_type, tmdb_id)
             );",
         )?;
@@ -158,6 +160,8 @@ impl Database {
             "ALTER TABLE library ADD COLUMN sequential INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE library ADD COLUMN torrent_bytes BLOB",
             "ALTER TABLE library ADD COLUMN playhead REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE tmdb_meta ADD COLUMN episodes_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE tmdb_meta ADD COLUMN fetched_at INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute_batch(stmt);
         }
@@ -508,24 +512,31 @@ impl Database {
 
     // ---- TMDB metadata cache ----
 
-    /// Cached TMDB detail — the overview (description) paragraph plus the
-    /// canonical TV-season list — so the sidebar serves from SQLite instead of
-    /// re-hitting TMDB on every page refresh.
+    /// The cached TMDB payload for one `media_type` + `tmdb_id` pair: overview
+    /// (description) paragraph, the canonical TV-season list and every season's
+    /// episode list — so opening a show paints its season/episode buttons from
+    /// SQLite instead of round-tripping TMDB per season click.
     pub fn get_tmdb_meta(
         &self,
         media_type: &str,
         tmdb_id: i64,
-    ) -> Result<Option<(Option<String>, Vec<crate::metadata::SeasonInfo>)>> {
+    ) -> Result<Option<crate::metadata::TmdbMeta>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT overview, seasons_json FROM tmdb_meta WHERE media_type = ?1 AND tmdb_id = ?2",
+            "SELECT overview, seasons_json, episodes_json, fetched_at
+             FROM tmdb_meta WHERE media_type = ?1 AND tmdb_id = ?2",
         )?;
         let mut rows = stmt.query_map(params![media_type, tmdb_id], |row| {
             let overview: Option<String> = row.get(0)?;
             let seasons_json: String = row.get(1)?;
-            let seasons: Vec<crate::metadata::SeasonInfo> =
-                serde_json::from_str(&seasons_json).unwrap_or_default();
-            Ok((overview, seasons))
+            let episodes_json: String = row.get(2)?;
+            let fetched_at: i64 = row.get(3)?;
+            Ok(crate::metadata::TmdbMeta {
+                overview,
+                seasons: serde_json::from_str(&seasons_json).unwrap_or_default(),
+                episodes: serde_json::from_str(&episodes_json).unwrap_or_default(),
+                fetched_at,
+            })
         })?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -533,23 +544,32 @@ impl Database {
         }
     }
 
+    /// Upsert a TMDB payload. `fetched_at` (unix secs) is the time of the last
+    /// *complete* read — callers pass the previous value when part of the sweep
+    /// failed, which keeps the row eligible for an immediate retry.
     pub fn set_tmdb_meta(
         &self,
         media_type: &str,
         tmdb_id: i64,
         overview: Option<&str>,
         seasons: &[crate::metadata::SeasonInfo],
+        episodes: &[crate::metadata::SeasonEpisodes],
+        fetched_at: i64,
     ) -> Result<()> {
         let seasons_json = serde_json::to_string(seasons)
             .map_err(|e| crate::error::Error::BadRequest(format!("serialize seasons: {e}")))?;
+        let episodes_json = serde_json::to_string(episodes)
+            .map_err(|e| crate::error::Error::BadRequest(format!("serialize episodes: {e}")))?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO tmdb_meta (media_type, tmdb_id, overview, seasons_json)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO tmdb_meta (media_type, tmdb_id, overview, seasons_json, episodes_json, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(media_type, tmdb_id) DO UPDATE SET
                  overview = excluded.overview,
-                 seasons_json = excluded.seasons_json",
-            params![media_type, tmdb_id, overview, seasons_json],
+                 seasons_json = excluded.seasons_json,
+                 episodes_json = excluded.episodes_json,
+                 fetched_at = excluded.fetched_at",
+            params![media_type, tmdb_id, overview, seasons_json, episodes_json, fetched_at],
         )?;
         Ok(())
     }
@@ -831,28 +851,109 @@ mod tests {
 
     #[test]
     fn test_tmdb_meta_roundtrip() {
+        use crate::metadata::{EpisodeInfo, SeasonEpisodes};
         let (db, dir) = temp_db();
         assert!(db.get_tmdb_meta("movie", 46648).unwrap().is_none());
         let seasons = vec![crate::metadata::SeasonInfo {
             season_number: 1,
             name: Some("Season 1".into()),
-            episode_count: Some(8),
+            episode_count: Some(2),
             air_date: Some("2014-01-12".into()),
         }];
-        db.set_tmdb_meta("tv", 46648, Some("A cool show."), &seasons)
-            .unwrap();
-        let (overview, got) = db.get_tmdb_meta("tv", 46648).unwrap().unwrap();
-        assert_eq!(overview.as_deref(), Some("A cool show."));
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].season_number, 1);
-        assert_eq!(got[0].name.as_deref(), Some("Season 1"));
+        let episodes = vec![SeasonEpisodes {
+            season_number: 1,
+            episodes: (1..=2)
+                .map(|n| EpisodeInfo {
+                    episode_number: n,
+                    name: Some(format!("Ep {n}")),
+                    overview: None,
+                    still_path: None,
+                    air_date: None,
+                })
+                .collect(),
+        }];
+        db.set_tmdb_meta(
+            "tv",
+            46648,
+            Some("A cool show."),
+            &seasons,
+            &episodes,
+            1000,
+        )
+        .unwrap();
+        let m = db.get_tmdb_meta("tv", 46648).unwrap().unwrap();
+        assert_eq!(m.overview.as_deref(), Some("A cool show."));
+        assert_eq!(m.fetched_at, 1000);
+        assert_eq!(m.seasons.len(), 1);
+        assert_eq!(m.seasons[0].season_number, 1);
+        assert_eq!(m.seasons[0].name.as_deref(), Some("Season 1"));
+        let by_season = m.episodes_by_season();
+        assert_eq!(by_season.len(), 1);
+        let eps = &by_season[&1];
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[1].name.as_deref(), Some("Ep 2"));
+
         // Upsert replaces the stored payload.
-        db.set_tmdb_meta("tv", 46648, Some("New desc."), &[]).unwrap();
-        let (overview, got) = db.get_tmdb_meta("tv", 46648).unwrap().unwrap();
-        assert_eq!(overview.as_deref(), Some("New desc."));
-        assert!(got.is_empty());
+        db.set_tmdb_meta("tv", 46648, Some("New desc."), &[], &[], 2000)
+            .unwrap();
+        let m = db.get_tmdb_meta("tv", 46648).unwrap().unwrap();
+        assert_eq!(m.overview.as_deref(), Some("New desc."));
+        assert_eq!(m.fetched_at, 2000);
+        assert!(m.seasons.is_empty());
+        assert!(m.episodes.is_empty());
+
         // A different media_type with the same id is isolated.
         assert!(db.get_tmdb_meta("movie", 46648).unwrap().is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn test_tmdb_meta_episodes_migrate() {
+        use crate::metadata::{EpisodeInfo, SeasonEpisodes};
+        let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "chadtorrent_db_test_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        // Simulate a pre-episodes database: a tmdb_meta row with only an
+        // overview and season list.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tmdb_meta (
+                    media_type TEXT NOT NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    overview TEXT,
+                    seasons_json TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY (media_type, tmdb_id)
+                );
+                INSERT INTO tmdb_meta (media_type, tmdb_id, overview, seasons_json)
+                VALUES ('tv', 1, 'Old show.', '[]');",
+            )
+            .unwrap();
+        }
+        // Opening it runs the migrations: the new columns appear and the
+        // existing row survives.
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        let episodes = vec![SeasonEpisodes {
+            season_number: 2,
+            episodes: vec![EpisodeInfo {
+                episode_number: 1,
+                name: None,
+                overview: None,
+                still_path: None,
+                air_date: None,
+            }],
+        }];
+        db.set_tmdb_meta("tv", 1, Some("Old show."), &[], &episodes, 5)
+            .unwrap();
+        let m = db.get_tmdb_meta("tv", 1).unwrap().unwrap();
+        assert_eq!(m.overview.as_deref(), Some("Old show."));
+        assert_eq!(m.fetched_at, 5);
+        assert_eq!(m.episodes_by_season()[&2].len(), 1);
         cleanup(&dir);
     }
 }

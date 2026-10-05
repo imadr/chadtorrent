@@ -824,6 +824,10 @@ function openMovie(k, push = true) {
   renderMovie();
   const rep = movieRep(rows);
   if (rep.tmdb_id) findTorrents(rep);
+  // Season/episode buttons are already painted from the server's cached
+  // payload; this only re-checks upstream for newly released seasons/episodes
+  // and repaints if something changed.
+  refreshMvMeta(rep);
 }
 
 const IC_PLAY = '<svg viewBox="0 0 24 24"><use href="#ic-play"/></svg>';
@@ -1015,14 +1019,22 @@ function isTvMovie() {
   return !!(currentMovie && movieRep(currentMovie.rows) && movieRep(currentMovie.rows).media_type === 'tv');
 }
 
-/* Canonical seasons come from TMDB (the show "has" seasons 1..N whether or
-   not the user has torrents for them) — chips are built from that list, and
-   torrents are then filtered by the selected season. The same detail response
-   also powers the description paragraph under the title. Cached per media_type
-   + tmdb_id for the session; `false` means the fetch failed and we fall back
-   to bucket-only chips / no description. */
+/* Canonical seasons and episode lists come from TMDB (a show "has" seasons
+   1..N whether or not the user has torrents for them) — chips are built from
+   that list, and torrents are then filtered by the selected season. The same
+   detail response powers the description paragraph AND every season's episode
+   buttons, and the server serves it from its `tmdb_meta` cache, so opening a
+   show paints everything at once and clicking a season never has to wait on a
+   TMDB round-trip. Cached per media_type + tmdb_id for the session; `null` is
+   the in-flight marker and `false` means the fetch failed (fall back to
+   bucket-only chips / no description). */
 var mvMetaByTmdb = new Map();
+var mvMetaRefreshedAt = new Map();
+const MV_META_REFRESH_COOLDOWN = 30 * 60 * 1000;
 function mvMetaKey(rep) { return (rep.media_type || 'movie') + ':' + rep.tmdb_id; }
+function mvMetaPath(rep) {
+  return '/api/meta/' + encodeURIComponent(rep.media_type || 'movie') + '/' + rep.tmdb_id;
+}
 function tvSeasonsOf(rep) {
   if (!rep || rep.media_type !== 'tv' || !rep.tmdb_id) return null;
   const m = mvMetaByTmdb.get(mvMetaKey(rep));
@@ -1037,36 +1049,81 @@ function applyMvOverview(rep) {
   if (t) { el.hidden = false; el.textContent = m.overview; }
   else el.hidden = true;
 }
+/* Fold a detail payload into the session cache: `episodes` comes back keyed by
+   season number ("1" -> [EpisodeInfo, ...]). */
+function storeMvMeta(rep, d) {
+  const raw = (d && d.episodes) || {};
+  const episodes = {};
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const k in raw) {
+      const list = raw[k];
+      if (Array.isArray(list)) episodes[k] = list.filter(e => e && e.episode_number != null);
+    }
+  }
+  mvMetaByTmdb.set(mvMetaKey(rep), {
+    overview: (d && d.overview) || '',
+    seasons: ((d && d.seasons) || []).map(s => String(s.season_number)),
+    episodes: episodes,
+  });
+}
+/* Repaint the open detail view from a freshly stored payload — season chips,
+   episode buttons, matching file rows and the description. */
+function repaintMvMeta(rep) {
+  const me = currentMovie && movieRep(currentMovie.rows);
+  if (!me || !me.tmdb_id || mvMetaKey(me) !== mvMetaKey(rep)) return;
+  if (me.media_type === 'tv') refreshTvView();
+  applyMvOverview(me);
+}
+/* Pull the cached payload (one request, served from SQLite). Replaces any
+   existing entry, so it also works as the post-refresh reload. */
+function loadMvMeta(rep) {
+  const key = mvMetaKey(rep);
+  return api(mvMetaPath(rep))
+    .then(d => { storeMvMeta(rep, d); repaintMvMeta(rep); })
+    // A failed first load is remembered as "no data"; a failed *reload* after a
+    // background refresh must not throw away a payload we are already showing.
+    .catch(() => { if (mvMetaByTmdb.get(key) === null) mvMetaByTmdb.set(key, false); });
+}
 function ensureMvMeta(rep) {
   if (!rep || !rep.tmdb_id) return;
   const key = mvMetaKey(rep);
   if (mvMetaByTmdb.has(key)) return;
   mvMetaByTmdb.set(key, null); // in-flight marker; do not refetch this session
-  api('/api/meta/' + encodeURIComponent(rep.media_type || 'movie') + '/' + rep.tmdb_id)
-    .then(d => {
-      mvMetaByTmdb.set(key, {
-        overview: (d && d.overview) || '',
-        seasons: ((d && d.seasons) || []).map(s => String(s.season_number)),
-      });
-      const me = currentMovie && movieRep(currentMovie.rows);
-      if (me && me.tmdb_id && mvMetaKey(me) === key) {
-        if (me.media_type === 'tv') refreshTvView();
-        applyMvOverview(me);
-      }
-    })
-    .catch(() => { mvMetaByTmdb.set(key, false); });
+  loadMvMeta(rep);
+}
+/* Background check for newly released seasons/episodes. The TTL lives
+   server-side, so this costs two SQLite reads and no TMDB request while the
+   stored payload is fresh; when the server did find something new we reload
+   the payload and repaint. Throttled client-side so repeated views of the same
+   title don't queue up requests. */
+function refreshMvMeta(rep) {
+  if (!rep || !rep.tmdb_id) return;
+  const key = mvMetaKey(rep);
+  const now = Date.now();
+  if (now - (mvMetaRefreshedAt.get(key) || 0) < MV_META_REFRESH_COOLDOWN) return;
+  mvMetaRefreshedAt.set(key, now);
+  api(mvMetaPath(rep) + '/refresh', { method: 'POST' })
+    .then(d => { if (d && d.updated) loadMvMeta(rep); })
+    .catch(() => {});
 }
 
-/* TMDB episode lists per season, for the episode buttons (a show "has"
-   episodes 1..N whether or not the user has torrents for them). Keyed by
-   tmdb_id + season — season numbers alone are not unique across shows. */
+/* Episode buttons for a season. The show's cached bulk payload covers every
+   season, so this is a synchronous hit on the render path — no fetch, no
+   flicker. The per-season endpoint is only reached for a season the bulk
+   payload is missing (failed sweep, or a season that aired since the last
+   check). Keyed by tmdb_id + season — season numbers alone are not unique
+   across shows. */
 var episodesBySeason = new Map();
-function episodesOf(tmdbId, season) {
-  const e = episodesBySeason.get(tmdbId + ':' + season);
+function episodesOf(rep, season) {
+  const m = rep && mvMetaByTmdb.get(mvMetaKey(rep));
+  const bulk = m && m.episodes && m.episodes[String(season)];
+  if (Array.isArray(bulk)) return bulk;
+  const e = episodesBySeason.get(rep.tmdb_id + ':' + season);
   return Array.isArray(e) ? e : null;
 }
 function ensureTvEpisodes(rep, season) {
   if (!rep || !rep.tmdb_id) return;
+  if (Array.isArray((mvMetaByTmdb.get(mvMetaKey(rep)) || {}).episodes?.[String(season)])) return;
   const key = rep.tmdb_id + ':' + season;
   if (episodesBySeason.has(key)) return;
   episodesBySeason.set(key, null); // in-flight marker; do not refetch this session
@@ -1162,8 +1219,17 @@ function renderTvEpisodes(rep) {
     return;
   }
   ensureTvEpisodes(rep, tvSeason);
-  const eps = episodesOf(rep.tmdb_id, tvSeason);
+  const eps = episodesOf(rep, tvSeason);
   if (!eps) { box.hidden = true; return; }   // loading or failed — nothing yet
+  // An announced season TMDB has no episodes for yet: say so instead of
+  // indexing into an empty list.
+  if (!eps.length) {
+    box.hidden = false;
+    box.innerHTML = '<div class="empty" style="padding:6px 0">No episodes listed yet</div>';
+    box.onclick = null;
+    tvEpisode = null;
+    return;
+  }
   eps.sort((a, b) => a.episode_number - b.episode_number);
   if (!tvEpisode || !eps.some(e => String(e.episode_number) === String(tvEpisode))) {
     tvEpisode = String(eps[0].episode_number);

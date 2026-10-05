@@ -16,7 +16,7 @@ use tracing::warn;
 use crate::db::LibraryItem;
 use crate::error::{Error, Result};
 use crate::library::LibraryManager;
-use crate::metadata::TmdbClient;
+use crate::metadata::{MetaCache, TmdbClient, TmdbMeta};
 use crate::remux::Remuxer;
 use crate::subtitles::{self, SubtitlesClient};
 
@@ -70,6 +70,9 @@ pub struct AppState {
     pub library: Arc<LibraryManager>,
     pub index_html: String,
     pub tmdb: Option<Arc<TmdbClient>>,
+    /// `tmdb_meta`-backed cache in front of `tmdb`. Present only when a TMDB
+    /// key is configured.
+    pub meta: Option<Arc<MetaCache>>,
     pub subs: Option<Arc<SubtitlesClient>>,
     pub party: Arc<crate::party::PartyManager>,
 }
@@ -88,6 +91,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/movies", post(add_movie))
         .route("/api/search", get(search_tmdb))
         .route("/api/meta/{media_type}/{tmdb_id}", get(meta_detail))
+        .route("/api/meta/{media_type}/{tmdb_id}/refresh", post(meta_refresh))
         .route("/api/meta/tv/{tmdb_id}/season/{season_number}", get(meta_episodes))
         .route("/api/torrents", get(torrent_search))
         .route("/api/library/{id}", delete(delete_item))
@@ -149,47 +153,83 @@ async fn add_item(
     Ok(Json(json!({ "id": id })))
 }
 
-/// TMDB detail for a library item's head section: the overview (description
-/// paragraph) always, plus the canonical TV-season list for the season chips.
+/// TMDB detail for a library item's head section: the overview (description)
+/// paragraph, the canonical TV-season list and every season's episode list —
+/// all served from the `tmdb_meta` cache so opening a show paints its season
+/// and episode buttons immediately instead of flickering them in per click.
+///
+/// A stale cache is returned as-is and re-checked in the background; only a
+/// completely cold show blocks on TMDB, and it then comes back whole.
 async fn meta_detail(
     State(state): State<AppState>,
     axum::extract::Path((media_type, tmdb_id)): axum::extract::Path<(String, i64)>,
 ) -> Result<impl IntoResponse> {
-    let Some(tmdb) = state.tmdb.as_ref() else {
-        return Err(Error::BadRequest("Movie search is not configured on this server".into()));
+    let Some(cache) = state.meta.as_ref() else {
+        return Err(Error::BadRequest(
+            "Movie search is not configured on this server".into(),
+        ));
     };
     // Serve from the DB cache first — a page refresh must never re-hit TMDB.
     // `mvMetaByTmdb` on the client only covers the current session.
-    if let Some((overview, seasons)) = state.library.db.get_tmdb_meta(&media_type, tmdb_id)? {
-        return Ok(Json(json!({ "overview": overview, "seasons": seasons })));
+    if let Some(meta) = cache.get(&media_type, tmdb_id)? {
+        if meta.is_stale() {
+            cache.spawn_refresh(media_type.clone(), tmdb_id);
+        }
+        return Ok(Json(meta_json(&meta)));
     }
-    let details = tmdb.get_details(tmdb_id, &media_type).await.ok();
-    let overview = details.as_ref().and_then(|d| d.overview.clone());
-    let seasons = if media_type == "tv" {
-        tmdb.tv_seasons(tmdb_id).await.unwrap_or_default()
-    } else {
-        Vec::new()
+    // Cold cache: one blocking read so even the very first open of a show is
+    // complete. A failed run stores nothing and is retried on the next open.
+    let _ = cache.refresh(&media_type, tmdb_id).await;
+    let meta = cache.get(&media_type, tmdb_id)?.unwrap_or_default();
+    Ok(Json(meta_json(&meta)))
+}
+
+fn meta_json(meta: &TmdbMeta) -> serde_json::Value {
+    json!({
+        "overview": meta.overview,
+        "seasons": meta.seasons,
+        "episodes": meta.episodes_by_season(),
+    })
+}
+
+/// Explicit background re-check for newly released seasons/episodes. Answers
+/// `{updated}` so the caller only repaints when something actually changed.
+/// Costs two SQLite reads while the cached payload is still fresh — the TTL
+/// lives server-side, so repeat views of a show never re-hit TMDB.
+async fn meta_refresh(
+    State(state): State<AppState>,
+    axum::extract::Path((media_type, tmdb_id)): axum::extract::Path<(String, i64)>,
+) -> Result<impl IntoResponse> {
+    let Some(cache) = state.meta.as_ref() else {
+        return Err(Error::BadRequest(
+            "Movie search is not configured on this server".into(),
+        ));
     };
-    // Persist only when TMDB actually answered, so a failed run is retried on
-    // the next refresh instead of being pinned in the DB as "no data".
-    if details.is_some() {
-        let _ = state
-            .library
-            .db
-            .set_tmdb_meta(&media_type, tmdb_id, overview.as_deref(), &seasons);
-    }
-    Ok(Json(json!({ "overview": overview, "seasons": seasons })))
+    let updated = cache.refresh(&media_type, tmdb_id).await.unwrap_or(false);
+    Ok(Json(json!({ "updated": updated })))
 }
 
 /// The ordered episode list of one TV season, for the show's episode buttons.
+/// Normally served out of the show's cached bulk payload; the live endpoint is
+/// only reached for a season the cache never got (failed sweep, or a season
+/// that aired since the last one).
 async fn meta_episodes(
     State(state): State<AppState>,
     axum::extract::Path((tmdb_id, season_number)): axum::extract::Path<(i64, i64)>,
 ) -> Result<impl IntoResponse> {
-    let Some(tmdb) = state.tmdb.as_ref() else {
-        return Err(Error::BadRequest("Movie search is not configured on this server".into()));
+    let Some(cache) = state.meta.as_ref() else {
+        return Err(Error::BadRequest(
+            "Movie search is not configured on this server".into(),
+        ));
     };
-    let episodes = tmdb
+    if let Some(eps) = cache
+        .get("tv", tmdb_id)?
+        .and_then(|m| m.episodes_by_season().remove(&season_number))
+    {
+        return Ok(Json(json!({ "episodes": eps })));
+    }
+    let episodes = cache
+        .tmdb()
         .tv_episodes(tmdb_id, season_number)
         .await
         .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
@@ -238,6 +278,15 @@ async fn add_movie(
             req.media_type.as_deref().unwrap_or("movie"),
         )
         .await?;
+    // Warm the TMDB cache now (overview + seasons + every episode list) so the
+    // detail view opens complete instead of filling in after a round-trip. The
+    // TTL means this is a no-op when the show is already known.
+    if let Some(cache) = state.meta.as_ref() {
+        cache.spawn_refresh(
+            req.media_type.clone().unwrap_or_else(|| "movie".into()),
+            req.tmdb_id,
+        );
+    }
     Ok(Json(json!({ "id": id })))
 }
 

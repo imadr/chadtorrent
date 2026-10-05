@@ -103,6 +103,9 @@ async fn main() {
     let state = AppState {
         library: library.clone(),
         index_html,
+        meta: tmdb
+            .as_ref()
+            .map(|t| Arc::new(metadata::MetaCache::new(library.db.clone(), t.clone()))),
         tmdb,
         subs,
         party,
