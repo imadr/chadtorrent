@@ -1542,6 +1542,18 @@ async function findTorrents(rep) {
   }
 }
 
+/* Torrent search results ordering. The indexer already returns seeders-desc;
+ * the cycle button re-sorts the same list locally. */
+var torrentSort = 'seeders';
+const TORRENT_SORT_LABEL = { seeders: 'Seeders', name: 'Name', size: 'Size' };
+function sortSearchResults(list) {
+  const s = [...list];
+  if (torrentSort === 'name') s.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+  else if (torrentSort === 'size') s.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+  else s.sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
+  return s;
+}
+
 function renderSearch() {
   const box = $('mv-results');
   if (!box) return;
@@ -1560,8 +1572,19 @@ function renderSearch() {
     box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>';
     return;
   }
+  const tsort = document.createElement('button');
+  tsort.className = 'minibtn';
+  tsort.style.marginLeft = '0';
+  tsort.style.marginBottom = '8px';
+  tsort.textContent = 'Sort: ' + TORRENT_SORT_LABEL[torrentSort];
+  tsort.onclick = () => {
+    const keys = Object.keys(TORRENT_SORT_LABEL);
+    torrentSort = keys[(keys.indexOf(torrentSort) + 1) % keys.length];
+    renderSearch();
+  };
+  box.appendChild(tsort);
   const addedHashes = new Set(items.filter(i => i.magnet).map(i => infoHash(i.magnet)).filter(Boolean));
-  for (const t of searchResults) {
+  for (const t of sortSearchResults(searchResults)) {
     const row = document.createElement('div');
     row.className = 'row';
     const sz = t.size_bytes ? fmtBytes(t.size_bytes) : '';
