@@ -40,6 +40,11 @@ pub struct PeerState {
     /// True while the member's player is stalled and the party should wait.
     #[serde(default)]
     pub buffering: bool,
+    /// Torrent-relative path of the episode this member is watching
+    /// (None for single-file items — the party timeline is then the
+    /// torrent's only file).
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 /// A watch-party control message. Actions are last-writer-wins: whoever
@@ -55,9 +60,28 @@ pub enum Message {
     /// Heartbeat + roster update (every few seconds, and immediately on
     /// local state changes such as becoming ready or stalling).
     Presence { peer: PeerState },
-    Play { from: String, t: f64 },
-    Pause { from: String, t: f64 },
-    Seek { from: String, t: f64 },
+    /// Actions carry the acting member's current file so a TV-pack party
+    /// always agrees on WHICH episode the position `t` refers to: an action
+    /// whose file differs from the receiver's current one implies "switch
+    /// to that episode, then apply".
+    Play {
+        from: String,
+        t: f64,
+        #[serde(default)]
+        file: Option<String>,
+    },
+    Pause {
+        from: String,
+        t: f64,
+        #[serde(default)]
+        file: Option<String>,
+    },
+    Seek {
+        from: String,
+        t: f64,
+        #[serde(default)]
+        file: Option<String>,
+    },
 }
 
 impl Message {
@@ -68,11 +92,12 @@ impl Message {
         }
     }
 
-    pub fn action(&self) -> Option<(&'static str, &str, f64)> {
+    /// (kind, from, position, file) for the three member actions.
+    pub fn action(&self) -> Option<(&'static str, &str, f64, Option<&str>)> {
         match self {
-            Message::Play { from, t } => Some(("play", from, *t)),
-            Message::Pause { from, t } => Some(("pause", from, *t)),
-            Message::Seek { from, t } => Some(("seek", from, *t)),
+            Message::Play { from, t, file } => Some(("play", from, *t, file.as_deref())),
+            Message::Pause { from, t, file } => Some(("pause", from, *t, file.as_deref())),
+            Message::Seek { from, t, file } => Some(("seek", from, *t, file.as_deref())),
             _ => None,
         }
     }
@@ -186,6 +211,11 @@ pub struct Invite {
     /// Display name of the party creator (roster convenience).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_name: Option<String>,
+    /// Episode (torrent-relative file path) the host started the party on,
+    /// so joiners opening the player land on the same episode. Absent for
+    /// single-file parties.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl Invite {
@@ -254,6 +284,7 @@ mod tests {
             year: Some(1999),
             poster_path: Some("/abc.jpg".into()),
             host_name: Some("alice".into()),
+            file: Some("Show/S01E01.mkv".into()),
         }
     }
 
@@ -293,16 +324,28 @@ mod tests {
         let msg = Message::Play {
             from: "abcd".into(),
             t: 1234.5,
+            file: Some("Show/S01E02.mkv".into()),
         };
         let frame = encode_message(&key, &msg);
         let back = decode_message(&key, &frame).unwrap();
-        assert!(matches!(back, Message::Play { ref from, t } if from == "abcd" && (t - 1234.5).abs() < 1e-9));
+        assert!(matches!(back, Message::Play { ref from, t, file: Some(ref f) }
+            if from == "abcd" && (t - 1234.5).abs() < 1e-9 && f == "Show/S01E02.mkv"));
+    }
+
+    /// Actions from an older peer (no `file` field) must still parse — the
+    /// field defaults to None so mixed-version parties keep working.
+    #[test]
+    fn action_without_file_defaults_to_none() {
+        let legacy = br#"{"type":"play","from":"p1","t":12.0}"#;
+        let back: Message = serde_json::from_slice(legacy).unwrap();
+        assert!(matches!(back, Message::Play { file: None, .. }));
+        assert_eq!(back.action(), Some(("play", "p1", 12.0, None)));
     }
 
     #[test]
     fn seal_rejects_wrong_key_and_tampering() {
         let key = generate_key();
-        let frame = encode_message(&key, &Message::Pause { from: "x".into(), t: 1.0 });
+        let frame = encode_message(&key, &Message::Pause { from: "x".into(), t: 1.0, file: None });
         assert!(decode_message(&generate_key(), &frame).is_none());
         let mut tampered = frame.clone();
         let last = tampered.len() - 1;
@@ -322,11 +365,12 @@ mod tests {
         let m = Message::Seek {
             from: "p1".into(),
             t: 9.0,
+            file: None,
         };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains(r#""type":"seek""#));
         let back: Message = serde_json::from_str(&j).unwrap();
-        assert!(matches!(back, Message::Seek { ref from, t } if from == "p1" && t == 9.0));
+        assert!(matches!(back, Message::Seek { ref from, t, file: None } if from == "p1" && t == 9.0));
     }
 
     #[test]

@@ -505,7 +505,7 @@ async fn watch_party_join_and_action_sync() {
         .unwrap();
 
     let (invite, _lan_only) = party_a
-        .create(ida, "alice", Some(ws_a.clone()))
+        .create(ida, "alice", Some(ws_a.clone()), None)
         .unwrap();
     assert!(invite.starts_with("CTPARTY1:"));
 
@@ -569,7 +569,7 @@ async fn watch_party_join_and_action_sync() {
     .await;
 
     // B plays: the action must land in A's roster (server-side ferry).
-    party_b.send_action("play", 42.0);
+    party_b.send_action("play", 42.0, None);
     wait_for(&party_a, |snap| {
         snap["party"]["peers"]
             .as_array()
@@ -641,7 +641,7 @@ async fn watch_party_punches_into_peer_to_peer() {
         .db
         .insert_item("magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=punch")
         .unwrap();
-    let (invite, _lan) = party_a.create(ida, "alice", Some(ws_a.clone())).unwrap();
+    let (invite, _lan) = party_a.create(ida, "alice", Some(ws_a.clone()), None).unwrap();
 
     let library_b = setup_app(&tmp_b.path().join("app")).await;
     let (http_b, _ws_b, party_b, srv_b) = start_http(library_b.clone()).await;
@@ -658,14 +658,24 @@ async fn watch_party_punches_into_peer_to_peer() {
     wait_for(&party_a, |s| s["party"]["conn"] == serde_json::json!("online")).await;
     wait_for(&party_b, |s| s["party"]["conn"] == serde_json::json!("online")).await;
 
-    // An action now travels the punched UDP path end-to-end.
-    party_b.send_action("play", 7.5);
+    // An action now travels the punched UDP path end-to-end — including the
+    // acting member's file (episode scoping for TV parties).
+    party_b.send_action("play", 7.5, Some("Show/S01E01.mkv"));
     wait_for(&party_a, |snap| {
         snap["party"]["peers"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
             .any(|x| x["name"] == serde_json::json!("bob") && x["pos"].as_f64() == Some(7.5))
+    })
+    .await;
+    wait_for(&party_a, |snap| {
+        snap["party"]["file"] == serde_json::json!("Show/S01E01.mkv")
+            && snap["party"]["peers"]
+                .as_array()
+                .unwrap_or(&vec![])
+                .iter()
+                .any(|x| x["name"] == serde_json::json!("bob") && x["file"] == serde_json::json!("Show/S01E01.mkv"))
     })
     .await;
 

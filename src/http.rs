@@ -909,6 +909,8 @@ pub struct CreatePartyRequest {
     item_id: i64,
     name: Option<String>,
     relay: Option<String>,
+    /// Episode (torrent-relative file path) to scope a TV party to.
+    file: Option<String>,
 }
 
 /// Create a watch party around a library item. Returns the paste-able
@@ -921,7 +923,9 @@ async fn create_party(
         .name
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| state.party.default_name().to_string());
-    let (invite, lan_only) = state.party.create(req.item_id, &name, req.relay)?;
+    let (invite, lan_only) = state
+        .party
+        .create(req.item_id, &name, req.relay, req.file)?;
     let party = state.party.snapshot_json()["party"].clone();
     Ok(Json(json!({ "invite": invite, "lan_only": lan_only, "party": party })))
 }
@@ -1088,7 +1092,8 @@ async fn handle_party_ws(mut socket: WebSocket, party: Arc<crate::party::PartyMa
                             Some("action") => {
                                 if let Some(kind) = v["kind"].as_str() {
                                     let t = v["t"].as_f64().unwrap_or(0.0);
-                                    party.send_action(kind, t);
+                                    let file = v["file"].as_str();
+                                    party.send_action(kind, t, file);
                                 }
                             }
                             Some("state") => {
@@ -1097,6 +1102,7 @@ async fn handle_party_ws(mut socket: WebSocket, party: Arc<crate::party::PartyMa
                                     v["pos"].as_f64().unwrap_or(0.0),
                                     v["playing"].as_bool().unwrap_or(false),
                                     v["buffering"].as_bool().unwrap_or(false),
+                                    v["file"].as_str(),
                                 );
                             }
                             _ => {}

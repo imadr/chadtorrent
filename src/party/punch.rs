@@ -774,7 +774,7 @@ mod tests {
         c.punched = true;
         c.my_seq = 42;
         c.recv_next = 500;
-        c.hold.insert(501, Message::Seek { from: "p".into(), t: 1.0 });
+        c.hold.insert(501, Message::Seek { from: "p".into(), t: 1.0, file: None });
         c.unacked.push_back((42, vec![0u8], now, now));
         c.stall_since = Some(now);
         reset_stream(&mut c);
@@ -840,7 +840,7 @@ mod tests {
         c.punched = true;
         conns.insert(peer, c);
 
-        let env = protocol::encode_message(&key, &Message::Seek { from: "p".into(), t: 3.0 });
+        let env = protocol::encode_message(&key, &Message::Seek { from: "p".into(), t: 3.0, file: None });
         // seq 2 while recv_next=1 → held, stall armed with oldest=2.
         let frame = build_frame(F_DATA, 2, &env);
         handle_frame(&sock, &key, "me", &tx, &mut conns, peer, &frame, Instant::now()).await;

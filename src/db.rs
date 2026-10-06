@@ -54,6 +54,9 @@ pub struct PartyRow {
     pub poster_path: Option<String>,
     pub item_id: i64,
     pub name: String,
+    /// Episode (torrent-relative file path) the party is watching
+    /// (None for single-file items).
+    pub file: Option<String>,
 }
 
 fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
@@ -116,7 +119,8 @@ impl Database {
                 year INTEGER,
                 poster_path TEXT,
                 item_id INTEGER NOT NULL,
-                name TEXT NOT NULL
+                name TEXT NOT NULL,
+                file TEXT
             );
             CREATE TABLE IF NOT EXISTS skipped_files (
                 item_id INTEGER NOT NULL,
@@ -162,6 +166,7 @@ impl Database {
             "ALTER TABLE library ADD COLUMN playhead REAL NOT NULL DEFAULT 0",
             "ALTER TABLE tmdb_meta ADD COLUMN episodes_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE tmdb_meta ADD COLUMN fetched_at INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE party ADD COLUMN file TEXT",
         ] {
             let _ = conn.execute_batch(stmt);
         }
@@ -388,13 +393,13 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO party (id, relay, room, room_key, magnet, tmdb_id, media_type, title,
-                                year, poster_path, item_id, name)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                year, poster_path, item_id, name, file)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 relay = excluded.relay, room = excluded.room, room_key = excluded.room_key,
                 magnet = excluded.magnet, tmdb_id = excluded.tmdb_id, media_type = excluded.media_type,
                 title = excluded.title, year = excluded.year, poster_path = excluded.poster_path,
-                item_id = excluded.item_id, name = excluded.name",
+                item_id = excluded.item_id, name = excluded.name, file = excluded.file",
             params![
                 p.relay,
                 p.room,
@@ -406,7 +411,8 @@ impl Database {
                 p.year,
                 p.poster_path,
                 p.item_id,
-                p.name
+                p.name,
+                p.file
             ],
         )?;
         Ok(())
@@ -416,7 +422,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT relay, room, room_key, magnet, tmdb_id, media_type, title, year,
-                    poster_path, item_id, name
+                    poster_path, item_id, name, file
              FROM party WHERE id = 1",
         )?;
         let mut rows = stmt.query_map([], |row| {
@@ -432,6 +438,7 @@ impl Database {
                 poster_path: row.get(8)?,
                 item_id: row.get(9)?,
                 name: row.get(10)?,
+                file: row.get(11)?,
             })
         })?;
         match rows.next() {
@@ -811,6 +818,7 @@ mod tests {
             poster_path: Some("/p.jpg".into()),
             item_id: 3,
             name: "alice".into(),
+            file: Some("Show/S01E01.mkv".into()),
         };
         db.set_party(&row).unwrap();
         let back = db.get_party().unwrap().unwrap();
@@ -821,11 +829,15 @@ mod tests {
         assert_eq!(back.tmdb_id, Some(7));
         assert_eq!(back.item_id, 3);
         assert_eq!(back.name, "alice");
+        assert_eq!(back.file.as_deref(), Some("Show/S01E01.mkv"));
         // Upsert path
         let mut row2 = row.clone();
         row2.name = "bob".into();
+        row2.file = None;
         db.set_party(&row2).unwrap();
-        assert_eq!(db.get_party().unwrap().unwrap().name, "bob");
+        let back2 = db.get_party().unwrap().unwrap();
+        assert_eq!(back2.name, "bob");
+        assert_eq!(back2.file, None);
         db.clear_party().unwrap();
         assert!(db.get_party().unwrap().is_none());
         cleanup(&dir);

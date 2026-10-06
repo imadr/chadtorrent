@@ -49,6 +49,10 @@ struct Peer {
 struct ActiveParty {
     invite: Invite,
     item_id: i64,
+    /// Episode (torrent-relative file path) the party is currently
+    /// watching; None for single-file items. Follows the last member
+    /// action that carried a file.
+    file: Option<String>,
     /// True when the invite's relay is this instance's own LAN address
     /// (no external relay configured) — the UI warns "same network only".
     lan_only: bool,
@@ -120,6 +124,7 @@ impl PartyManager {
                     year: item.year,
                     poster_path: item.poster_path,
                     host_name: None,
+                    file: row.file,
                 };
                 info!("Rejoining persisted watch party for item {}", row.item_id);
                 self.activate(invite, row.item_id, row.name, false);
@@ -130,14 +135,16 @@ impl PartyManager {
         }
     }
 
-    /// Create a party around a library item. Returns the invite string and
-    /// whether it points at this instance's LAN address (no external
-    /// relay configured — parties work on the local network only).
+    /// Create a party around a library item. `file` optionally scopes the
+    /// party to one episode of a multi-file (TV) torrent. Returns the invite
+    /// string and whether it points at this instance's LAN address (no
+    /// external relay configured — parties work on the local network only).
     pub fn create(
         self: &Arc<Self>,
         item_id: i64,
         name: &str,
         relay_override: Option<String>,
+        file: Option<String>,
     ) -> Result<(String, bool)> {
         let item = self
             .library
@@ -149,6 +156,7 @@ impl PartyManager {
                 "item has no torrent attached".to_string(),
             ));
         }
+        let file = file.filter(|f| !f.trim().is_empty());
         let (relay, lan_only) = if let Some(r) = relay_override.filter(|s| !s.trim().is_empty()) {
             (r.trim().to_string(), false)
         } else if let Some(r) = self.library.config.party_relay.as_deref() {
@@ -167,6 +175,7 @@ impl PartyManager {
             year: item.year,
             poster_path: item.poster_path,
             host_name: Some(name.to_string()),
+            file,
         };
         let invite_str = protocol::encode_invite(&invite);
         self.activate(invite, item_id, name.to_string(), lan_only);
@@ -204,7 +213,14 @@ impl PartyManager {
                     info!("Watch party already active — keeping transport");
                     p.me.name = name.clone();
                     p.item_id = item_id;
+                    // A re-join with an invite that pins an episode moves the
+                    // party there; one without keeps the current episode.
+                    if invite.file.is_some() {
+                        p.file = invite.file.clone();
+                        p.me.file = invite.file.clone();
+                    }
                     let me = p.me.clone();
+                    let file = p.file.clone();
                     drop(inner);
                     let row = PartyRow {
                         relay: invite.relay.clone(),
@@ -218,6 +234,7 @@ impl PartyManager {
                         poster_path: invite.poster_path.clone(),
                         item_id,
                         name,
+                        file,
                     };
                     if let Err(e) = self.library.db.set_party(&row) {
                         warn!("Failed to persist party: {e}");
@@ -242,12 +259,15 @@ impl PartyManager {
             pos: 0.0,
             playing: false,
             buffering: false,
+            file: invite.file.clone(),
         };
         let (tx, rx) = mpsc::unbounded_channel::<ClientCmd>();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Message>();
+        let file = invite.file.clone();
         self.inner.lock().unwrap().party = Some(ActiveParty {
             invite: invite.clone(),
             item_id,
+            file,
             lan_only,
             me: me.clone(),
             peers: HashMap::new(),
@@ -267,6 +287,7 @@ impl PartyManager {
             poster_path: invite.poster_path.clone(),
             item_id,
             name,
+            file: invite.file.clone(),
         };
         if let Err(e) = self.library.db.set_party(&row) {
             warn!("Failed to persist party: {e}");
@@ -341,11 +362,17 @@ impl PartyManager {
     }
 
     /// Local browser sent an action (it has already applied it locally).
-    pub fn send_action(&self, kind: &str, t: f64) {
+    /// `file` is the episode the member is watching (None for single-file
+    /// items); an action carrying a file also moves the whole party there.
+    pub fn send_action(&self, kind: &str, t: f64, file: Option<&str>) {
         let mut inner = self.inner.lock().unwrap();
         let Some(p) = inner.party.as_mut() else { return };
         p.me.pos = t;
         p.me.buffering = false;
+        p.me.file = file.map(|f| f.to_string());
+        if let Some(f) = file {
+            p.file = Some(f.to_string());
+        }
         // Only play/pause change the playing flag; a seek must not flip it
         // to false (the local player's state is the authority via
         // set_local_state, and clobbering here showed us as paused after
@@ -359,14 +386,17 @@ impl PartyManager {
             "play" => Message::Play {
                 from: p.me.id.clone(),
                 t,
+                file: file.map(|f| f.to_string()),
             },
             "pause" => Message::Pause {
                 from: p.me.id.clone(),
                 t,
+                file: file.map(|f| f.to_string()),
             },
             "seek" => Message::Seek {
                 from: p.me.id.clone(),
                 t,
+                file: file.map(|f| f.to_string()),
             },
             _ => return,
         };
@@ -379,17 +409,27 @@ impl PartyManager {
     /// (ready/buffering/playing) also trigger an immediate presence
     /// broadcast so peers react without waiting for the heartbeat;
     /// position movement refreshes the local roster only.
-    pub fn set_local_state(&self, ready: bool, pos: f64, playing: bool, buffering: bool) {
+    pub fn set_local_state(
+        &self,
+        ready: bool,
+        pos: f64,
+        playing: bool,
+        buffering: bool,
+        file: Option<&str>,
+    ) {
         let changed = {
             let mut inner = self.inner.lock().unwrap();
             let Some(p) = inner.party.as_mut() else { return };
+            let me_file = file.map(|f| f.to_string());
             let visible_changed =
-                p.me.ready != ready || p.me.buffering != buffering || p.me.playing != playing;
+                p.me.ready != ready || p.me.buffering != buffering || p.me.playing != playing
+                    || p.me.file != me_file;
             let moved = (p.me.pos - pos).abs() > 0.25;
             p.me.ready = ready;
             p.me.pos = pos;
             p.me.playing = playing;
             p.me.buffering = buffering;
+            p.me.file = me_file;
             if visible_changed {
                 let msg = Message::Presence {
                     peer: p.me.clone(),
@@ -419,6 +459,7 @@ impl PartyManager {
             "type": "party",
             "party": {
                 "item_id": p.item_id,
+                "file": p.file,
                 "invite": protocol::encode_invite(&p.invite),
                 "relay": p.invite.relay,
                 "lan_only": p.lan_only,
@@ -445,6 +486,7 @@ impl PartyManager {
                     || existing.state.buffering != peer.buffering
                     || existing.state.playing != peer.playing
                     || existing.state.name != peer.name
+                    || existing.state.file != peer.file
                     || (existing.state.pos - peer.pos).abs() > 0.25;
                 existing.state = peer;
                 existing.last_seen = Instant::now();
@@ -489,12 +531,19 @@ impl PartyManager {
         false
     }
 
-    /// Fold a remote action into the roster so positions stay fresh.
-    fn apply_remote_action(&self, from: &str, kind: &str, t: f64) {
+    /// Fold a remote action into the roster so positions stay fresh. An
+    /// action that carries a file also moves the party to that episode.
+    fn apply_remote_action(&self, from: &str, kind: &str, t: f64, file: Option<&str>) {
         let mut inner = self.inner.lock().unwrap();
         let Some(p) = inner.party.as_mut() else { return };
+        if let Some(f) = file {
+            p.file = Some(f.to_string());
+        }
         if let Some(peer) = p.peers.get_mut(from) {
             peer.state.pos = t;
+            if let Some(f) = file {
+                peer.state.file = Some(f.to_string());
+            }
             match kind {
                 "play" => peer.state.playing = true,
                 "pause" => peer.state.playing = false,
@@ -512,6 +561,7 @@ fn peer_json(p: &PeerState) -> serde_json::Value {
         "pos": p.pos,
         "playing": p.playing,
         "buffering": p.buffering,
+        "file": p.file,
     })
 }
 
@@ -535,13 +585,14 @@ async fn run_inbound(mgr: Arc<PartyManager>, my_gen: u64, mut rx: UnboundedRecei
             if changed || is_hello {
                 mgr.emit_snapshot();
             }
-        } else if let Some((kind, from, t)) = msg.action() {
+        } else if let Some((kind, from, t, file)) = msg.action() {
             let by = mgr.peer_name(from);
-            mgr.apply_remote_action(from, kind, t);
+            mgr.apply_remote_action(from, kind, t, file);
             let playing = mgr.peer_playing(from);
             mgr.emit_snapshot();
             let ev = serde_json::json!({
-                "type": "action", "kind": kind, "t": t, "by": by, "playing": playing
+                "type": "action", "kind": kind, "t": t, "by": by, "playing": playing,
+                "file": file,
             });
             let _ = mgr.events.send(ev.to_string());
         }
