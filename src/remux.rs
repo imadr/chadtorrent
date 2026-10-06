@@ -4,18 +4,19 @@ use tokio::process::Command;
 pub struct Remuxer;
 
 impl Remuxer {
-    /// Build the `SourceBuffer` MIME type for a file, e.g.
+    /// Build the stream MIME type for a file, e.g.
     /// `video/mp4; codecs="avc1.640028,mp4a.40.5"`. Returns `None` when the
     /// file can't be probed yet (e.g. a partial download without its moov
-    /// atom) — the caller retries later instead of caching a guess. Guessing
-    /// is dangerous: Firefox wedges on an AAC profile mismatch, so a wrong
-    /// fallback is worse than no answer.
+    /// atom) or when its video codec can't be honestly named — the caller
+    /// retries later / fails honestly instead of caching a guess. Guessing
+    /// is dangerous: the declared codec string must match the stream's
+    /// actual codecs, so a wrong answer is worse than none.
     pub async fn probe_mse_mime(path: &str) -> Option<String> {
         let output = Command::new("ffprobe")
             .args([
                 "-v", "error",
                 "-print_format", "json",
-                "-show_entries", "stream=codec_type,codec_name,profile,level",
+                "-show_entries", "stream=codec_type,codec_name,profile,level,pix_fmt",
                 path,
             ])
             .stdout(Stdio::piped())
@@ -33,7 +34,7 @@ impl Remuxer {
                     let codec = st.get("codec_name").and_then(|v| v.as_str()).unwrap_or("");
                     match ctype {
                         "video" if video.is_none() => {
-                            video = Some(mse_video_codec(codec, st));
+                            video = mse_video_codec(codec, st);
                         }
                         "audio" if audio.is_none() => {
                             audio = Some(mse_audio_codec(codec, st));
@@ -72,10 +73,31 @@ impl Remuxer {
 
 }
 
-fn mse_video_codec(codec: &str, st: &serde_json::Value) -> String {
+/// Bit depth from the ffprobe pixel format ("yuv420p10le" → 10).
+fn pix_depth(st: &serde_json::Value) -> u32 {
+    let pf = st.get("pix_fmt").and_then(|v| v.as_str()).unwrap_or("");
+    if pf.contains("10") {
+        10
+    } else if pf.contains("12") {
+        12
+    } else if pf.contains("16") {
+        16
+    } else {
+        8
+    }
+}
+
+/// Codec string for the video stream, or `None` when the codec can't be
+/// honestly named (exotic container codecs with no browser decoder). A
+/// guaranteed-mismatch string is worse than none: the browser would reject
+/// a stream by its NAME, not by its content.
+fn mse_video_codec(codec: &str, st: &serde_json::Value) -> Option<String> {
     match codec {
         "h264" => {
             // avc1.<profile><constraint><level> · profile/level from ffprobe.
+            // NOTE: the AVC level byte is the decimal level written as 2 HEX
+            // digits (40 → "28") — the opposite convention of HEVC. Don't
+            // "fix" this one to decimal.
             let profile = st.get("profile").and_then(|v| v.as_str()).unwrap_or("High");
             let level = st.get("level").and_then(|v| v.as_i64()).unwrap_or(40).clamp(10, 52);
             let level_hex = format!("{:02X}", level as u32);
@@ -90,28 +112,48 @@ fn mse_video_codec(codec: &str, st: &serde_json::Value) -> String {
                 "High 4:4:4 Predictive" => ("F4", "00"),
                 _ => ("64", "00"), // High
             };
-            format!("avc1.{}{}{}", profile_hex, constraint, level_hex)
+            Some(format!("avc1.{}{}{}", profile_hex, constraint, level_hex))
         }
         "hevc" | "h265" => {
-            // hvc1.<profile_space+profile_idc>.<compat>.<tier_level>.<constraints>
-            // Common defaults (Main / Main 10 at level 4.1, Main tier).
+            // hvc1.<profile_idc>.<compat>.L<general_level_idc>.<constraints>
+            // e.g. `hvc1.1.6.L93.B0` (Main@3.1), `hvc1.2.4.L153.B0` (Main10).
+            // The level MUST be DECIMAL: ffprobe reports general_level_idc as
+            // a decimal integer, and Chrome's strict codec-string parser
+            // rejects anything else before ever consulting the hardware
+            // decoder (a {:03X} here once produced "L05D" for level 93 and
+            // wedged every Chrome machine with a perfectly good HEVC
+            // decoder, while Safari — which ignores the string — played
+            // the same file fine).
             let profile = st.get("profile").and_then(|v| v.as_str()).unwrap_or("Main");
             let level = st.get("level").and_then(|v| v.as_i64()).unwrap_or(120).clamp(30, 186);
-            let level_code = format!("L{:03X}.B0", level as u32);
+            let level_code = format!("L{}.B0", level);
             let profile_code = match profile {
-                "Main 10" => "1.6",
-                "Main Still Picture" => "3",
-                "Main 4:2:2 10" => "4.4",
-                "Main 4:4:4" => "3.4",
-                "Main 4:4:4 10" => "5.6",
+                // The declared profile must match the hvcC the stream
+                // actually carries: Main → "1.6", Main10 → "2.4" (the
+                // canonical Apple/ffmpeg form).
+                "Main 10" => "2.4",
+                "Main Still Picture" => "3.1",
+                // ffprobe lumps every range-extension profile (4:2:2, 4:4:4,
+                // 12-bit) under "Rext" — profile_idc 4. No browser decodes
+                // these, but the name still has to tell the truth (the
+                // decoder ladder rejects it and the UI says so honestly).
+                "Rext" => "4.13",
                 _ => "1.6", // Main
             };
-            format!("hvc1.{}.{}", profile_code, level_code)
+            Some(format!("hvc1.{}.{}", profile_code, level_code))
         }
-        "vp9" => "vp09.00.10.08".to_string(),
-        "av1" => "av01.0.04M.08".to_string(),
-        "mpeg4" => "mp4v.20.240".to_string(),
-        _ => "avc1.640028".to_string(),
+        "vp9" => {
+            // vp09.<profile>.<level>.<bit-depth> — declare the REAL depth; a
+            // 10-bit stream declared as 08 would configure an 8-bit decoder.
+            Some(format!("vp09.00.10.{:02}", pix_depth(st)))
+        }
+        "av1" => {
+            // av01.<profile>.<level><tier>.<bit-depth>
+            Some(format!("av01.0.04M.{:02}", pix_depth(st)))
+        }
+        // Anything else (mpeg2video, mpeg4-ASP, vp6, theora, ...) either
+        // can't live in fMP4 or has no browser decoder: name nothing.
+        _ => None,
     }
 }
 
@@ -135,5 +177,95 @@ fn mse_audio_codec(codec: &str, st: &serde_json::Value) -> String {
         "ac3" => "ac-3".to_string(),
         "eac3" => "ec-3".to_string(),
         _ => "mp4a.40.2".to_string(),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn st(profile: &str, level: i64, pix_fmt: &str) -> serde_json::Value {
+        json!({ "profile": profile, "level": level, "pix_fmt": pix_fmt })
+    }
+
+    #[test]
+    fn hevc_level_is_decimal() {
+        // ffprobe reports general_level_idc as a DECIMAL integer (93 = 3.1).
+        // It must land in the codec string verbatim: a hex formatting here
+        // produced "L05D" for level 93, and Chrome's strict codec-string
+        // parser rejected the whole string before ever consulting the
+        // hardware HEVC decoder.
+        assert_eq!(
+            mse_video_codec("hevc", &st("Main", 93, "yuv420p")).as_deref(),
+            Some("hvc1.1.6.L93.B0")
+        );
+        assert_eq!(
+            mse_video_codec("hevc", &st("Main", 120, "yuv420p")).as_deref(),
+            Some("hvc1.1.6.L120.B0")
+        );
+        assert_eq!(
+            mse_video_codec("hevc", &st("Main", 150, "yuv420p")).as_deref(),
+            Some("hvc1.1.6.L150.B0")
+        );
+    }
+
+    #[test]
+    fn hevc_profiles_match_the_stream() {
+        // Main10 is profile_idc 2 compat 4 (the canonical "2.4") — declaring
+        // Main "1.6" for a Main10 hvcC is a lie that strict parsers punish.
+        assert_eq!(
+            mse_video_codec("hevc", &st("Main 10", 153, "yuv420p10le")).as_deref(),
+            Some("hvc1.2.4.L153.B0")
+        );
+        // ffprobe's "Rext" covers all range-extension profiles (idc 4).
+        assert_eq!(
+            mse_video_codec("hevc", &st("Rext", 120, "yuv422p10le")).as_deref(),
+            Some("hvc1.4.13.L120.B0")
+        );
+        // Still Picture (idc 3) must keep all four segments.
+        assert_eq!(
+            mse_video_codec("hevc", &st("Main Still Picture", 93, "yuv420p")).as_deref(),
+            Some("hvc1.3.1.L93.B0")
+        );
+    }
+
+    #[test]
+    fn h264_keeps_the_hex_level_byte() {
+        // AVC is the OPPOSITE convention of HEVC: the level_idc byte is the
+        // decimal level written as 2 hex digits (40 → "28", 51 → "33").
+        assert_eq!(
+            mse_video_codec("h264", &st("High", 40, "yuv420p")).as_deref(),
+            Some("avc1.640028")
+        );
+        assert_eq!(
+            mse_video_codec("h264", &st("High", 51, "yuv420p")).as_deref(),
+            Some("avc1.640033")
+        );
+    }
+
+    #[test]
+    fn vp9_av1_declare_real_bit_depth() {
+        // 10-bit streams declared as 08 would configure an 8-bit decoder.
+        assert_eq!(
+            mse_video_codec("vp9", &st("", 0, "yuv420p10le")).as_deref(),
+            Some("vp09.00.10.10")
+        );
+        assert_eq!(
+            mse_video_codec("vp9", &st("", 0, "yuv420p")).as_deref(),
+            Some("vp09.00.10.08")
+        );
+        assert_eq!(
+            mse_video_codec("av1", &st("", 0, "yuv420p10le")).as_deref(),
+            Some("av01.0.04M.10")
+        );
+    }
+
+    #[test]
+    fn unknown_video_is_not_named() {
+        // Exotic container codecs get NO string rather than a guaranteed
+        // mismatch — the manifest stays unset and the player fails honestly.
+        assert_eq!(mse_video_codec("mpeg2video", &st("", 0, "")), None);
+        assert_eq!(mse_video_codec("mpeg4", &st("", 0, "")), None);
+        assert_eq!(mse_video_codec("vp6", &st("", 0, "")), None);
     }
 }

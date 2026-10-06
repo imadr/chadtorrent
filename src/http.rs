@@ -404,9 +404,9 @@ async fn list_items(
     Ok(Json(with_flag))
 }
 
-/// Every playable item is served through the MSE endpoint (fragmented MP4
-/// regardless of the source container). The flag is a convenience for the
-/// frontend to pick the MSE player vs the plain `<video>` fallback.
+/// Every playable item is served through the streaming endpoint (fragmented
+/// MP4 regardless of the source container). The `mse` flag is a legacy
+/// marker kept for API compatibility: it simply means "playable".
 fn item_json_with_mse(it: LibraryItem) -> serde_json::Value {
     let playable = matches!(
         it.state.as_str(),

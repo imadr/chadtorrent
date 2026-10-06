@@ -2275,6 +2275,10 @@ async function startEngine() {
     catch (e) { throw new Error(String(e.message || e).includes('not found') ? 'Item is gone' : 'Server unreachable'); }
     if (info.error) throw new Error(info.error);
     if (info.state === 'error') throw new Error('Torrent failed to download');
+    // A finished cut that never produced a codec string: the server could not
+    // name the video codec honestly (exotic container codec with no browser
+    // decoder) — fail clearly instead of looping forever.
+    if (info.done && !info.mime) throw new Error('Unsupported codec: nothing in this file that the browser can decode');
     // A ready item's cache is re-cut on server start; joining mid-recut means
     // reading init/segments that are being rewritten (truncated chain, dead
     // session). Wait for the cut to finish; downloading items have no such
@@ -2321,7 +2325,7 @@ async function startEngine() {
   const dot = codecs.v.indexOf('.');
   const base = dot > 0 ? codecs.v.slice(dot) : '';
   const codecs2 = new Set([codecs.v]);
-  if (base && /^hvc1|hev1|avc1|avc3/.test(codecs.v)) codecs2.add(vtr.codec4cc + base);
+  if (base && /^(hvc1|hev1|avc1|avc3)/.test(codecs.v)) codecs2.add(vtr.codec4cc + base);
   const cands = [];
   // Prefer a hardware decoder first (libmedia does the same): with the
   // default 'no-preference' Chrome can pick software decode for some
