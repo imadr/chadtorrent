@@ -682,7 +682,7 @@ function posterURL(p, size) {
   return /^https?:/i.test(p) ? p : TMDB_IMG + '/' + size + p;
 }
 function placeholder(phText) { return '<div class="ph">' + phText + '</div>'; }
-function posterTag(src) { return '<img loading="lazy" src="' + src + '" alt="" onerror="this.onerror=null;this.outerHTML=placeholder(\'▷\')">'; }
+function posterTag(src) { return '<img loading="lazy" referrerpolicy="no-referrer" src="' + src + '" alt="" onerror="this.onerror=null;this.outerHTML=placeholder(\'▷\')">'; }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
