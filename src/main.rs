@@ -6,6 +6,7 @@ mod http;
 mod library;
 mod metadata;
 mod party;
+mod reading;
 mod remux;
 mod segmenter;
 mod subtitles;
@@ -95,20 +96,39 @@ async fn main() {
             keys.clone(),
         )))
     };
+    let reading = Arc::new(reading::ReadingClient::new(
+        if keys.comicvine_api_key.is_empty() {
+            None
+        } else {
+            Some(keys.comicvine_api_key.clone())
+        },
+    ));
+    if reading.comics_configured() {
+        info!("Comics search: Comic Vine key configured");
+    } else {
+        info!("Comics search disabled — no comicvine_api_key in chadtorrent.json");
+    }
 
     let index_html = include_str!("../static/index.html").to_string();
 
     let party = PartyManager::new(library.clone());
 
+    // The meta cache serves every catalogue: TMDB for movies/shows (only with
+    // a key), MangaDex/Comic Vine for manga/comics (always available).
+    let meta = Arc::new(metadata::MetaCache::new(
+        library.db.clone(),
+        tmdb.clone(),
+        reading.clone(),
+    ));
+
     let state = AppState {
         library: library.clone(),
         index_html,
-        meta: tmdb
-            .as_ref()
-            .map(|t| Arc::new(metadata::MetaCache::new(library.db.clone(), t.clone()))),
+        meta: Some(meta),
         tmdb,
         subs,
         party,
+        reading,
     };
 
     let router = http::build_router(state);

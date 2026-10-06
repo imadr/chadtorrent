@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::db::Database;
 use crate::error::{Error, Result};
+use crate::reading::ReadingDetail;
 
 const TMDB_BASE: &str = "https://api.themoviedb.org/3";
 
@@ -372,7 +373,11 @@ impl TmdbClient {
 /// a change so their caller re-reads the row.
 pub struct MetaCache {
     db: Arc<Database>,
-    tmdb: Arc<TmdbClient>,
+    /// TMDB covers movie/tv sweeps; `None` when no key is configured (those
+    /// media types then error on refresh, but reading types still work).
+    tmdb: Option<Arc<TmdbClient>>,
+    /// Reading catalogues (MangaDex / Comic Vine) back the manga/comic sweeps.
+    reading: Arc<crate::reading::ReadingClient>,
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -382,16 +387,21 @@ enum Slot {
 }
 
 impl MetaCache {
-    pub fn new(db: Arc<Database>, tmdb: Arc<TmdbClient>) -> Self {
+    pub fn new(
+        db: Arc<Database>,
+        tmdb: Option<Arc<TmdbClient>>,
+        reading: Arc<crate::reading::ReadingClient>,
+    ) -> Self {
         Self {
             db,
             tmdb,
+            reading,
             inflight: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn tmdb(&self) -> &TmdbClient {
-        &self.tmdb
+    pub fn tmdb(&self) -> Option<&TmdbClient> {
+        self.tmdb.as_deref()
     }
 
     /// The stored payload, or `None` if this show was never fetched.
@@ -447,19 +457,117 @@ impl MetaCache {
         });
     }
 
+    /// Refresh dispatch by catalogue. Movies/shows sweep TMDB; manga/comics
+    /// sweep MangaDex/Comic Vine — the cache row shape is shared.
     async fn sweep(&self, media_type: &str, tmdb_id: i64) -> Result<bool> {
+        match media_type {
+            "manga" | "comic" => self.sweep_reading(media_type, tmdb_id).await,
+            _ => self.sweep_tmdb(media_type, tmdb_id).await,
+        }
+    }
+
+    /// Re-read a manga's chapter feed or a comic's issue list (plus fresh
+    /// descriptions) into the shared cache row. Same TTL/staleness and change
+    /// reporting rules as the TMDB sweep, so ongoing titles pick up new
+    /// chapters and no-op views cost two SQLite reads.
+    async fn sweep_reading(&self, media_type: &str, id: i64) -> Result<bool> {
+        let cached = self.db.get_tmdb_meta(media_type, id).ok().flatten();
+        if let Some(c) = cached.as_ref() {
+            if !c.is_stale() {
+                return Ok(false);
+            }
+        }
+        let detail = match media_type {
+            "manga" => {
+                // ext_key is the MangaDex UUID; the title is the fallback for
+                // rows added before MangaDex became the source.
+                let source = self.db.get_reading_source(media_type, id)?;
+                match source {
+                    Some((Some(uuid), _)) => self.reading.manga_detail(&uuid).await?,
+                    Some((None, Some(title))) => self
+                        .reading
+                        .manga_detail_by_title(&title)
+                        .await
+                        .unwrap_or(ReadingDetail {
+                            overview: None,
+                            episodes: Vec::new(),
+                            poster: None,
+                        }),
+                    _ => ReadingDetail {
+                        overview: None,
+                        episodes: Vec::new(),
+                        poster: None,
+                    },
+                }
+            }
+            _ => self.reading.comic_detail(id).await?,
+        };
+        // Manga covers come from AniList: push the refreshed art onto every
+        // row of the group so existing entries heal without a re-add.
+        if media_type == "manga" {
+            if let Some(poster) = detail.poster.as_deref() {
+                if let Err(e) = self.db.set_poster_for_group(media_type, id, poster) {
+                    warn!("poster refresh failed for {media_type}:{id}: {e}");
+                }
+            }
+        }
+        let episodes = vec![crate::metadata::SeasonEpisodes {
+            season_number: 1,
+            episodes: detail.episodes,
+        }];
+        let seasons = vec![SeasonInfo {
+            season_number: 1,
+            name: Some(if media_type == "comic" {
+                "Issues".into()
+            } else {
+                "Chapters".into()
+            }),
+            episode_count: Some(episodes[0].episodes.len() as i64),
+            air_date: None,
+        }];
+        let fetched_at = now_secs();
+        let changed = match cached.as_ref() {
+            Some(c) => {
+                c.fingerprint()
+                    != TmdbMeta {
+                        overview: detail.overview.clone(),
+                        seasons: seasons.clone(),
+                        episodes: episodes.clone(),
+                        fetched_at,
+                    }
+                    .fingerprint()
+            }
+            None => true,
+        };
+        self.db
+            .set_tmdb_meta(media_type, id, detail.overview.as_deref(), &seasons, &episodes, fetched_at)?;
+        Ok(changed)
+    }
+
+    async fn sweep_tmdb(&self, media_type: &str, tmdb_id: i64) -> Result<bool> {
+        // Invariant: only movie/tv ever reach TMDB. A stray manga/comic id
+        // here would resolve to an unrelated TMDB title (catalogue ids
+        // collide) and poison the cache row under the reading media_type.
+        if !matches!(media_type, "movie" | "tv") {
+            return Err(Error::BadRequest(format!(
+                "unsupported media_type for TMDB: {media_type}"
+            )));
+        }
+        let tmdb = self.tmdb.as_ref().ok_or_else(|| {
+            Error::BadRequest("Movie metadata is not configured on this server".into())
+        })?;
         let cached = self.db.get_tmdb_meta(media_type, tmdb_id).ok().flatten();
         if let Some(c) = cached.as_ref() {
             if !c.is_stale() {
                 return Ok(false);
             }
         }
-        let (details, seasons) = self.tmdb.get_details(tmdb_id, media_type).await?;
+        let (details, seasons) = tmdb.get_details(tmdb_id, media_type).await?;
         // A failed episode sweep is stored (the overview and season list are
         // still good) but leaves `fetched_at` alone so the next view retries
         // instead of trusting a show with empty episode lists for a day.
         let (episodes, complete) = if media_type == "tv" {
-            match self.tmdb.tv_all_episodes(tmdb_id, &seasons).await {
+            match tmdb.tv_all_episodes(tmdb_id, &seasons).await {
                 Ok(e) => (e, true),
                 Err(e) => {
                     warn!("tmdb episode sweep failed for tv:{tmdb_id}: {e}");

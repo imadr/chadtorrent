@@ -128,6 +128,15 @@
          border: 1px solid var(--line); padding: 9px 12px; font: inherit; outline: none; }
   input:focus { border-color: var(--line-hi); }
   #am-search { width: 100%; display: block; flex: none; }
+  .minibtn { font-size: 11px; padding: 3px 10px; margin-left: 8px; vertical-align: 2px;
+             background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+             text-transform: none; letter-spacing: 0; }
+  .minibtn:hover { border-color: var(--line-hi); color: var(--text); }
+  #am-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  #am-tabs .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
+                     background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  #am-tabs .s-chip:hover { border-color: var(--line-hi); }
+  #am-tabs .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
   label.k { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; white-space: nowrap; }
   .panel.confirm { max-width: 380px; }
   .cf-msg { color: var(--text); margin: 0 0 20px; line-height: 1.5; white-space: pre-line; }
@@ -367,6 +376,14 @@
     <h3>TV Shows</h3>
     <div id="grid-tv" class="grid"></div>
   </section>
+  <section class="lib-sec" id="lib-sec-manga" hidden>
+    <h3>Manga</h3>
+    <div id="grid-manga" class="grid"></div>
+  </section>
+  <section class="lib-sec" id="lib-sec-comics" hidden>
+    <h3>Comics</h3>
+    <div id="grid-comics" class="grid"></div>
+  </section>
 </main>
 
 <main id="view-movie" hidden>
@@ -428,6 +445,11 @@
   <div class="panel">
     <div class="phead"><span>Add to library</span><button class="x" id="am-close">✕</button></div>
     <input type="text" id="am-search" placeholder="Search movies &amp; shows…">
+    <div id="am-tabs">
+      <button class="s-chip sel" data-tab="media">Movies &amp; TV</button>
+      <button class="s-chip" data-tab="manga">Manga</button>
+      <button class="s-chip" data-tab="comics">Comics</button>
+    </div>
     <div id="am-results" class="am-body"></div>
   </div>
 </div>
@@ -652,7 +674,12 @@ function groupItems(list) {
   }
   return g;
 }
-function posterURL(p, size) { return TMDB_IMG + '/' + size + p; }
+function posterURL(p, size) {
+  if (!p) return '';
+  // Reading catalogues (MangaDex / Comic Vine) hand out absolute URLs; TMDB
+  // gives path fragments that need the image host + size prefix.
+  return /^https?:/i.test(p) ? p : TMDB_IMG + '/' + size + p;
+}
 function placeholder(phText) { return '<div class="ph">' + phText + '</div>'; }
 function posterTag(src) { return '<img loading="lazy" src="' + src + '" alt="" onerror="this.onerror=null;this.outerHTML=placeholder(\'▷\')">'; }
 function esc(s) {
@@ -668,7 +695,12 @@ function movieYear(it) {
   if (it.magnet) { const m = it.magnet.match(/20\d{2}/); return m ? m[0] : ''; }
   return '';
 }
-function kindLabel(it) { return it.tmdb_id ? (it.media_type === 'tv' ? 'TV' : 'Movie') : ''; }
+function kindLabel(it) {
+  if (!it.tmdb_id) return '';
+  return { tv: 'TV', manga: 'Manga', comic: 'Comic' }[it.media_type] || 'Movie';
+}
+/* Reading entries (manga/comics) are metadata-only: no torrent, no player. */
+function isReading(it) { return it && (it.media_type === 'manga' || it.media_type === 'comic'); }
 
 function movieRep(rows) {
   return rows.find(r => r.tmdb_id && !r.magnet) || rows.find(r => r.tmdb_id) || rows[0];
@@ -679,25 +711,32 @@ function infoHash(mag) {
 }
 
 function renderGrid() {
-  const gm = $('grid-movies'), gtv = $('grid-tv');
-  gm.innerHTML = ''; gtv.innerHTML = '';
+  // Map keys are media_type values ('movie'/'tv'/'manga'/'comic').
+  const grids = {
+    movie: $('grid-movies'), tv: $('grid-tv'),
+    manga: $('grid-manga'), comic: $('grid-comics'),
+  };
+  for (const g of Object.values(grids)) g.innerHTML = '';
   const g = groupItems(items);
   for (const [k, rows] of g) {
     const rep = movieRep(rows);
     const card = document.createElement('div');
     card.className = 'card';
+    const ph = isReading(rep) ? '▤' : '▷';
     const posterHtml = rep.poster_path
       ? posterTag(posterURL(rep.poster_path, POSTER_IDX))
-      : placeholder('▷');
+      : placeholder(ph);
     card.innerHTML =
       '<div class="poster">' + posterHtml + '</div>' +
       '<div class="meta"><div class="t">' + esc(movieName(rep)) + '</div>' +
       '<div class="y">' + esc(movieYear(rep)) + '</div></div>';
     card.onclick = () => openMovie(k);
-    (rep.media_type === 'tv' ? gtv : gm).appendChild(card);
+    grids[isReading(rep) ? rep.media_type : (rep.media_type === 'tv' ? 'tv' : 'movie')].appendChild(card);
   }
-  $('lib-sec-movies').hidden = !gm.children.length;
-  $('lib-sec-tv').hidden = !gtv.children.length;
+  $('lib-sec-movies').hidden = !grids.movie.children.length;
+  $('lib-sec-tv').hidden = !grids.tv.children.length;
+  $('lib-sec-manga').hidden = !grids.manga.children.length;
+  $('lib-sec-comics').hidden = !grids.comic.children.length;
   libHighlight();
 }
 
@@ -824,10 +863,11 @@ function openMovie(k, push = true) {
   window.scrollTo(0, 0);
   renderMovie();
   const rep = movieRep(rows);
-  if (rep.tmdb_id) findTorrents(rep);
-  // Season/episode buttons are already painted from the server's cached
-  // payload; this only re-checks upstream for newly released seasons/episodes
-  // and repaints if something changed.
+  // Reading entries are metadata-only: no torrent search. The meta refresh
+  // still runs for them — it's the TTL'd re-check for new chapters/issues.
+  if (!isReading(rep)) {
+    if (rep.tmdb_id) findTorrents(rep);
+  }
   refreshMvMeta(rep);
 }
 
@@ -852,13 +892,17 @@ function renderMovie() {
         '<button class="btn danger" id="mv-del">Delete</button>' +
       '</div>' +
     '</div>' +
+    '<section id="mv-ch-sec" hidden>' +
+      '<h3 id="mv-ch-title">Chapters</h3>' +
+      '<div class="rows" id="mv-chapters"></div>' +
+    '</section>' +
     '<section id="mv-ep-sec">' +
       '<h3 id="mv-ep-title" hidden>Episodes</h3>' +
       '<div id="mv-seasonchips" hidden></div>' +
       '<div id="mv-epselect" hidden></div>' +
       '<div class="rows" id="mv-epfiles" hidden></div>' +
     '</section>' +
-    '<section>' +
+    '<section id="mv-dl-sec">' +
       '<h3>Downloaded contents</h3>' +
       '<div class="rows" id="mv-torrents"></div>' +
     '</section>' +
@@ -869,10 +913,29 @@ function renderMovie() {
 
   $('mv-poster').innerHTML = rep.poster_path
     ? posterTag(posterURL(rep.poster_path, POSTER_MD))
-    : placeholder('▷');
+    : placeholder(isReading(rep) ? '▤' : '▷');
   $('mv-title').textContent = movieName(rep);
   $('mv-sub').textContent = [movieYear(rep), kindLabel(rep)].filter(Boolean).join(' · ') || ' ';
   $('mv-del').addEventListener('click', mvDelClick);
+
+  if (isReading(rep)) {
+    // A reading entry is just its page: cover, synopsis, chapter list,
+    // delete. Everything torrent-ish stays out of the DOM.
+    $('mv-ep-sec').hidden = true;
+    $('mv-dl-sec').hidden = true;
+    $('mv-searchsec').hidden = true;
+    const ov = $('mv-overview');
+    const t = (rep.overview || '').trim();
+    if (t) { ov.hidden = false; ov.textContent = t; }
+    else ov.hidden = true;
+    // Chapters/issues come from the same cached meta payload as TV episodes
+    // (swept from MangaDex/Comic Vine server-side); the list paints when the
+    // payload lands.
+    ensureMvMeta(rep);
+    renderChapters(rep);
+    mvSyncSel();
+    return;
+  }
 
   $('mv-searchsec').hidden = !rep.tmdb_id;
 
@@ -1065,9 +1128,12 @@ function tvSeasonsOf(rep) {
 function applyMvOverview(rep) {
   const el = $('mv-overview');
   if (!el || !rep || !rep.tmdb_id) return;
+  // Reading entries never reach here (their synopsis is set in renderMovie);
+  // movies/shows prefer the cached TMDB payload, falling back to the
+  // synopsis the search result carried.
   const m = mvMetaByTmdb.get(mvMetaKey(rep));
-  const t = m && m.overview && String(m.overview).trim();
-  if (t) { el.hidden = false; el.textContent = m.overview; }
+  const t = (m && m.overview && String(m.overview).trim()) || (rep.overview || '').trim();
+  if (t) { el.hidden = false; el.textContent = t; }
   else el.hidden = true;
 }
 /* Fold a detail payload into the session cache: `episodes` comes back keyed by
@@ -1093,7 +1159,34 @@ function repaintMvMeta(rep) {
   const me = currentMovie && movieRep(currentMovie.rows);
   if (!me || !me.tmdb_id || mvMetaKey(me) !== mvMetaKey(rep)) return;
   if (me.media_type === 'tv') refreshTvView();
+  if (isReading(me)) renderChapters(me);
   applyMvOverview(me);
+}
+/* The chapter (manga) / issue (comic) list. Stored in the same cached meta
+ * payload as TV episodes — one season ("1") whose episodes are the rows —
+ * swept from MangaDex (real chapter titles) or Comic Vine (real issue
+ * names + cover dates). Rows are inert: no reader yet, nothing plays.
+ * Newest first by default; the header button flips the order. */
+var chDesc = true;
+function renderChapters(rep) {
+  const sec = $('mv-ch-sec'), box = $('mv-chapters');
+  if (!sec || !box) return;
+  const m = mvMetaByTmdb.get(mvMetaKey(rep));
+  let list = m && m.episodes && m.episodes['1'];
+  if (!Array.isArray(list) || !list.length) { sec.hidden = true; return; }
+  const isComic = rep.media_type === 'comic';
+  list = [...list].sort((a, b) => (chDesc ? -1 : 1) * ((b.episode_number || 0) - (a.episode_number || 0)));
+  $('mv-ch-title').innerHTML = (isComic ? 'Issues' : 'Chapters') +
+    ' <button id="mv-ch-sort" class="minibtn">' + (chDesc ? 'Newest first' : 'Oldest first') + '</button>';
+  $('mv-ch-sort').onclick = () => { chDesc = !chDesc; renderChapters(rep); };
+  box.innerHTML = list.map(ch => {
+    const n = ch.episode_number;
+    const label = ch.name ? n + ' · ' + ch.name : (isComic ? 'Issue ' + n : 'Chapter ' + n);
+    const sub = ch.air_date || '';
+    return '<div class="row"><div class="nm"><div class="t">' + esc(label) + '</div>' +
+           (sub ? '<div class="s">' + esc(sub) + '</div>' : '') + '</div></div>';
+  }).join('');
+  sec.hidden = false;
 }
 /* Pull the cached payload (one request, served from SQLite). Replaces any
    existing entry, so it also works as the post-refresh reload. */
@@ -1397,7 +1490,11 @@ async function delItem(t) {
 }
 
 async function mvDelClick() {
-  if (!(await confirmBox('Delete this movie and all of its contents from the library?'))) return;
+  const kind = currentMovie ? kindLabel(movieRep(currentMovie.rows)) : '';
+  const msg = kind === 'Manga' || kind === 'Comic'
+    ? 'Delete this ' + kind.toLowerCase() + ' from the library?'
+    : 'Delete this movie and all of its contents from the library?';
+  if (!(await confirmBox(msg))) return;
   const rep = movieRep(currentMovie.rows);
   if (rep) {
     // Cancel any in-flight optimistic adds for this movie first.
@@ -1454,7 +1551,10 @@ function renderSearch() {
   // previous movie's torrent links into this one's "Find torrents" box, and
   // clicking one would attach it to the wrong movie).
   const rep = currentMovie ? movieRep(currentMovie.rows) : null;
-  if (!curRep || !rep || curRep.tmdb_id !== rep.tmdb_id) return;
+  // media_type in the guard too: different catalogues (TMDB/MangaDex/Comic
+  // Vine) reuse the same numeric ids, so a bare id match could render one
+  // catalogue's torrents under another's title.
+  if (!curRep || !rep || curRep.tmdb_id !== rep.tmdb_id || curRep.media_type !== rep.media_type) return;
   box.innerHTML = '';
   if (!searchResults.length) {
     box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>';
@@ -1521,9 +1621,29 @@ async function addTorrentFromSearch(t) {
   refreshLibrary();
 }
 
-/* ---------- add modal (TMDB search) ---------- */
+/* ---------- add modal (movie/TV/manga/comics search) ----------
+ * One search box, one catalogue per tab: TMDB multi-search for movies &
+ * shows, MangaDex for manga, Comic Vine for comics. Every catalogue returns
+ * the same result shape, so the rows and the Add button are shared. */
+let amTab = 'media';
+const AM_PLACEHOLDER = { media: 'Search movies & shows…', manga: 'Search manga…', comics: 'Search comics…' };
+const AM_ENDPOINT = { media: '/api/search', manga: '/api/search/manga', comics: '/api/search/comics' };
+function amKind(r) { return { tv: 'TV', manga: 'Manga', comic: 'Comic' }[r.media_type] || 'Movie'; }
+function amSetTab(tab) {
+  amTab = tab;
+  [...$('am-tabs').querySelectorAll('.s-chip')].forEach(b => b.classList.toggle('sel', b.dataset.tab === tab));
+  $('am-search').placeholder = AM_PLACEHOLDER[tab] || 'Search…';
+  const q = $('am-search').value.trim();
+  if (q) doSearch(q);
+  else { $('am-results').innerHTML = ''; amSet([], -1); }
+}
+$('am-tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('button.s-chip');
+  if (btn) amSetTab(btn.dataset.tab);
+});
+
 let searchTimer = null;
-function openAdd() { $('add-modal').hidden = false; amSel = -1; $('am-search').focus(); }
+function openAdd() { $('add-modal').hidden = false; amSel = -1; $('am-search').placeholder = AM_PLACEHOLDER[amTab] || 'Search…'; $('am-search').focus(); }
 function closeAdd() { $('add-modal').hidden = true; amSel = -1; $('am-results').innerHTML = ''; $('am-search').value = ''; }
 $('btn-add').addEventListener('click', openAdd);
 $('am-close').addEventListener('click', closeAdd);
@@ -1567,7 +1687,7 @@ async function doSearch(q) {
   amSel = -1;
   box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
   try {
-    const res = await api('/api/search?q=' + encodeURIComponent(q));
+    const res = await api(AM_ENDPOINT[amTab] + '?q=' + encodeURIComponent(q));
     if (seq !== amSeq || $('add-modal').hidden) return;   // superseded or closed
     box.innerHTML = '';
     if (!res.length) { box.innerHTML = '<div class="empty" style="padding:10px 0">No results.</div>'; return; }
@@ -1576,11 +1696,11 @@ async function doSearch(q) {
       row.className = 'srow';
       const p = r.poster_path
         ? posterTag(posterURL(r.poster_path, POSTER_IDX))
-        : placeholder('▷');
+        : placeholder((r.media_type === 'manga' || r.media_type === 'comic') ? '▤' : '▷');
       row.innerHTML =
         '<div class="poster">' + p + '</div>' +
         '<div class="info"><div class="t">' + esc(r.title) + '</div>' +
-        '<div class="s">' + (r.year || '') + (r.year ? ' · ' : '') + (r.media_type === 'tv' ? 'TV' : 'Movie') + '</div></div>';
+        '<div class="s">' + (r.year || '') + (r.year ? ' · ' : '') + amKind(r) + '</div></div>';
       const add = document.createElement('button');
       add.className = 'btn'; add.textContent = 'Add';
       add.onclick = async () => {
@@ -1588,11 +1708,12 @@ async function doSearch(q) {
         try {
           await api('/api/movies', { method: 'POST', body: JSON.stringify({
             title: r.title, year: r.year, poster_path: r.poster_path,
-            tmdb_id: r.id, media_type: r.media_type
+            tmdb_id: r.id, media_type: r.media_type, overview: r.overview || null,
+            ext_key: r.ext_key || null
           })});
           closeAdd();
           refreshLibrary();
-        } catch (e) { console.error('add movie failed', e); add.disabled = false; }
+        } catch (e) { console.error('add failed', e); add.disabled = false; }
       };
       row.appendChild(add);
       box.appendChild(row);
@@ -3676,9 +3797,11 @@ function toggleFs() {
   else if (v.webkitEnterFullscreen) { v.webkitEnterFullscreen(); }
 }
 
-function libCount() { return document.querySelectorAll('#grid-movies .card, #grid-tv .card').length; }
+/* Every library card, across all four sections (keyboard grid navigation). */
+const LIB_CARDS_SEL = '#grid-movies .card, #grid-tv .card, #grid-manga .card, #grid-comics .card';
+function libCount() { return document.querySelectorAll(LIB_CARDS_SEL).length; }
 function libHighlight() {
-  document.querySelectorAll('#grid-movies .card, #grid-tv .card').forEach((c, i) => c.classList.toggle('sel', i === libSel));
+  document.querySelectorAll(LIB_CARDS_SEL).forEach((c, i) => c.classList.toggle('sel', i === libSel));
 }
 /* Visual rows of the library grid: card indices grouped by measured top,
  * sorted top→bottom. Section titles and partially-filled rows don't skew
@@ -3693,7 +3816,7 @@ function libRows(els) {
   return [...rows.entries()].sort((a, b) => a[0] - b[0]);
 }
 function libSelJump(d, axis) {
-  const els = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
+  const els = document.querySelectorAll(LIB_CARDS_SEL);
   const n = els.length;
   if (!n) return;
   if (libSel < 0 || libSel >= n) libSel = d > 0 ? 0 : n - 1;
@@ -3772,7 +3895,7 @@ function selDown() { libSelJump(1, 'v'); }
 function selUp() { libSelJump(-1, 'v'); }
 function selOpen() {
   if (activeKeyCtx() === KCTX_LIBRARY) {
-    const cards = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
+    const cards = document.querySelectorAll(LIB_CARDS_SEL);
     if (libSel >= 0 && libSel < cards.length) cards[libSel].click();
     return;
   }

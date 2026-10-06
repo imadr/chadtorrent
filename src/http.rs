@@ -63,6 +63,12 @@ pub struct AddMovieRequest {
     poster_path: Option<String>,
     tmdb_id: i64,
     media_type: Option<String>,
+    /// Synopsis stored on the row itself. Reading items (manga/comics) show
+    /// this directly on their detail page; movie/show rows keep it as a
+    /// fallback while the TMDB cache is cold.
+    overview: Option<String>,
+    /// The reading catalogue's native key (MangaDex UUID for manga rows).
+    ext_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -75,6 +81,9 @@ pub struct AppState {
     pub meta: Option<Arc<MetaCache>>,
     pub subs: Option<Arc<SubtitlesClient>>,
     pub party: Arc<crate::party::PartyManager>,
+    /// Reading catalogues (manga: MangaDex keyless; comics: Comic Vine). Always
+    /// present — the comics side just reports "not configured" without a key.
+    pub reading: Arc<crate::reading::ReadingClient>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -90,6 +99,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library", post(add_item).get(list_items))
         .route("/api/movies", post(add_movie))
         .route("/api/search", get(search_tmdb))
+        .route("/api/search/manga", get(search_manga))
+        .route("/api/search/comics", get(search_comics))
         .route("/api/meta/{media_type}/{tmdb_id}", get(meta_detail))
         .route("/api/meta/{media_type}/{tmdb_id}/refresh", post(meta_refresh))
         .route("/api/meta/tv/{tmdb_id}/season/{season_number}", get(meta_episodes))
@@ -164,6 +175,12 @@ async fn meta_detail(
     State(state): State<AppState>,
     axum::extract::Path((media_type, tmdb_id)): axum::extract::Path<(String, i64)>,
 ) -> Result<impl IntoResponse> {
+    // Movie/show meta needs a TMDB key; manga/comic sweeps are keyless.
+    if matches!(media_type.as_str(), "movie" | "tv") && state.tmdb.is_none() {
+        return Err(Error::BadRequest(
+            "Movie search is not configured on this server".into(),
+        ));
+    }
     let Some(cache) = state.meta.as_ref() else {
         return Err(Error::BadRequest(
             "Movie search is not configured on this server".into(),
@@ -200,6 +217,11 @@ async fn meta_refresh(
     State(state): State<AppState>,
     axum::extract::Path((media_type, tmdb_id)): axum::extract::Path<(String, i64)>,
 ) -> Result<impl IntoResponse> {
+    if matches!(media_type.as_str(), "movie" | "tv") && state.tmdb.is_none() {
+        return Err(Error::BadRequest(
+            "Movie search is not configured on this server".into(),
+        ));
+    }
     let Some(cache) = state.meta.as_ref() else {
         return Err(Error::BadRequest(
             "Movie search is not configured on this server".into(),
@@ -230,6 +252,9 @@ async fn meta_episodes(
     }
     let episodes = cache
         .tmdb()
+        .ok_or_else(|| {
+            Error::BadRequest("Movie search is not configured on this server".into())
+        })?
         .tv_episodes(tmdb_id, season_number)
         .await
         .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
@@ -261,6 +286,52 @@ async fn search_tmdb(
     Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!([]))))
 }
 
+/// Manga search (MangaDex, keyless). Same result shape as `/api/search`, so
+/// the add modal renders every catalogue with one code path.
+async fn search_manga(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
+    let query = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    let results = state
+        .reading
+        .search_manga(&query)
+        .await
+        .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
+    Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!([]))))
+}
+
+/// Comics search (Comic Vine). Without a key the error text is the setup
+/// instructions, surfaced in the add modal as-is.
+async fn search_comics(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
+    let query = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    let results = state
+        .reading
+        .search_comics(&query)
+        .await
+        .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
+    Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!([]))))
+}
+
 async fn add_movie(
     State(state): State<AppState>,
     Json(req): Json<AddMovieRequest>,
@@ -276,6 +347,8 @@ async fn add_movie(
             req.poster_path.as_deref(),
             req.tmdb_id,
             req.media_type.as_deref().unwrap_or("movie"),
+            req.overview.as_deref(),
+            req.ext_key.as_deref(),
         )
         .await?;
     // Warm the TMDB cache now (overview + seasons + every episode list) so the

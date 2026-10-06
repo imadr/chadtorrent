@@ -55,6 +55,10 @@ pub struct ApiKeys {
     pub tmdb_api_key: String,
     #[serde(default)]
     pub opensubtitles_api_keys: Vec<String>,
+    /// Comic Vine API key for the comics search. Free: register at
+    /// https://comicvine.gamespot.com/api/ and paste the generated key here.
+    #[serde(default)]
+    pub comicvine_api_key: String,
     #[serde(default)]
     pub opensubtitles_usage: HashMap<String, Usage>,
 }

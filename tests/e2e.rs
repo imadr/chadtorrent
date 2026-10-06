@@ -7,7 +7,9 @@ use tempfile::TempDir;
 use chadtorrent::config::Config;
 use chadtorrent::http::{AppState, build_router};
 use chadtorrent::library::LibraryManager;
+use chadtorrent::metadata::MetaCache;
 use chadtorrent::party::PartyManager;
+use chadtorrent::reading::ReadingClient;
 
 fn make_pattern(size: usize) -> Vec<u8> {
     let mut state: u64 = 0x9E3779B97F4A7C15;
@@ -40,7 +42,12 @@ async fn start_http(
 ) -> (String, String, Arc<PartyManager>, tokio::task::AbortHandle) {
     let index_html = include_str!("../static/index.html").to_string();
     let party = PartyManager::new(library.clone());
-    let router = build_router(AppState { library, index_html, tmdb: None, meta: None, subs: None, party: party.clone() });
+    let meta = MetaCache::new(
+        library.db.clone(),
+        None,
+        Arc::new(ReadingClient::new(None)),
+    );
+    let router = build_router(AppState { library, index_html, tmdb: None, meta: Some(Arc::new(meta)), subs: None, party: party.clone(), reading: Arc::new(ReadingClient::new(None)) });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -165,7 +172,8 @@ async fn tmdb_meta_serves_seasons_and_episodes_from_cache() {
 
     let meta = MetaCache::new(
         library.db.clone(),
-        Arc::new(TmdbClient::new("bogus-key".into())),
+        Some(Arc::new(TmdbClient::new("bogus-key".into()))),
+        Arc::new(ReadingClient::new(None)),
     );
     let index_html = include_str!("../static/index.html").to_string();
     let party = PartyManager::new(library.clone());
@@ -176,6 +184,7 @@ async fn tmdb_meta_serves_seasons_and_episodes_from_cache() {
         meta: Some(Arc::new(meta)),
         subs: None,
         party: party.clone(),
+        reading: Arc::new(ReadingClient::new(None)),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -348,7 +357,7 @@ async fn movie_delete_cascades_to_attached_torrents() {
 
     let place = library
         .db
-        .insert_movie("My Movie", Some(2024), None, 999, "movie")
+        .insert_movie("My Movie", Some(2024), None, 999, "movie", None, None)
         .unwrap();
     let t1 = library
         .db
@@ -388,6 +397,140 @@ async fn movie_delete_cascades_to_attached_torrents() {
 
     library.stop().await;
 }
+/// Reading items (manga/comics): added as metadata-only rows via the movies
+/// endpoint, listed with their synopsis, deleted like anything else. The
+/// comics search reports its setup instructions while no key is configured,
+/// and a hard delete never reaches across catalogues that merely share an
+/// id (a ComicVine 123 and a TMDB 123 are different titles).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reading_item_lifecycle() {
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(&tmp.path().join("app")).await;
+    let (http, _ws, _party, _srv) = start_http(library.clone()).await;
+    let client = reqwest::Client::new();
+
+    // Add a manga entry the way the search modal does.
+    let resp = client
+        .post(format!("{http}/api/movies"))
+        .json(&serde_json::json!({
+            "title": "Berserk",
+            "year": 1989,
+            "poster_path": "https://uploads.mangadex.org/covers/x/cover.jpg",
+            "tmdb_id": 30002,
+            "media_type": "manga",
+            "overview": "Guts, a lone mercenary.",
+            "ext_key": "801513ba-a712-498c-8f57-cae55b38cc92"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let manga_id: i64 = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_i64()
+        .unwrap();
+
+    // It shows up in the library list with its metadata attached.
+    let items: serde_json::Value = client
+        .get(format!("{http}/api/library"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"].as_i64() == Some(manga_id))
+        .unwrap()
+        .clone();
+    assert_eq!(row["media_type"], "manga");
+    assert_eq!(row["overview"], "Guts, a lone mercenary.");
+    assert_eq!(
+        row["poster_path"],
+        "https://uploads.mangadex.org/covers/x/cover.jpg"
+    );
+    assert_eq!(row["ext_key"], "801513ba-a712-498c-8f57-cae55b38cc92");
+    assert_eq!(row["state"], "ready");
+    assert_eq!(row["magnet"], "");
+
+    // Comics search without a configured key: a 400 whose body explains the fix.
+    let resp = client
+        .get(format!("{http}/api/search/comics?q=blake"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let text = resp.text().await.unwrap();
+    assert!(text.contains("comicvine_api_key"), "helpful error, got: {text}");
+
+    // An empty manga query is an empty result, not an upstream request.
+    let resp = client
+        .get(format!("{http}/api/search/manga?q="))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Chapter lists share the TV meta endpoint and cache row shape: seeded
+    // here (no network), served as episodes keyed by season.
+    use chadtorrent::metadata::{EpisodeInfo, SeasonEpisodes, SeasonInfo};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let seasons = vec![SeasonInfo {
+        season_number: 1,
+        name: Some("Chapters".into()),
+        episode_count: Some(2),
+        air_date: None,
+    }];
+    let chapters = vec![SeasonEpisodes {
+        season_number: 1,
+        episodes: (1..=2)
+            .map(|n| EpisodeInfo {
+                episode_number: n,
+                name: None,
+                overview: None,
+                still_path: None,
+                air_date: None,
+            })
+            .collect(),
+    }];
+    library
+        .db
+        .set_tmdb_meta("manga", 30002, Some("Guts, a lone mercenary."), &seasons, &chapters, now)
+        .unwrap();
+    let detail: serde_json::Value = client
+        .get(format!("{http}/api/meta/manga/30002"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["episodes"]["1"].as_array().unwrap().len(), 2);
+    assert_eq!(detail["overview"], "Guts, a lone mercenary.");
+
+    // Hard delete removes the manga; a same-id movie in another catalogue
+    // is untouched.
+    let movie_id = library
+        .db
+        .insert_movie("Same Number", Some(2001), None, 30002, "movie", None, None)
+        .unwrap();
+    let resp = client
+        .delete(format!("{http}/api/library/{manga_id}?hard=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(library.db.get_item(manga_id).unwrap().is_none());
+    assert!(library.db.get_item(movie_id).unwrap().is_some());
+
+    library.stop().await;
+}
+
 /// Segment pipeline end-to-end: a finished (ready) item with a real (tiny)
 /// MP4 gets segmented by the background ffmpeg job, the manifest reports
 /// segments with sane media times, init/segments are served, unknown

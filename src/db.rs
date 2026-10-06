@@ -20,6 +20,12 @@ pub struct LibraryItem {
     pub sequential: bool,
     /// Saved playback position in seconds (per torrent file, not per movie).
     pub playhead: f64,
+    /// Synopsis. Torrent items leave it to the metadata cache; reading items
+    /// (manga/comics) carry it from the search result they were added from.
+    pub overview: Option<String>,
+    /// The catalogue's native key when it isn't an integer (MangaDex UUID for
+    /// manga rows); comic rows leave it empty (Comic Vine ids are integers).
+    pub ext_key: Option<String>,
     #[serde(skip)]
     pub torrent_bytes: Option<Vec<u8>>,
 }
@@ -75,6 +81,8 @@ fn item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryItem> {
         media_type: row.get(11)?,
         sequential: row.get(12)?,
         playhead: row.get(14)?,
+        overview: row.get(15)?,
+        ext_key: row.get(16)?,
         torrent_bytes: row.get(13)?,
     })
 }
@@ -101,7 +109,9 @@ impl Database {
                 tmdb_id INTEGER,
                 media_type TEXT,
                 sequential INTEGER NOT NULL DEFAULT 1,
-                torrent_bytes BLOB
+                torrent_bytes BLOB,
+                overview TEXT,
+                ext_key TEXT
             );
             CREATE TABLE IF NOT EXISTS pieces (
                 info_hash TEXT PRIMARY KEY,
@@ -167,6 +177,8 @@ impl Database {
             "ALTER TABLE tmdb_meta ADD COLUMN episodes_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE tmdb_meta ADD COLUMN fetched_at INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE party ADD COLUMN file TEXT",
+            "ALTER TABLE library ADD COLUMN overview TEXT",
+            "ALTER TABLE library ADD COLUMN ext_key TEXT",
         ] {
             let _ = conn.execute_batch(stmt);
         }
@@ -177,6 +189,32 @@ impl Database {
             "UPDATE library SET title = trim(substr(title, 1, instr(title, ' / ') - 1))
              WHERE title LIKE '% / %'",
         )?;
+        // One-time repair: manga/comic rows written before the reading sweep
+        // existed could hold TMDB payloads (catalogue ids collide — TMDB id
+        // 30002 is a Munsters special, a MangaDex id is Berserk). Drop
+        // them so the next open re-sweeps from the right source.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta_migration (k TEXT PRIMARY KEY, v INTEGER NOT NULL)",
+        )?;
+        let reading_meta_repaired: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM meta_migration WHERE k = 'reading_meta_reset')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !reading_meta_repaired {
+            conn.execute("DELETE FROM tmdb_meta WHERE media_type IN ('manga', 'comic')", [])?;
+            conn.execute(
+                "INSERT INTO meta_migration (k, v) VALUES ('reading_meta_reset', 1)",
+                [],
+            )?;
+        }
+        // Repair: MangaDex cover file names already carry their extension;
+        // an early importer appended a second ".jpg", producing dead URLs.
+        let _ = conn.execute_batch(
+            "UPDATE library
+             SET poster_path = substr(poster_path, 1, length(poster_path) - 4)
+             WHERE poster_path LIKE '%.jpg.jpg'",
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -191,6 +229,10 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Insert a metadata-only placeholder row (movie placeholder, or a manga /
+    /// comic entry — those never carry a torrent). `state` starts at `ready`
+    /// and `magnet` stays empty.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_movie(
         &self,
         title: &str,
@@ -198,21 +240,64 @@ impl Database {
         poster_path: Option<&str>,
         tmdb_id: i64,
         media_type: &str,
+        overview: Option<&str>,
+        ext_key: Option<&str>,
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO library (magnet, state, title, year, poster_path, tmdb_id, media_type)
-             VALUES ('', 'ready', ?1, ?2, ?3, ?4, ?5)",
-            params![title, year, poster_path, tmdb_id, media_type],
+            "INSERT INTO library (magnet, state, title, year, poster_path, tmdb_id, media_type, overview, ext_key)
+             VALUES ('', 'ready', ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![title, year, poster_path, tmdb_id, media_type, overview, ext_key],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// The reading catalogue's native key and title for a group, used by the
+    /// chapter sweep: `(ext_key, title)`. `ext_key` is the MangaDex UUID for
+    /// manga rows; `title` lets old rows (pre-ext_key) resolve by search.
+    pub fn get_reading_source(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ext_key, title FROM library
+             WHERE media_type = ?1 AND tmdb_id = ?2
+             ORDER BY (ext_key IS NULL), id LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![media_type, tmdb_id], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store a refreshed cover for a whole reading group (manga rows share
+    /// their catalogue id). Called by the chapter sweep when AniList yields
+    /// art for the title, so pre-existing rows heal without a re-add.
+    pub fn set_poster_for_group(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+        poster: &str,
+    ) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "UPDATE library SET poster_path = ?3
+             WHERE media_type = ?1 AND tmdb_id = ?2",
+            params![media_type, tmdb_id, poster],
+        )?;
+        Ok(changed)
     }
 
     pub fn get_item(&self, id: i64) -> Result<Option<LibraryItem>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead, overview, ext_key
              FROM library WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], item_from_row)?;
@@ -226,7 +311,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead, overview, ext_key
              FROM library ORDER BY added_at DESC",
         )?;
         let rows = stmt.query_map([], item_from_row)?;
@@ -295,7 +380,7 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, magnet, title, state, added_at, file_path, size_bytes, rqbit_id,
-                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead
+                    poster_path, year, tmdb_id, media_type, sequential, torrent_bytes, playhead, overview, ext_key
              FROM library WHERE rqbit_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![rqbit_id], item_from_row)?;
@@ -638,6 +723,64 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_movie_overview_roundtrip() {
+        let (db, dir) = temp_db();
+        let id = db
+            .insert_movie(
+                "Berserk",
+                Some(1989),
+                Some("https://x/y.jpg"),
+                123,
+                "manga",
+                Some("Guts."),
+                Some("801513ba-a712-498c-8f57-cae55b38cc92"),
+            )
+            .unwrap();
+        let it = db.get_item(id).unwrap().unwrap();
+        assert_eq!(it.title.as_deref(), Some("Berserk"));
+        assert_eq!(it.media_type.as_deref(), Some("manga"));
+        assert_eq!(it.overview.as_deref(), Some("Guts."));
+        assert_eq!(it.poster_path.as_deref(), Some("https://x/y.jpg"));
+        assert_eq!(
+            it.ext_key.as_deref(),
+            Some("801513ba-a712-498c-8f57-cae55b38cc92")
+        );
+        assert!(it.magnet.is_empty());
+        assert_eq!(it.state, "ready");
+        // Survives a reopen (the column is created by the migration too).
+        drop(db);
+        let db2 = Database::new(dir.join("test.db").to_str().unwrap()).unwrap();
+        assert_eq!(
+            db2.get_item(id).unwrap().unwrap().overview.as_deref(),
+            Some("Guts.")
+        );
+        cleanup(&dir);
+    }
+
+    /// The chapter sweep's source lookup: prefers rows carrying an ext_key,
+    /// falls back to the title for legacy rows.
+    #[test]
+    fn test_get_reading_source() {
+        let (db, dir) = temp_db();
+        let a = db
+            .insert_movie("Berserk", Some(1989), None, 30002, "manga", None, None)
+            .unwrap();
+        let b = db
+            .insert_movie("Berserk", None, None, 30002, "manga", None,
+                          Some("801513ba-a712-498c-8f57-cae55b38cc92"))
+            .unwrap();
+        // ext_key row wins over the legacy one, even though it's newer.
+        let (ext, title) = db.get_reading_source("manga", 30002).unwrap().unwrap();
+        assert_eq!(ext.as_deref(), Some("801513ba-a712-498c-8f57-cae55b38cc92"));
+        assert_eq!(title.as_deref(), Some("Berserk"));
+        assert_eq!(db.get_item(b).unwrap().unwrap().id, b);
+        assert_eq!(db.get_item(a).unwrap().unwrap().ext_key, None);
+        // Unknown catalogue entry.
+        assert!(db.get_reading_source("manga", 999).unwrap().is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
     fn test_list_items() {
         let (db, dir) = temp_db();
         db.insert_item("magnet:?xt=urn:btih:abc1").unwrap();
@@ -916,6 +1059,58 @@ mod tests {
 
         // A different media_type with the same id is isolated.
         assert!(db.get_tmdb_meta("movie", 46648).unwrap().is_none());
+        cleanup(&dir);
+    }
+
+    /// One-time repair: manga/comic meta rows from before the reading sweep
+    /// could hold TMDB payloads (catalogue ids collide). The first open must
+    /// drop them; later opens must keep freshly-swept rows.
+    #[test]
+    fn test_reading_meta_rows_repaired_once() {
+        let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "chadtorrent_db_test_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        // A database from before the repair: poisoned reading rows, a legit
+        // TMDB row, no marker table.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tmdb_meta (
+                    media_type TEXT NOT NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    overview TEXT,
+                    seasons_json TEXT NOT NULL DEFAULT '[]',
+                    episodes_json TEXT NOT NULL DEFAULT '[]',
+                    fetched_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (media_type, tmdb_id)
+                );
+                INSERT INTO tmdb_meta (media_type, tmdb_id, overview, fetched_at) VALUES
+                    ('manga', 30002, 'Munsters junk', 1000),
+                    ('comic', 50270, 'Also suspect', 1000),
+                    ('movie', 680, 'Legit TMDB overview', 1000);",
+            )
+            .unwrap();
+        }
+
+        // First open: reading rows dropped, TMDB row survives, marker set.
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        assert!(db.get_tmdb_meta("manga", 30002).unwrap().is_none());
+        assert!(db.get_tmdb_meta("comic", 50270).unwrap().is_none());
+        assert!(db.get_tmdb_meta("movie", 680).unwrap().is_some());
+
+        // Later opens must not keep deleting: a freshly swept reading row
+        // survives a restart.
+        db.set_tmdb_meta("manga", 30002, Some("Guts."), &[], &[], 2000)
+            .unwrap();
+        drop(db);
+        let db2 = Database::new(path.to_str().unwrap()).unwrap();
+        let m = db2.get_tmdb_meta("manga", 30002).unwrap().unwrap();
+        assert_eq!(m.overview.as_deref(), Some("Guts."));
         cleanup(&dir);
     }
 

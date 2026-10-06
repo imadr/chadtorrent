@@ -305,8 +305,10 @@ impl LibraryManager {
         self.add_item_inner(magnet, None, sequential).await
     }
 
-    /// Add a movie placeholder entry (no torrent yet) so it appears in the
-    /// library and can get torrents attached later.
+    /// Add a metadata-only placeholder entry (a movie awaiting torrents, or a
+    /// manga/comic — reading entries never carry torrents) so it appears in
+    /// the library.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_movie(
         &self,
         title: &str,
@@ -314,10 +316,12 @@ impl LibraryManager {
         poster_path: Option<&str>,
         tmdb_id: i64,
         media_type: &str,
+        overview: Option<&str>,
+        ext_key: Option<&str>,
     ) -> Result<i64> {
         let id = self
             .db
-            .insert_movie(title, year, poster_path, tmdb_id, media_type)?;
+            .insert_movie(title, year, poster_path, tmdb_id, media_type, overview, ext_key)?;
         self.notify_changed();
         Ok(id)
     }
@@ -890,13 +894,24 @@ impl LibraryManager {
         self.remove_files_of(id).await;
 
         if hard {
-            // Movie delete: cascade to every other row sharing the tmdb_id.
-            if let Some(tmdb_id) = item.tmdb_id {
+            // Movie/group delete: cascade to every other row sharing the same
+            // catalogue identity. media_type must match where both sides have
+            // one — manga/comic ids come from different catalogues and mean
+            // different titles. A torrent row with no media_type at all
+            // (added by raw magnet, never tagged) follows its group head.
+            if let (Some(tmdb_id), Some(media_type)) = (item.tmdb_id, item.media_type.as_deref()) {
                 let siblings: Vec<i64> = self
                     .db
                     .list_items()?
                     .into_iter()
-                    .filter(|s| s.tmdb_id == Some(tmdb_id) && s.id != id)
+                    .filter(|s| {
+                        s.tmdb_id == Some(tmdb_id)
+                            && s.id != id
+                            && match s.media_type.as_deref() {
+                                None => true,
+                                Some(mt) => mt == media_type,
+                            }
+                    })
                     .map(|s| s.id)
                     .collect();
                 for sibling in siblings {
