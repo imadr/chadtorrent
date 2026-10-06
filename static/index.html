@@ -132,6 +132,7 @@
              background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
              text-transform: none; letter-spacing: 0; }
   .minibtn:hover { border-color: var(--line-hi); color: var(--text); }
+  .minibtn.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
   #am-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
   #am-tabs .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
                      background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
@@ -1166,7 +1167,8 @@ function repaintMvMeta(rep) {
  * payload as TV episodes — one season ("1") whose episodes are the rows —
  * swept from MangaDex (real chapter titles) or Comic Vine (real issue
  * names + cover dates). Rows are inert: no reader yet, nothing plays.
- * Newest first by default; the header button flips the order. */
+ * "Date" = recency order (highest number first by default); the button
+ * flips the arrow. */
 var chDesc = true;
 function renderChapters(rep) {
   const sec = $('mv-ch-sec'), box = $('mv-chapters');
@@ -1177,7 +1179,7 @@ function renderChapters(rep) {
   const isComic = rep.media_type === 'comic';
   list = [...list].sort((a, b) => (chDesc ? -1 : 1) * ((b.episode_number || 0) - (a.episode_number || 0)));
   $('mv-ch-title').innerHTML = (isComic ? 'Issues' : 'Chapters') +
-    ' <button id="mv-ch-sort" class="minibtn">' + (chDesc ? 'Newest first' : 'Oldest first') + '</button>';
+    ' <button id="mv-ch-sort" class="minibtn sel">Date ' + (chDesc ? '↓' : '↑') + '</button>';
   $('mv-ch-sort').onclick = () => { chDesc = !chDesc; renderChapters(rep); };
   box.innerHTML = list.map(ch => {
     const n = ch.episode_number;
@@ -1542,15 +1544,22 @@ async function findTorrents(rep) {
   }
 }
 
-/* Torrent search results ordering. The indexer already returns seeders-desc;
- * the cycle button re-sorts the same list locally. */
+/* Torrent search results ordering. One button per key — the active one is
+ * highlighted and carries the direction arrow; clicking it again flips
+ * asc/desc. Defaults: most seeders, biggest size, name A-Z. */
 var torrentSort = 'seeders';
-const TORRENT_SORT_LABEL = { seeders: 'Seeders', name: 'Name', size: 'Size' };
+var torrentSortDesc = { seeders: true, name: false, size: true };
+const TORRENT_SORTS = [
+  { key: 'seeders', label: 'Seeders' },
+  { key: 'name',    label: 'Name' },
+  { key: 'size',    label: 'Size' },
+];
 function sortSearchResults(list) {
+  const dir = torrentSortDesc[torrentSort] ? -1 : 1;
   const s = [...list];
-  if (torrentSort === 'name') s.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
-  else if (torrentSort === 'size') s.sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
-  else s.sort((a, b) => (b.seeders || 0) - (a.seeders || 0));
+  if (torrentSort === 'name') s.sort((a, b) => dir * String(a.name || '').localeCompare(String(b.name || '')));
+  else if (torrentSort === 'size') s.sort((a, b) => dir * ((a.size_bytes || 0) - (b.size_bytes || 0)));
+  else s.sort((a, b) => dir * ((a.seeders || 0) - (b.seeders || 0)));
   return s;
 }
 
@@ -1572,17 +1581,22 @@ function renderSearch() {
     box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>';
     return;
   }
-  const tsort = document.createElement('button');
-  tsort.className = 'minibtn';
-  tsort.style.marginLeft = '0';
-  tsort.style.marginBottom = '8px';
-  tsort.textContent = 'Sort: ' + TORRENT_SORT_LABEL[torrentSort];
-  tsort.onclick = () => {
-    const keys = Object.keys(TORRENT_SORT_LABEL);
-    torrentSort = keys[(keys.indexOf(torrentSort) + 1) % keys.length];
-    renderSearch();
-  };
-  box.appendChild(tsort);
+  const srow = document.createElement('div');
+  srow.style.cssText = 'display:flex;gap:6px;margin-bottom:8px';
+  for (const s of TORRENT_SORTS) {
+    const b = document.createElement('button');
+    const active = torrentSort === s.key;
+    b.className = 'minibtn' + (active ? ' sel' : '');
+    b.style.marginLeft = '0';
+    b.textContent = s.label + (active ? (torrentSortDesc[s.key] ? ' ↓' : ' ↑') : '');
+    b.onclick = () => {
+      if (active) torrentSortDesc[s.key] = !torrentSortDesc[s.key];
+      else torrentSort = s.key;
+      renderSearch();
+    };
+    srow.appendChild(b);
+  }
+  box.appendChild(srow);
   const addedHashes = new Set(items.filter(i => i.magnet).map(i => infoHash(i.magnet)).filter(Boolean));
   for (const t of sortSearchResults(searchResults)) {
     const row = document.createElement('div');
