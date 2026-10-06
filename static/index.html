@@ -3680,31 +3680,49 @@ function libCount() { return document.querySelectorAll('#grid-movies .card, #gri
 function libHighlight() {
   document.querySelectorAll('#grid-movies .card, #grid-tv .card').forEach((c, i) => c.classList.toggle('sel', i === libSel));
 }
-/* Cards per row at the current window width — measured from the actual grid
- * (the shared top of the first row), so up/down follow screen layout instead
- * of a hard-coded offset. */
-function libCols() {
-  const els = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
-  if (!els.length) return 1;
-  const top = Math.round(els[0].getBoundingClientRect().top);
-  let cols = 0;
-  for (const el of els) {
-    if (Math.round(el.getBoundingClientRect().top) !== top) break;
-    cols++;
-  }
-  return Math.max(1, cols);
+/* Visual rows of the library grid: card indices grouped by measured top,
+ * sorted top→bottom. Section titles and partially-filled rows don't skew
+ * anything — rows come from where the cards actually are. */
+function libRows(els) {
+  const rows = new Map();
+  els.forEach((el, i) => {
+    const t = Math.round(el.getBoundingClientRect().top);
+    if (!rows.has(t)) rows.set(t, []);
+    rows.get(t).push(i);
+  });
+  return [...rows.entries()].sort((a, b) => a[0] - b[0]);
 }
 function libSelJump(d, axis) {
-  const n = libCount();
-  if (!n) return;
-  // Vertical moves step by one full row (cols adapts to the window width);
-  // horizontal stays ±1. Edges clamp instead of wrapping so a press always
-  // lands on something visible.
-  const step = axis === 'v' ? libCols() : 1;
-  if (libSel < 0 || libSel >= n) libSel = d > 0 ? 0 : n - 1;
-  else libSel = Math.max(0, Math.min(n - 1, libSel + d * step));
-  libHighlight();
   const els = document.querySelectorAll('#grid-movies .card, #grid-tv .card');
+  const n = els.length;
+  if (!n) return;
+  if (libSel < 0 || libSel >= n) libSel = d > 0 ? 0 : n - 1;
+  else if (axis === 'h') {
+    // Horizontal stays ±1. Edges clamp instead of wrapping so a press
+    // always lands on something visible.
+    libSel = Math.max(0, Math.min(n - 1, libSel + d));
+  } else {
+    // Spatial vertical move: the nearest card in the next/previous VISUAL
+    // row. Same column wins; otherwise the column-nearest card with a left
+    // bias — Down from the 2nd movie lands on the lone movie below-left,
+    // never skips a half-filled row, and crossing into the TV section goes
+    // to its first row. Nothing below → stay put.
+    const rows = libRows(els);
+    const cur = els[libSel].getBoundingClientRect();
+    const ri = rows.findIndex(r => r[0] === Math.round(cur.top));
+    const target = rows[ri + d];
+    if (target) {
+      let best = -1, bestScore = Infinity;
+      for (const i of target[1]) {
+        const dl = els[i].getBoundingClientRect().left - cur.left;
+        // Column distance; ties go to the card on the left.
+        const score = Math.abs(dl) * 2 + (dl > 0 ? 1 : 0);
+        if (score < bestScore) { bestScore = score; best = i; }
+      }
+      libSel = best;
+    }
+  }
+  libHighlight();
   if (els[libSel]) els[libSel].scrollIntoView({ block: 'nearest' });
 }
 
