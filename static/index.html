@@ -1177,7 +1177,9 @@ function renderChapters(rep) {
   let list = m && m.episodes && m.episodes['1'];
   if (!Array.isArray(list) || !list.length) { sec.hidden = true; return; }
   const isComic = rep.media_type === 'comic';
-  list = [...list].sort((a, b) => (chDesc ? -1 : 1) * ((b.episode_number || 0) - (a.episode_number || 0)));
+  list = [...list].sort((a, b) => (chDesc
+    ? (b.episode_number || 0) - (a.episode_number || 0)   // ↓ newest first
+    : (a.episode_number || 0) - (b.episode_number || 0))); // ↑ oldest first
   $('mv-ch-title').innerHTML = (isComic ? 'Issues' : 'Chapters') +
     ' <button id="mv-ch-sort" class="minibtn sel">Date ' + (chDesc ? '↓' : '↑') + '</button>';
   $('mv-ch-sort').onclick = () => { chDesc = !chDesc; renderChapters(rep); };
