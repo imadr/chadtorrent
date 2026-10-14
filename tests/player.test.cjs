@@ -48,7 +48,7 @@ async function startVideoOnly(c, beforeStart = () => {}) {
   c.fetchSegBuf = async () => new ArrayBuffer(0);
   c.parseInit = () => new Map([[1, { kind: 'video', w: 64, h: 64, codec4cc: 'avc1' }]]);
   c.ensureCtx = () => c.P.ctx = { currentTime: 0, state: 'running' };
-  c.VideoDecoder = class { constructor() { this.state = 'unconfigured'; } configure() { this.state = 'configured'; } };
+  c.VideoDecoder = class { constructor() { this.state = 'unconfigured'; } configure() { this.state = 'configured'; } async flush() {} };
   c.feedLoop = async () => {};
   c.setTimeout = fn => { queueMicrotask(fn); return 0; };
   c.P.id = 1;
@@ -124,6 +124,9 @@ test('video-only startup selects a wall clock without EOF and clears previous au
   assert.equal(c.P.noAudio, true);
   assert.equal(c.P.acfgs, null);
   c.P.ctx.currentTime = 5;
+  assert.equal(c.mediaNow(), 0); // early codec checks must not skip unavailable video
+  c.queueVideoFrame(c.P.vdec, { timestamp: 0, duration: 40000 });
+  c.P.ctx.currentTime = 10;
   assert.equal(c.mediaNow(), 5);
   assert.equal(c.P.eof, false);
 });
@@ -248,6 +251,7 @@ test('the accepted startup decoder surfaces later decode errors', async () => {
     c.VideoDecoder = class {
       constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; }
       configure() { this.state = 'configured'; }
+      async flush() {}
     };
   });
   c.P.vdec.callbacks.error(new Error('hardware decoder failed'));
@@ -256,14 +260,10 @@ test('the accepted startup decoder surfaces later decode errors', async () => {
 test('a superseded startup cannot install its codec into the new session', async () => {
   const c = engine();
   await startVideoOnly(c, () => {
-    c.setTimeout = fn => {
-      vm.runInContext('segGen++', c);
-      c.P.id = 2;
-      queueMicrotask(fn); return 0;
-    };
     c.VideoDecoder = class {
       constructor() { this.state = 'unconfigured'; }
       configure() { this.state = 'configured'; }
+      async flush() { vm.runInContext('segGen++', c); c.P.id = 2; }
       close() { this.state = 'closed'; }
     };
   });
@@ -280,6 +280,7 @@ test('asynchronous configuration failures advance to the next decoder candidate'
         this.state = 'configured';
         if (++attempts === 1) queueMicrotask(() => this.callbacks.error(new Error('unsupported hardware config')));
       }
+      async flush() {}
       close() { this.state = 'closed'; }
     };
   });
@@ -306,4 +307,36 @@ test('a paused seek to EOF does not trigger the autoplay loop', () => {
   c.timers[0]();
   assert.equal(ended, 0);
   assert.equal(c.P.paused, true);
+});
+test('unsupported HEVC candidates fail without scheduling per-candidate timers', async () => {
+  const c = engine();
+  let attempts = 0, timers = 0, flushes = 0;
+  await assert.rejects(startVideoOnly(c, () => {
+    c.api = async () => ({ mime: 'video/mp4; codecs="hvc1.2.4.L120.B0"', done: false, segments: [] });
+    c.parseInit = () => new Map([[1, { kind: 'video', w: 64, h: 64, codec4cc: 'hev1', desc: new Uint8Array([1]) }]]);
+    c.setTimeout = fn => { timers++; queueMicrotask(fn); return 0; };
+    c.VideoDecoder = class {
+      constructor() { this.state = 'unconfigured'; }
+      configure() { attempts++; throw new Error('unsupported codec'); }
+      flush() { flushes++; throw new Error('must not flush rejected config'); }
+      close() { this.state = 'closed'; }
+    };
+  }), /no WebCodecs decoder/);
+  assert.equal(attempts, 8);
+  assert.equal(flushes, 0);
+  assert.equal(timers, 0);
+});
+test('codec checks do not wait for ready-file segmentation to finish', async () => {
+  const c = engine();
+  let requests = 0;
+  await startVideoOnly(c, () => {
+    c.items = [{ id: 1, state: 'ready' }];
+    c.api = async () => {
+      if (++requests > 1) throw new Error('unnecessary manifest poll');
+      return { mime: 'video/mp4; codecs="avc1.64001E"', done: false, segments: [] };
+    };
+  });
+  assert.equal(c.P.vdec.state, 'configured');
+  assert.equal(c.P.done, false);
+  assert.equal(requests, 1);
 });

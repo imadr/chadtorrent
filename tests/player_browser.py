@@ -4,6 +4,7 @@ Requires ffmpeg, ffprobe, Python playwright, and Chrome (or CHROME_BIN).
 Run after cargo build: python tests/player_browser.py
 Set PLAYER_BROWSER=firefox to exercise Playwright's installed Firefox.
 Set PLAYER_HEAAC=1 on macOS to include an AudioToolbox HE-AAC fixture.
+Set PLAYER_HEVC=1 to include a Main10 HEVC capability/rejection latency check.
 """
 import asyncio
 import json
@@ -22,15 +23,19 @@ from playwright.async_api import async_playwright
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def generate(folder, duration, audio_duration=None, audio_delay=0, he_aac=False):
+def generate(folder, duration, audio_duration=None, audio_delay=0, he_aac=False, hevc=False):
     folder.mkdir(parents=True)
     args = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
             f"testsrc2=duration={duration}:size=640x360:rate=24"]
     if audio_duration is not None:
         args += ["-itsoffset", str(audio_delay), "-f", "lavfi", "-i",
                  f"sine=frequency=440:duration={audio_duration}:sample_rate=48000"]
-    args += ["-c:v", "libx264", "-preset", "fast", "-g", "144",
-             "-keyint_min", "144", "-sc_threshold", "0", "-bf", "3"]
+    args += ["-c:v", "libx265" if hevc else "libx264", "-preset", "fast", "-g", "144",
+             "-keyint_min", "144", "-bf", "3"]
+    if hevc:
+        args += ["-pix_fmt", "yuv420p10le", "-x265-params", "level-idc=4:pools=1:log-level=error"]
+    else:
+        args += ["-sc_threshold", "0"]
     if audio_duration is not None:
         args += ["-c:a", "aac_at" if he_aac else "aac"]
         if he_aac:
@@ -38,7 +43,7 @@ def generate(folder, duration, audio_duration=None, audio_delay=0, he_aac=False)
     subprocess.run(args + [str(folder / "clip.mp4")], check=True)
 
 
-async def exercise(url, library, he_aac, restart_server):
+async def exercise(url, library, he_aac, hevc, restart_server):
     chrome = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
     if not chrome and Path("/Applications/Google Chrome.app").exists():
         chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -56,15 +61,21 @@ async def exercise(url, library, he_aac, restart_server):
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.on("console", lambda m: messages.append(m.text) if m.type in ("error", "warning") else None)
             await page.goto(url)
-            await page.wait_for_function("n=>items.length === n", arg=6 if he_aac else 5)
+            await page.wait_for_function("n=>items.length === n", arg=5 + int(he_aac) + int(hevc))
             await page.evaluate("""() => {
                 window.testRecords=[];window.testEnds=[];
+                window.testProbes=[];
+                const configure=configureCandidate;
+                configureCandidate=async(dec,cfg)=>{
+                    const at=performance.now(),ok=await configure(dec,cfg);
+                    testProbes.push({at,end:performance.now(),ok});return ok;
+                };
                 const original=paint;
                 paint=f=>{testRecords.push({ts:f.timestamp/1e6,at:performance.now()});original(f)};
                 v.addEventListener('ended',()=>testEnds.push(testRecords.slice()));
                 const b=document.createElement('button');b.id='test-start';b.textContent='Start';
                 b.style='position:fixed;top:0;right:0;z-index:99999';
-                b.onclick=()=>{testRecords=[];testEnds=[];const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item)};
+                b.onclick=()=>{testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item)};
                 document.body.appendChild(b);
             }""")
 
@@ -117,22 +128,24 @@ async def exercise(url, library, he_aac, restart_server):
             # Recut while paused: stale immutable URLs must rebuild the engine
             # without changing playback position or resuming the AudioContext.
             previous = await page.evaluate("P.generation")
-            await page.evaluate("window.savedAudioContext=P.ctx")
+            await page.evaluate("window.savedAudioContext=P.ctx;testRecords=[]")
             with (library / "2" / "clip.mp4").open("ab") as file:
                 file.write(b"\0\0\0\x08free")
             await page.evaluate("refreshManifest(segGen,P.id)")
-            await page.wait_for_function("g=>P.generation!==g && P.tracks && pendSeek===null", arg=previous)
+            await page.wait_for_function("g=>P.generation!==g && testRecords.length>0 && pendSeek===null", arg=previous)
             state = await page.evaluate("__seg()")
             assert state["paused"] and abs(state["clock"] - 8.3) < 0.03, state
             assert await page.evaluate("P.ctx===savedAudioContext")
 
             # A process restart first returns 404 for the old URL. The client
             # must refresh the manifest, recreate the cache, and retain pause.
+            await page.wait_for_function("P.fetchN>=10 && P.segs.has(10)", timeout=6000)
             previous = await page.evaluate("P.generation")
             # Routing disables the browser HTTP cache, exercising an uncached
             # old URL even though the seek tests already fetched this tiny file.
             await page.route("**/mse/**", lambda route: route.continue_())
             await restart_server()
+            assert await page.evaluate("P.id===2"), await page.evaluate("__seg()")
             await page.evaluate("testRecords=[];seekTo(8.3)")
             await page.wait_for_function("g=>P.generation!==g && testRecords.length>0 && pendSeek===null", arg=previous, timeout=12000)
             state = await page.evaluate("__seg()")
@@ -176,11 +189,28 @@ async def exercise(url, library, he_aac, restart_server):
                     assert abs(state["adrift"] or 0) < 0.002, state
                     assert state["clock"] > 3.1 and state["ctx"] == "running", state
                     he_aac_result = "played and sought"
+            hevc_result = "not requested"
+            if hevc:
+                await page.evaluate("window.testId=7")
+                await page.click("#test-start")
+                await page.wait_for_function("testRecords.length > 0 || (P.id===null && document.getElementById('buf').innerText.toLowerCase().includes('decoder'))", timeout=6000)
+                probes = await page.evaluate("testProbes")
+                probe_ms = probes[-1]["end"] - probes[0]["at"]
+                if await page.evaluate("P.id===null"):
+                    error = await page.evaluate("document.getElementById('buf').innerText")
+                    assert "no hvc1.2.4.L120.B0 decoder in WebCodecs" in error, error
+                    assert probe_ms < 500, probes
+                    assert await page.evaluate("document.getElementById('buf').querySelector('.spin').hidden")
+                    hevc_result = {"unsupported_decoder_probe_ms": round(probe_ms, 1),
+                                   "click_to_error_ms": await page.evaluate("Math.round(performance.now()-testClickedAt)")}
+                else:
+                    hevc_result = {"played_decoder_probe_ms": round(probe_ms, 1)}
             assert not errors, errors
             print(json.dumps({"browser": browser_name, "version": browser.version, "seek_ms": latencies,
                               "checks": ["accurate seeks", "video-only", "paused seek", "cache rebuild",
                                          "server restart", "delayed audio", "short B-frame EOF", "audio EOF video tail", "paused EOF seek"],
                               "he_aac": he_aac_result,
+                              "hevc": hevc_result,
                               "page_errors": errors}))
         except Exception:
             print("PLAYER STATE", await page.evaluate("()=>({state:__seg(),overlay:document.getElementById('buf').innerText,records:testRecords.slice(0,3)})"))
@@ -202,6 +232,9 @@ async def main():
         he_aac = os.environ.get("PLAYER_HEAAC") == "1"
         if he_aac:
             generate(library / "6", 6, 6, he_aac=True)
+        hevc = os.environ.get("PLAYER_HEVC") == "1"
+        if hevc:
+            generate(library / "7", 2, hevc=True)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -238,11 +271,12 @@ async def main():
             try:
                 await wait_ready()
                 with sqlite3.connect(tmp / "test.db") as db:
-                    for item_id in range(1, 7 if he_aac else 6):
+                    fixture_ids = list(range(1, 6)) + ([6] if he_aac else []) + ([7] if hevc else [])
+                    for item_id in fixture_ids:
                         db.execute("INSERT INTO library (id,magnet,title,state,file_path,added_at) "
                                    "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",
                                    (item_id, "audit", f"fixture-{item_id}", "ready", str(library / str(item_id))))
-                await exercise(url, library, he_aac, restart_server)
+                await exercise(url, library, he_aac, hevc, restart_server)
             except Exception:
                 log.flush(); log.seek(0)
                 print(log.read())

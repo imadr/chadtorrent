@@ -2656,6 +2656,7 @@ function queueVideoFrame(dec, frame) {
     return;
   }
   if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
+  if (P.noAudio && !P.wall) P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: P.lastT };
   P.vq.push(frame);
   P.seekVideoReady = true;
   finishSeek();
@@ -3043,15 +3044,25 @@ function playerPause() {
   if (!P.paused) { P.paused = true; v.dispatchEvent(new Event('pause')); }
 }
 
+async function configureCandidate(dec, config) {
+  try {
+    dec.configure(config);
+    // An empty flush is a control-queue barrier: it settles when configuration
+    // has actually been processed, or rejects if the backend cannot configure.
+    // Synchronous failures skip it entirely; no arbitrary per-candidate sleep.
+    await dec.flush();
+    return dec.state === 'configured';
+  } catch (e) { return false; }
+}
+
 async function startEngine(position = 0) {
   const gen = ++segGen;
   const id = P.id;
   if (segAbort) segAbort.abort();
   segAbort = new AbortController();
 
-  // Manifest: codecs + duration + which segments exist. Poll until the first
-  // segment is cut — for a still-downloading torrent that means waiting for
-  // the head pieces, which is exactly the buffering we want to show.
+  // Check codecs as soon as metadata is available. Segment availability is
+  // handled by the feeder, so unsupported files need not finish remuxing first.
   let info = null;
   for (;;) {
     if (gen !== segGen || P.id !== id) return false;
@@ -3068,19 +3079,14 @@ async function startEngine(position = 0) {
     // decoder) — fail clearly instead of looping forever.
     if (info.done && !info.mime) throw new Error('Unsupported codec: nothing in this file that the browser can decode');
     if (info.done && !info.segments.length) throw new Error('Remux produced no playable segments');
-    // A ready item's cache is re-cut on server start; joining mid-recut means
-    // reading init/segments that are being rewritten (truncated chain, dead
-    // session). Wait for the cut to finish; downloading items have no such
-    // moment and use the frontier as always.
-    const ready = ((items.find(i => i.id === id) || {}).state === 'ready');
-    if (info.mime && info.timing && info.segments.length && (info.done || !ready)) break;
+    if (info.mime) break;
     await segSleep(500);
   }
   if (gen !== segGen || P.id !== id) return false;
   fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
   P.done = !!info.done;
   P.generation = info.generation;
-  P.timing = info.timing; P.audioSkipUntil = info.timing.audio_skip_until;
+  P.timing = info.timing || null; P.audioSkipUntil = info.timing?.audio_skip_until || 0;
   P.segs = new Map(info.segments.map(s => [s.n, s.t]));
   P.segMaxN = info.segments.length ? info.segments[info.segments.length - 1].n : 0;
   const codecs = parseMime(info.mime);
@@ -3091,7 +3097,8 @@ async function startEngine(position = 0) {
     if (gen !== segGen || P.id !== id) return false;
     initBuf = await fetchSegBuf(id, 'init');
     if (initBuf) break;
-    await segSleep(500);
+    await refreshManifest(gen, id);
+    await segSleep(50);
   }
   if (gen !== segGen || P.id !== id) return false;
   const trks = parseInit(initBuf);
@@ -3104,7 +3111,7 @@ async function startEngine(position = 0) {
 
   ensureCtx(!P.paused);
   P.nextAt = 0;
-  P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: 0 };   // video-only master base
+  P.wall = null; // video-only startup waits for its first decoded frame
 
   // isConfigSupported lies for HEVC on Firefox (hangs / false-negatives) while
   // decodingInfo says supported — so configure candidates directly and treat a
@@ -3143,10 +3150,9 @@ async function startEngine(position = 0) {
     let failed = false, accepted = false;
     const dec = mkVdec(e => { if (accepted) onDecErr('video')(e); else failed = true; });
     P.vdec = dec;
-    try { dec.configure(c); } catch (e) { failed = true; }
-    await segSleep(250);   // give an async reject time to surface
+    const configured = await configureCandidate(dec, c);
     if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
-    if (failed || dec.state !== 'configured') {
+    if (!configured || failed || dec.state !== 'configured') {
       try { dec.close(); } catch (e) {}
       continue;
     }
@@ -3190,10 +3196,9 @@ async function startEngine(position = 0) {
       const dec = mkAdec(e => { if (accepted) onAudioDecErr(e); else failed = true; });
       P.adec = dec;
       try {
-        dec.configure(P.acfgs[i]);
-        await segSleep(120);
+        const configured = await configureCandidate(dec, P.acfgs[i]);
         if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
-        if (!failed && dec.state === 'configured') { P.acfgIdx = i; accepted = true; break; }
+        if (configured && !failed && dec.state === 'configured') { P.acfgIdx = i; accepted = true; break; }
       } catch (e) {}
       try { dec.close(); } catch (_e) {}
       P.adec = null;
