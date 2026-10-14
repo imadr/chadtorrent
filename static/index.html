@@ -2977,6 +2977,8 @@ async function startEngine() {
   const vtr = [...trks.values()].find(t => t.kind === 'video');
   const atr = [...trks.values()].find(t => t.kind === 'audio');
   if (!vtr) throw new Error('no video track');
+  P.noAudio = !atr;
+  P.acfgs = null; P.acfgIdx = 0;
 
   ensureCtx();
   P.nextAt = 0;
@@ -3075,8 +3077,7 @@ async function startEngine() {
       try { dec.close(); } catch (_e) {}
       P.adec = null;
     }
-    if (!P.adec) console.warn('[ct] audio decode unavailable — video only');
-    P.noAudio = !P.adec;   // wall-clock master (see mediaNow)
+    if (!P.adec) throw new Error('No WebCodecs audio decoder for ' + acodec);
     // AAC decoder-delay trim. Raw AAC streams start with the codec's
     // algorithmic delay (priming) baked into the first packets, and every
     // native player trims it before presenting (CoreAudio/CoreMedia and
@@ -3231,6 +3232,7 @@ function teardownWC() {
   pendSeek = null; pendSeekAt = 0;
   if (segAbort) { segAbort.abort(); segAbort = null; }
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
+  P.vcfg = null; P.acfgs = null; P.acfgIdx = 0;
   P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0; P.aTrimUs = 0;
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }

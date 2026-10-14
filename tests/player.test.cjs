@@ -41,6 +41,18 @@ function fragment({ defaults = [], tfhdFlags = 0, runFlags = 0, rows = [], count
 function tracks(defaults = {}) {
   return new Map([[1, { kind: 'video', timescale: 1000, trex: { dur: 0, size: 0, flags: 0, ...defaults } }]]);
 }
+async function startVideoOnly(c) {
+  c.api = async () => ({ done: true, mime: 'video/mp4; codecs="avc1.64001E"', duration: 90, segments: [{ n: 1, t: 0 }] });
+  c.items = []; c.segFileQ = () => '';
+  c.fetchSegBuf = async () => new ArrayBuffer(0);
+  c.parseInit = () => new Map([[1, { kind: 'video', w: 64, h: 64, codec4cc: 'avc1' }]]);
+  c.ensureCtx = () => c.P.ctx = { currentTime: 0, state: 'running' };
+  c.VideoDecoder = class { constructor() { this.state = 'unconfigured'; } configure() { this.state = 'configured'; } };
+  c.feedLoop = async () => {};
+  c.setTimeout = fn => { queueMicrotask(fn); return 0; };
+  c.P.id = 1;
+  await c.startEngine();
+}
 
 test('single-fragment tails use tfhd timing without neighboring fragments', () => {
   const c = engine();
@@ -86,4 +98,14 @@ test('seek completion keeps rejecting in-flight preroll and waits for both track
   assert.equal(vm.runInContext('pendSeek', c), null);
   assert.equal(output(c.P.vdec, 6, 0.04).closed, true);
   assert.equal(c.P.seekFloor, 10);
+});
+test('video-only startup selects a wall clock without EOF and clears previous audio config', async () => {
+  const c = engine();
+  c.P.acfgs = [{ codec: 'mp4a.40.2' }];
+  await startVideoOnly(c);
+  assert.equal(c.P.noAudio, true);
+  assert.equal(c.P.acfgs, null);
+  c.P.ctx.currentTime = 5;
+  assert.equal(c.mediaNow(), 5);
+  assert.equal(c.P.eof, false);
 });
