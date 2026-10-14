@@ -109,3 +109,15 @@ test('video-only startup selects a wall clock without EOF and clears previous au
   assert.equal(c.mediaNow(), 5);
   assert.equal(c.P.eof, false);
 });
+test('explicit SBR ASC carries both object types and the original core configuration', () => {
+  const c = engine();
+  const result = c.ascExplicitSbr(new Uint8Array([0x13, 0x90])); // LC, 22050Hz, stereo
+  const bits = Array.from(result.asc, b => b.toString(2).padStart(8, '0')).join('');
+  assert.equal(parseInt(bits.slice(0, 5), 2), 5);
+  assert.equal(parseInt(bits.slice(5, 9), 2), 7);
+  assert.equal(parseInt(bits.slice(9, 13), 2), 2);
+  assert.equal(parseInt(bits.slice(13, 17), 2), 4);
+  assert.equal(parseInt(bits.slice(17, 22), 2), 2);
+  assert.equal(result.outRate, 44100);
+  assert.equal(c.ascExplicitSbr(result.asc), null);
+});

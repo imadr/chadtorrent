@@ -2576,7 +2576,7 @@ function parseMime(mime) {
  * A WebCodecs decoder that doesn't sniff it outputs half-rate audio whose
  * per-packet duration is 2x the container step — timing drift and wrong
  * pitch. Rewrite the ASC as explicit SBR (AOT 5 + doubled sampling rate, the
- * LC config verbatim after the 13-bit header) so the decoder outputs the
+ * underlying LC object type and GA config) so the decoder outputs the
  * full-rate stream the container timing assumes. Returns null when the ASC
  * is not a rewriting candidate (already SBR, escape/non-table rate, PCE...).
  */
@@ -2599,6 +2599,7 @@ function ascExplicitSbr(asc) {
   wr(idx, 4);        // core (container) rate
   wr(ch, 4);         // channelConfig
   wr(ext, 4);        // extensionSamplingFrequencyIndex = 2x rate
+  wr(2, 5);          // underlying audioObjectType = AAC-LC, before GASpecificConfig
   out.push(...bits); // remainder of the LC config (GA part) verbatim
   while (out.length % 8) out.push(0);
   const bytes = new Uint8Array(out.length / 8);
