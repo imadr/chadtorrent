@@ -150,3 +150,18 @@ test('audio EOF is determined by flush completion, not decodeQueueSize', async (
   await c.flushTail('A', 0);
   assert.equal(c.audioEnded(), true);
 });
+test('seek starts at the nearest preceding sync sample with bounded audio preroll', () => {
+  const c = engine();
+  const V = [0, 1, 2, 3, 4, 5].map(t => ({ ts: t * 1e6, key: t % 2 === 0 }));
+  const A = [2.7, 2.9, 3, 3.1].map(t => ({ ts: t * 1e6, durUs: 20000 }));
+  const selected = c.seekChunks({ V, A }, 3.1);
+  assert.equal(selected.V[0].ts, 2e6);
+  assert.equal(selected.A[0].ts, 2.9e6);
+});
+test('decoder progress wakes feeding without waiting for a polling timer', async () => {
+  const c = engine();
+  const waiting = c.waitFeed(10000);
+  c.wakeFeed();
+  await waiting;
+  assert.equal(vm.runInContext('feedWaiters.size', c), 0);
+});

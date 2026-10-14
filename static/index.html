@@ -2302,6 +2302,15 @@ let pendSeek = null, pendSeekAt = 0;  // pending seek target (party buffering ru
 let bufferingSince = 0;
 let segAbort = null;
 const segSleep = (ms) => new Promise(r => setTimeout(r, ms));
+const feedWaiters = new Set();
+function wakeFeed() { for (const wake of [...feedWaiters]) wake(); }
+function waitFeed(ms = 250) {
+  return new Promise(resolve => {
+    const wake = () => { clearTimeout(timer); feedWaiters.delete(wake); resolve(); };
+    const timer = setTimeout(wake, ms);
+    feedWaiters.add(wake);
+  });
+}
 
 const P = {
   id: null, tracks: null, segs: new Map(), segMaxN: 0, done: false,
@@ -2323,6 +2332,7 @@ const P = {
   paused: true,
   lastT: 0, flow: 0,          // flow = performance.now() of the last painted frame
   vol: 1, muted: false, err: null, tickOn: false, canplaySent: false,
+  raf: 0,
 };
 
 /* Master clock. Audio is scheduled ahead on the WebAudio timeline; the
@@ -2345,6 +2355,7 @@ function audioEnded() {
 }
 function mediaNow() {
   if (!P.ctx) return P.lastT;
+  if (pendSeek != null) return P.lastT;
   const now = P.ctx.currentTime;
   if (P.anchor) {
     const behind = P.anchor.ctx - now;
@@ -2636,6 +2647,7 @@ function onDecErr(which) {
  * them lets the keyframe→target tail decode at full speed; the first KEPT
  * output is already at the target. */
 function queueVideoFrame(dec, frame) {
+      wakeFeed();
       if (P.vdec !== dec) { try { frame.close(); } catch (e) {} return; }
       P.videoEnd = Math.max(P.videoEnd, (frame.timestamp + (frame.duration || 0)) / 1e6);
       if (P.seekFloor > 0 && frame.timestamp / 1e6 + (frame.duration || 0) / 1e6 <= P.seekFloor) {
@@ -2655,11 +2667,13 @@ function mkVdec() {
     output: (frame) => queueVideoFrame(dec, frame),
     error: (e) => { if (P.vdec === dec) onDecErr('video')(e); },
   });
+  dec.addEventListener?.('dequeue', wakeFeed);
   return dec;
 }
 function mkAdec() {
   const dec = new AudioDecoder({
     output: (ad) => {
+      wakeFeed();
       if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
       if (P.seekFloor > 0 && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 <= P.seekFloor) { ad.close(); return; }
@@ -2669,6 +2683,7 @@ function mkAdec() {
     },
     error: (e) => { if (P.adec === dec) onAudioDecErr(e); },
   });
+  dec.addEventListener?.('dequeue', wakeFeed);
   return dec;
 }
 /* Some AAC streams decode for a moment and then hit "encoding not supported"
@@ -2740,6 +2755,7 @@ function pumpAudio() {
   // frame lands) and audio+video then start at the target together.
   if (pendSeek != null) return;
   if (P.nextAt < P.ctx.currentTime) P.nextAt = P.ctx.currentTime + 0.01;
+  const queued = P.aq.length;
   while (P.aq.length && P.nextAt < P.ctx.currentTime + 1.5) {
     const ad = P.aq.shift();
     const ts = ad.timestamp / 1e6 - P.aTrimUs / 1e6;   // minus decoder delay (native parity)
@@ -2757,6 +2773,7 @@ function pumpAudio() {
   }
   // drop ring entries that finished sounding (keep the spanning one)
   if (P.sched) while (P.sched.length > 1 && P.sched[0].cs + P.sched[0].dur < P.ctx.currentTime - 0.5) P.sched.shift();
+  if (queued !== P.aq.length) wakeFeed();
 }
 
 function paint(frame) {
@@ -2800,7 +2817,7 @@ let lastTU = 0, wasWaiting = false;
  * drawing stops in background tabs, which is fine (nothing to look at). */
 function drawTick() {
   if (!P.id) { P.tickOn = false; return; }
-  requestAnimationFrame(drawTick);
+  P.raf = requestAnimationFrame(drawTick);
   pumpAudio();   // rAF-driven too: a janky 250ms interval must never starve the schedule
   const t = mediaNow();
   let draw = null;
@@ -2817,6 +2834,7 @@ function drawTick() {
     (window.__paints = window.__paints || []).push({ at: Math.round(performance.now()), clock: +t.toFixed(2), fts: +(draw.timestamp / 1e6).toFixed(2) });
     if (window.__paints.length > 400) window.__paints.splice(0, 100);
     draw.close();
+    wakeFeed();
     P.flow = performance.now();
     if (!P.canplaySent) { P.canplaySent = true; v.dispatchEvent(new Event('canplay')); }
   }
@@ -2867,27 +2885,39 @@ async function refreshManifest(gen, id) {
   } catch (e) {}
 }
 
-/* Sequential feeder: fetch segment N, demux, queue chunks for the decoders.
- * Headroom caps keep decoded memory tiny (a couple of MB of frames), and the
- * lookahead keeps the fetch window SEG_AHEAD ahead of the playhead. */
+function seekChunks(ch, target) {
+  let key = -1;
+  for (let i = 0; i < ch.V.length; i++) {
+    if (ch.V[i].key && ch.V[i].ts <= target * 1e6) key = i;
+  }
+  return {
+    V: key >= 0 ? ch.V.slice(key) : ch.V,
+    // Keep 200ms of audio preroll for decoder warm-up, but do not decode the
+    // entire segment prefix for a far seek.
+    A: ch.A.filter(c => c.ts + c.durUs > (target - 0.2) * 1e6),
+  };
+}
+
+/* A single fetch producer runs alongside event-driven decoder feeding. Frame
+ * output, dequeue, and presentation wake the feeder; sleeps only bound network
+ * retries and provide a fallback when the playhead reaches the fetch window. */
 async function feedLoop(gen, id) {
-  // Decode audio first (it drives the clock), video when there is headroom,
-  // and FETCH whenever the lookahead needs it — a full video queue must never
-  // block fetching, or the audio runs dry, the clock pins, and the video
-  // queue can never drain again (measured: session freezes ~45s in).
-  // Batches per pass: after a seek the backlog is thousands of chunks and a
-  // one-decode-per-pass loop re-runs every gate check per chunk for nothing.
+  let fetching = null, failure = null, pollAt = 0;
   while (gen === segGen && P.id === id) {
+    if (failure) throw failure;
+    let worked = false;
     if (P.chunksA.length && P.aq.length < 700 && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
       for (let i = 0; i < 64 && P.chunksA.length && P.aq.length < 700 && P.adec.decodeQueueSize < 80; i++) P.adec.decode(P.chunksA.shift());
-      continue;
+      worked = true;
     }
-    if (P.chunksV.length && P.vdec && P.vdec.state === 'configured' && P.vdec.decodeQueueSize < 32 && P.vq.length < SEG_MAX_VQ) {
-      for (let i = 0; i < 32 && P.chunksV.length && P.vdec.decodeQueueSize < 32 && P.vq.length < SEG_MAX_VQ; i++) P.vdec.decode(P.chunksV.shift());
-      continue;
+    if (P.chunksV.length && P.vdec && P.vdec.state === 'configured') {
+      for (let i = 0; i < 32 && P.chunksV.length && P.vdec.decodeQueueSize < 32
+          && P.vq.length + P.vdec.decodeQueueSize < SEG_MAX_VQ; i++) {
+        P.vdec.decode(P.chunksV.shift()); worked = true;
+      }
     }
     const t = P.segs.get(P.fetchN);
-    if (t === undefined) {
+    if (t === undefined && !fetching) {
       if (P.done) {
         P.eof = true;
         // Drain each track independently. Audio may finish before video; its
@@ -2898,29 +2928,31 @@ async function feedLoop(gen, id) {
           await Promise.all([P.flushA, P.flushV]);
           return;
         }
-        await segSleep(100);
+      } else if (performance.now() >= pollAt) {
+        await refreshManifest(gen, id);
+        pollAt = performance.now() + 400;
         continue;
       }
-      await refreshManifest(gen, id);
-      await segSleep(400);
-      continue;
     }
-    if (t >= mediaNow() + SEG_AHEAD) { await segSleep(200); continue; }
-    const buf = await fetchSegBuf(id, 'seg/' + P.fetchN);
-    if (gen !== segGen || P.id !== id) return;
-    if (!buf) { await refreshManifest(gen, id); await segSleep(400); continue; }
-    const ch = segToChunks(buf, parseSeg(buf, P.tracks));
-    for (const c of ch.V) {
-      if (P.needKey && !c.key) continue;
-      P.needKey = false;
-      P.chunksV.push(new EncodedVideoChunk({ type: c.key ? 'key' : 'delta', timestamp: c.ts, duration: c.durUs, data: c.data }));
+    if (t !== undefined && t < mediaNow() + SEG_AHEAD && !fetching && performance.now() >= pollAt) {
+      const n = P.fetchN;
+      fetching = fetchSegBuf(id, 'seg/' + n).then(buf => {
+        if (gen !== segGen || P.id !== id) return;
+        if (!buf) { pollAt = performance.now() + 400; return; }
+        let ch = segToChunks(buf, parseSeg(buf, P.tracks));
+        if (P.needKey) ch = seekChunks(ch, P.seekFloor);
+        for (const c of ch.V) {
+          if (P.needKey && !c.key) continue;
+          P.needKey = false;
+          P.chunksV.push(new EncodedVideoChunk({ type: c.key ? 'key' : 'delta', timestamp: c.ts, duration: c.durUs, data: c.data }));
+        }
+        for (const c of ch.A) P.chunksA.push(new EncodedAudioChunk({ type: 'key', timestamp: c.ts, duration: c.durUs, data: c.data }));
+        const next = P.segs.get(n + 1);
+        P.fedUntil = next != null ? next : (P.done && fullDur ? fullDur : t);
+        P.fetchN = n + 1;
+      }).catch(e => { failure = e; }).finally(() => { fetching = null; wakeFeed(); });
     }
-    for (const c of ch.A) {
-      P.chunksA.push(new EncodedAudioChunk({ type: 'key', timestamp: c.ts, duration: c.durUs, data: c.data }));
-    }
-    const next = P.segs.get(P.fetchN + 1);
-    P.fedUntil = next != null ? next : (P.done && fullDur ? fullDur : t + 60);
-    P.fetchN++;
+    if (!worked) await waitFeed(pollAt > performance.now() ? Math.min(250, pollAt - performance.now()) : 250);
   }
 }
 
@@ -2953,6 +2985,7 @@ function playerPlay() {
   if (!P.id) return;
   ensureCtx();
   if (P.paused) { P.paused = false; v.dispatchEvent(new Event('play')); }
+  wakeFeed();
 }
 function playerPause() {
   if (P.ctx && P.ctx.state === 'running') P.ctx.suspend();
@@ -3133,7 +3166,7 @@ async function startEngine() {
 
   v.dispatchEvent(new Event('loadedmetadata'));
   P.canplaySent = false;
-  if (!P.tickOn) { P.tickOn = true; requestAnimationFrame(drawTick); }
+  if (!P.tickOn) { P.tickOn = true; P.raf = requestAnimationFrame(drawTick); }
   feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
 }
 
@@ -3193,6 +3226,7 @@ function seekTo(globalT, partyOrigin) {
   if (partyOrigin) partyArm('seek');
   if (!P.id) { P.lastT = globalT; return; }
   const gen = ++segGen;
+  wakeFeed();
   if (segAbort) { segAbort.abort(); }
   segAbort = new AbortController();
   P.fetchN = segContaining(globalT);
@@ -3262,6 +3296,9 @@ function segFatal(e) {
 }
 
 function teardownWC() {
+  wakeFeed();
+  if (P.raf) cancelAnimationFrame(P.raf);
+  P.raf = 0;
   pendSeek = null; pendSeekAt = 0;
   if (segAbort) { segAbort.abort(); segAbort = null; }
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
