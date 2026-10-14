@@ -347,11 +347,10 @@ impl SegmenterManager {
         //      directory, or stale/NULL) / canonical `library_dir/{id}`; heal
         //      the DB when found in the canonical spot.
         //    - explicit file: the exact relative path beneath the same base.
-        //    Paused/stopped items must also use the file: their torrent's
-        //    FileStream blocks at the piece frontier forever, which would
-        //    wedge the segmenter into an eternal "buffering" with `done` never
-        //    true.
-        if matches!(item.state.as_str(), "ready" | "paused" | "stopped") {
+        //    Only verified finished items can bypass FileStream. A paused
+        //    download is still partial: reading sparse/unverified bytes would
+        //    turn the download frontier into corruption or a false EOF.
+        if item.state == "ready" {
             let base = item
                 .file_path
                 .as_ref()
@@ -460,7 +459,7 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
         _ => None,
     };
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+    cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-xerror"]);
     match input {
         Input::File(path) => {
             cmd.arg("-i").arg(path);
@@ -532,11 +531,14 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
     if !status.success() && ffmpeg_err.is_empty() {
         anyhow::bail!("ffmpeg exited with {status}");
     }
-    if !status.success() {
+    if !status.success() || !ffmpeg_err.is_empty() {
         anyhow::bail!("ffmpeg failed: {ffmpeg_err}");
     }
     splitter.finish().await?;
     let mut info = seg.info.lock().unwrap();
+    if info.segments.is_empty() {
+        anyhow::bail!("ffmpeg produced no playable segments");
+    }
     info.running = false;
     info.done = true;
     info!(
@@ -654,6 +656,9 @@ impl SegmentSplitter {
     }
 
     async fn finish(&mut self) -> anyhow::Result<()> {
+        if !self.init_done || self.timescale == 0 || self.acc.buf.len() != self.acc.consumed {
+            anyhow::bail!("ffmpeg produced an incomplete MP4 stream");
+        }
         self.close_segment().await
     }
 }
@@ -991,6 +996,28 @@ mod tests {
         assert_eq!(byte_range(Some("bytes=100-"), 100), None);
         assert_eq!(byte_range(Some("bytes=3-1"), 100), None);
         assert_eq!(byte_range(Some("bytes=0-1,3-4"), 100), None);
+    }
+
+    #[tokio::test]
+    async fn incomplete_output_is_not_marked_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = Arc::new(Segmenter::new(1, None, dir.path().to_owned()));
+        let mut splitter = SegmentSplitter::new(seg).unwrap();
+        splitter.init_done = true;
+        splitter.timescale = 1000;
+        splitter.feed(&[0, 0, 0, 16, b'm', b'd', b'a', b't']).await.unwrap();
+        assert!(splitter.finish().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_input_surfaces_an_error_instead_of_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("broken.mp4");
+        std::fs::write(&file, b"not an MP4 file").unwrap();
+        let seg = Arc::new(Segmenter::new(1, None, dir.path().to_owned()));
+        run_segmenter(seg.clone(), Input::File(file)).await;
+        assert!(!seg.snapshot().done);
+        assert!(seg.snapshot().error.is_some());
     }
 
     #[tokio::test]
