@@ -165,3 +165,13 @@ test('decoder progress wakes feeding without waiting for a polling timer', async
   await waiting;
   assert.equal(vm.runInContext('feedWaiters.size', c), 0);
 });
+test('manifest errors after playback starts are surfaced, not retried forever', async () => {
+  const c = engine();
+  c.P.id = 1; c.segFileQ = () => '';
+  c.api = async () => ({ error: 'demux failed', segments: [] });
+  await assert.rejects(c.refreshManifest(0, 1), /demux failed/);
+  c.api = async () => ({ done: true, segments: [] });
+  await assert.rejects(c.refreshManifest(0, 1), /no playable segments/);
+  c.api = async () => { throw new Error('server unreachable'); };
+  await assert.rejects(c.refreshManifest(0, 1), /server unreachable/);
+});

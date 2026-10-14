@@ -2875,14 +2875,15 @@ setInterval(() => {
 }, 250);
 
 async function refreshManifest(gen, id) {
-  try {
-    const info = await api('/api/library/' + id + '/stream' + segFileQ());
-    if (gen !== segGen || !info || info.error) return;
-    if (info.duration && isFinite(info.duration) && info.duration > fullDur) fullDur = info.duration;
-    P.done = !!info.done;
-    for (const s of info.segments) if (!P.segs.has(s.n)) P.segs.set(s.n, s.t);
-    if (info.segments.length) P.segMaxN = info.segments[info.segments.length - 1].n;
-  } catch (e) {}
+  const info = await api('/api/library/' + id + '/stream' + segFileQ(), { signal: segAbort?.signal });
+  if (gen !== segGen || P.id !== id) return;
+  if (info.error) throw new Error(info.error);
+  if (info.state === 'error') throw new Error('Torrent failed to download');
+  if (info.done && !info.segments.length) throw new Error('Remux produced no playable segments');
+  if (info.duration && isFinite(info.duration) && info.duration > fullDur) fullDur = info.duration;
+  P.done = !!info.done;
+  for (const s of info.segments) if (!P.segs.has(s.n)) P.segs.set(s.n, s.t);
+  if (info.segments.length) P.segMaxN = info.segments[info.segments.length - 1].n;
 }
 
 function seekChunks(ch, target) {
@@ -3012,6 +3013,7 @@ async function startEngine() {
     // name the video codec honestly (exotic container codec with no browser
     // decoder) — fail clearly instead of looping forever.
     if (info.done && !info.mime) throw new Error('Unsupported codec: nothing in this file that the browser can decode');
+    if (info.done && !info.segments.length) throw new Error('Remux produced no playable segments');
     // A ready item's cache is re-cut on server start; joining mid-recut means
     // reading init/segments that are being rewritten (truncated chain, dead
     // session). Wait for the cut to finish; downloading items have no such
@@ -3560,9 +3562,8 @@ v.addEventListener('playing', () => {
  * few times a second instead of trusting event order: the generic
  * 'Buffering…' overlay is visible exactly when we want to play but the
  * playhead has no data. Explicit overlays (errors, party waits) untouched. */
-let wedgeSince = 0, wedgeLastT = -1;
 setInterval(() => {
-  if ($('player-modal').hidden) { wedgeSince = 0; wedgeLastT = -1; return; }
+  if ($('player-modal').hidden) return;
   const b = $('buf'), span = b.querySelector('span');
   const generic = !b.hidden && span.textContent === 'Buffering…';
   const starving = pendSeek != null || (!P.paused && P.id && (!P.flow || performance.now() - P.flow > 1500));
@@ -3570,25 +3571,6 @@ setInterval(() => {
     if (b.hidden || generic) showBufProgress();
   } else if (generic) {
     hideBuf();
-  }
-  // Engine wedge: we want to play, a seek is not pending, yet nothing has been
-  // painted for 4s — nudge by re-seeking a hair forward (rebuilds the decode
-  // pipeline). A genuine decoder error surfaces through onDecErr instead.
-  if (!P.paused && P.id && !P.eof && pendSeek == null && P.flow && performance.now() - P.flow > 4000) {
-    const t = P.lastT;
-    if (Math.abs(t - wedgeLastT) < 0.05) {
-      if (!wedgeSince) wedgeSince = Date.now();
-      else if (Date.now() - wedgeSince > 4000) {
-        wedgeSince = 0;
-        console.warn('[ct] engine wedged at', t, '— nudging');
-        bufDump('wedge');
-        seekTo(t + 0.25);
-      }
-    } else wedgeSince = 0;
-    wedgeLastT = t;
-  } else {
-    wedgeSince = 0;
-    wedgeLastT = -1;
   }
 }, 400);
 
