@@ -2380,7 +2380,8 @@ function parseInit(buf) {
   const moov = mp4Find(d, 0, buf.byteLength, 'moov');
   if (!moov) throw new Error('bad init segment (no moov)');
   const trex = new Map();
-  for (const b of mp4Boxes(d, moov.off + moov.hdr, moov.end)) {
+  const mvex = mp4Find(d, moov.off + moov.hdr, moov.end, 'mvex');
+  for (const b of mp4Boxes(d, mvex ? mvex.off + mvex.hdr : moov.end, mvex ? mvex.end : moov.end)) {
     if (b.ty !== 'trex') continue;
     const bo = b.off + b.hdr;
     trex.set(d.getUint32(bo + 4), {
@@ -2455,13 +2456,9 @@ function parseInit(buf) {
   }
   return tracks;
 }
-/* one fragmented segment -> Map(trackId -> [{dts, pts, dur, size, key, off}])
- * ffmpeg's trun often carries NO per-sample durations (and no trex default):
- * dts then only ticks by 1 per sample, which compresses timestamps to garbage
- * inside a fragment (only each traf's tfdt base is real). The true implicit
- * per-sample duration falls out of consecutive trafs of the same track:
- * next.base - this.base == this.count * dur. So: pass 1 collects traf
- * records, pass 2 derives each track's implicit duration and emits samples. */
+/* Fragment sample fields inherit from trun → tfhd → mvex/trex. Never infer
+ * durations from neighboring fragments: tails can contain just one fragment,
+ * and a track can have variable sample durations. */
 function parseSeg(buf, tracks) {
   const d = new DataView(buf);
   const trafs = [];   // {top, trackId, base, runs, defDur, defSize, defFlags}
@@ -2469,7 +2466,7 @@ function parseSeg(buf, tracks) {
     if (top.ty !== 'moof') continue;
     for (const traf of mp4Boxes(d, top.off + top.hdr, top.end)) {
       if (traf.ty !== 'traf') continue;
-      let trackId = 0, defDur = 0, defSize = 0, defFlags = 0, baseTime = 0;
+      let trackId = 0, defDur = null, defSize = null, defFlags = null, baseTime = 0;
       const runs = [];
       for (const c of mp4Boxes(d, traf.off + traf.hdr, traf.end)) {
         const bo = c.off + c.hdr;
@@ -2492,7 +2489,7 @@ function parseSeg(buf, tracks) {
           if (f & 0x004) { firstFlags = d.getUint32(o); o += 4; }
           const smp = [];
           for (let i = 0; i < n; i++) {
-            let dur = 0, size = 0, flags = 0, cts = 0;
+            let dur = null, size = null, flags = null, cts = 0;
             if (f & 0x100) { dur = d.getUint32(o); o += 4; }
             if (f & 0x200) { size = d.getUint32(o); o += 4; }
             if (f & 0x400) { flags = d.getUint32(o); o += 4; }
@@ -2515,34 +2512,20 @@ function parseSeg(buf, tracks) {
   for (const [trackId, list] of byTrack) {
     const tr = tracks.get(trackId);
     const def = tr.trex;
-    // explicit durations anywhere (per-sample or trex default)?
-    let anyDur = def.dur > 0;
-    if (!anyDur) {
-      outer: for (const t of list) for (const run of t.runs) for (const r of run.smp) if (r.dur > 0) { anyDur = true; break outer; }
-    }
-    let idur = 0;
-    if (!anyDur) {
-      for (let i = 0; i + 1 < list.length; i++) {
-        const n = list[i].runs.reduce((a, r) => a + r.smp.length, 0);
-        if (n > 0 && list[i + 1].base > list[i].base) {
-          const dur = Math.round((list[i + 1].base - list[i].base) / n);
-          if (dur > 0 && (!idur || idur === dur)) idur = dur;
-        }
-      }
-      // single traf / no derivable pair: AAC frame sizes are the only audio
-      // this pipeline carries (1024 LC, 2048 HE per container); video falls
-      // back to 1-tick (its pts comes right from cts anyway).
-      if (!idur) idur = tr.kind === 'audio' ? 2048 : 1;
-    }
     const samples = [];
     for (const t of list) {
       let dts = t.base;
+      let pos = null;
       for (const run of t.runs) {
-        let pos = run.dataOff != null ? t.top.off + run.dataOff : -1;
+        if (run.dataOff != null) pos = t.top.off + run.dataOff;
+        if (pos == null) throw new Error('Fragment has no sample data offset');
         for (let i = 0; i < run.smp.length; i++) {
           const r = run.smp[i];
-          const dur = idur || r.dur || t.defDur || 1, size = r.size || t.defSize;
-          const flags = (i === 0 && run.firstFlags != null) ? run.firstFlags : (r.flags || t.defFlags);
+          const dur = r.dur ?? t.defDur ?? def.dur, size = r.size ?? t.defSize ?? def.size;
+          if (!(dur > 0) || !(size > 0) || pos < 0 || pos + size > buf.byteLength) {
+            throw new Error('Invalid fragment sample duration, size, or offset');
+          }
+          const flags = (i === 0 && run.firstFlags != null) ? run.firstFlags : (r.flags ?? t.defFlags ?? def.flags);
           samples.push({ dts, pts: dts + r.cts, dur, size, key: (flags & 0x10000) === 0, off: pos });
           dts += dur;
           pos += size;
