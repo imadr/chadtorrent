@@ -84,6 +84,9 @@ pub struct AppState {
     /// Reading catalogues (manga: MangaDex keyless; comics: Comic Vine). Always
     /// present — the comics side just reports "not configured" without a key.
     pub reading: Arc<crate::reading::ReadingClient>,
+    /// Reading sources: resolves bound series → chapter page images
+    /// (MangaDex, Weeb Central) and proxies the bytes.
+    pub reader: Arc<crate::reader::ReaderClient>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -115,6 +118,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/{id}/file", post(set_file_selected))
         .route("/api/library/{id}/playhead", post(set_playhead))
         .route("/api/library/{id}/stream", get(stream_info))
+        .route("/api/library/{id}/read/source", get(read_source_get).put(read_source_put))
+        .route("/api/library/{id}/read/source/{source}/search", get(read_source_search))
+        .route("/api/library/{id}/read/progress", get(read_progress))
+        .route("/api/library/{id}/read/chapter/{label}/progress", post(read_chapter_progress))
+        .route("/api/library/{id}/read/chapter/{label}", get(read_chapter))
+        .route("/api/library/{id}/read/chapter/{label}/page/{n}", get(read_chapter_page))
         .route("/api/library/{id}/subs", get(subs_list))
         .route("/api/library/{id}/subs/search", get(subs_search))
         .route("/api/library/{id}/subs/download", post(subs_download))
@@ -194,11 +203,26 @@ async fn meta_detail(
         }
         return Ok(Json(meta_json(&meta)));
     }
-    // Cold cache: one blocking read so even the very first open of a show is
-    // complete. A failed run stores nothing and is retried on the next open.
-    let _ = cache.refresh(&media_type, tmdb_id).await;
-    let meta = cache.get(&media_type, tmdb_id)?.unwrap_or_default();
-    Ok(Json(meta_json(&meta)))
+    // Cold cache: block until a sweep produces the payload so even the very
+    // first open of a title is complete. A warm-up sweep (spawned at add
+    // time) may still be in flight and lose the inflight race, so poll
+    // briefly — answering an empty payload here would latch as "no data"
+    // for the whole frontend session (the Gantz bug).
+    let mut meta = None;
+    for attempt in 0..6 {
+        if let Err(e) = cache.refresh(&media_type, tmdb_id).await {
+            warn!("meta refresh failed for {media_type}:{tmdb_id}: {e}");
+        }
+        meta = cache.get(&media_type, tmdb_id)?;
+        if meta.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        if attempt == 0 {
+            info!("cold meta for {media_type}:{tmdb_id} not ready yet — waiting on the in-flight sweep");
+        }
+    }
+    Ok(Json(meta_json(&meta.unwrap_or_default())))
 }
 
 fn meta_json(meta: &TmdbMeta) -> serde_json::Value {
@@ -286,8 +310,9 @@ async fn search_tmdb(
     Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!([]))))
 }
 
-/// Manga search (MangaDex, keyless). Same result shape as `/api/search`, so
-/// the add modal renders every catalogue with one code path.
+/// Manga search (Weeb Central catalogue, keyless — complete chapter lists,
+/// unlike MangaDex which delists licensed titles). Same result shape as
+/// `/api/search`, so the add modal renders every catalogue with one code path.
 async fn search_manga(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
@@ -302,8 +327,8 @@ async fn search_manga(
         return Ok(Json(json!([])));
     }
     let results = state
-        .reading
-        .search_manga(&query)
+        .reader
+        .search_catalogue(&query)
         .await
         .map_err(|e| Error::BadRequest(format!("search failed: {e}")))?;
     Ok(Json(serde_json::to_value(results).unwrap_or_else(|_| json!([]))))
@@ -599,6 +624,234 @@ async fn set_playhead(
         }
         None => state.library.db.set_playhead(id, req.t)?,
     }
+    Ok(Json(json!({ "success": true })))
+}
+
+// ---- reading (manga reader) ----
+
+/// Resolve a library row to its reading group identity:
+/// (media_type, catalogue id, catalogue ext_key, title).
+async fn reading_group(
+    state: &AppState,
+    id: i64,
+) -> Result<(String, i64, Option<String>, String)> {
+    let item = state
+        .library
+        .db
+        .get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+    let media_type = item
+        .media_type
+        .clone()
+        .filter(|mt| mt == "manga" || mt == "comic")
+        .ok_or_else(|| Error::BadRequest("item is not a reading entry".into()))?;
+    let tmdb_id = item
+        .tmdb_id
+        .ok_or_else(|| Error::BadRequest("reading entry has no catalogue id".into()))?;
+    let (ext, group_title) = state
+        .library
+        .db
+        .get_reading_source(&media_type, tmdb_id)?
+        .unwrap_or((None, None));
+    let title = group_title.or(item.title).unwrap_or_default();
+    Ok((media_type, tmdb_id, ext, title))
+}
+
+/// The group's reading-source binding (where chapter pages come from) plus
+/// the list of sources the picker can offer.
+async fn read_source_get(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    let (media_type, tmdb_id, _, _) = reading_group(&state, id).await?;
+    let binding = state.library.db.get_reader_source(&media_type, tmdb_id)?;
+    Ok(Json(json!({
+        "source": binding.as_ref().map(|b| b.source.clone()),
+        "series_ref": binding.as_ref().map(|b| b.series_ref.clone()),
+        "series_title": binding.as_ref().and_then(|b| b.series_title.clone()),
+        "sources": crate::reader::sources().iter()
+            .map(|(sid, label)| json!({ "id": sid, "label": label }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct ReadSourcePutRequest {
+    source: String,
+    /// Manual series pick from the picker; absent = auto-match by title.
+    series_ref: Option<String>,
+    series_title: Option<String>,
+}
+
+/// Bind (or rebind) the group's reading source. The source is chosen once
+/// per title, never per chapter; a chapter the source lacks surfaces as a
+/// reader error with a "switch source" escape hatch, not a picker per row.
+async fn read_source_put(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<ReadSourcePutRequest>,
+) -> Result<impl IntoResponse> {
+    let (media_type, tmdb_id, ext_key, title) = reading_group(&state, id).await?;
+    let label = crate::reader::source_label(&req.source)?.to_string();
+    let (series_ref, series_title) = match req
+        .series_ref
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(r) => (r, req.series_title.clone()),
+        None => {
+            // Auto-match. The catalogue IS Weeb Central: a row whose ext_key
+            // is already a Weeb Central series id binds exactly, zero
+            // upstream requests. Otherwise match by title.
+            if crate::reading::is_weebcentral_ref(ext_key.as_deref().unwrap_or("")) {
+                (ext_key.clone().unwrap_or_default(), Some(title.clone()))
+            } else {
+                let matched = state.reader.auto_match(&req.source, &title).await;
+                match matched {
+                    Some(m) => (m.key, Some(m.title)),
+                    None => {
+                        return Err(Error::BadRequest(format!(
+                            "no match for '{title}' on {label} — search and pick the series manually"
+                        )))
+                    }
+                }
+            }
+        }
+    };
+    state.library.db.set_reader_source(
+        &media_type,
+        tmdb_id,
+        &req.source,
+        &series_ref,
+        series_title.as_deref(),
+    )?;
+    Ok(Json(json!({
+        "source": req.source,
+        "series_ref": series_ref,
+        "series_title": series_title,
+    })))
+}
+
+/// Series search inside one source (the picker's manual-match mode).
+async fn read_source_search(
+    State(state): State<AppState>,
+    Path((id, source)): Path<(i64, String)>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
+    let _ = reading_group(&state, id).await?;
+    let query = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        return Ok(Json(json!([])));
+    }
+    let hits = state
+        .reader
+        .search(&source, &query)
+        .await
+        .map_err(|e| Error::BadRequest(format!("{e}")))?;
+    Ok(Json(serde_json::to_value(hits).unwrap_or_else(|_| json!([]))))
+}
+
+/// Resolve one chapter into its (proxied) page URLs via the bound source.
+async fn read_chapter(
+    State(state): State<AppState>,
+    Path((id, label)): Path<(i64, String)>,
+) -> Result<impl IntoResponse> {
+    let (media_type, tmdb_id, _, _) = reading_group(&state, id).await?;
+    let binding = state
+        .library
+        .db
+        .get_reader_source(&media_type, tmdb_id)?
+        .ok_or_else(|| {
+            Error::BadRequest("no reading source picked yet — choose one first".into())
+        })?;
+    let pages = state
+        .reader
+        .chapter_pages(&binding.source, &binding.series_ref, &label)
+        .await?;
+    let urls: Vec<String> = (0..pages.len())
+        .map(|n| format!("/api/library/{id}/read/chapter/{label}/page/{n}"))
+        .collect();
+    Ok(Json(json!({
+        "source": crate::reader::source_label(&binding.source).unwrap_or(&binding.source),
+        "series_title": binding.series_title,
+        "count": pages.len(),
+        "pages": urls,
+    })))
+}
+
+/// One proxied page image: the server talks to the source (referer rules,
+/// no CORS), the browser only ever sees this route.
+async fn read_chapter_page(
+    State(state): State<AppState>,
+    Path((id, label, n)): Path<(i64, String, usize)>,
+) -> Result<Response> {
+    let (media_type, tmdb_id, _, _) = reading_group(&state, id).await?;
+    let binding = state
+        .library
+        .db
+        .get_reader_source(&media_type, tmdb_id)?
+        .ok_or_else(|| {
+            Error::BadRequest("no reading source picked yet — choose one first".into())
+        })?;
+    let (bytes, ctype) = state
+        .reader
+        .fetch_page(&binding.source, &binding.series_ref, &label, n)
+        .await?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, ctype.as_str()),
+            (header::CACHE_CONTROL, "private, max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// Saved per-chapter progress (read flags + last visible page) and the most
+/// recently touched chapter — the detail page's read marks and the reader's
+/// scroll restore.
+async fn read_progress(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    let (media_type, tmdb_id, _, _) = reading_group(&state, id).await?;
+    let rows = state.library.db.list_chapter_progress(&media_type, tmdb_id)?;
+    let chapters: serde_json::Map<String, serde_json::Value> = rows
+        .iter()
+        .map(|r| (r.chapter.clone(), json!({ "read": r.read, "page": r.page })))
+        .collect();
+    let last = rows
+        .iter()
+        .filter(|r| r.read)
+        .max_by_key(|r| r.updated_at)
+        .or_else(|| rows.iter().max_by_key(|r| r.updated_at))
+        .map(|r| r.chapter.clone());
+    Ok(Json(json!({ "chapters": chapters, "last": last })))
+}
+
+#[derive(Deserialize)]
+pub struct ReadProgressRequest {
+    read: Option<bool>,
+    page: Option<i64>,
+}
+
+/// Save one chapter's progress (called by the reader while scrolling and on
+/// close; the read flag is sticky server-side).
+async fn read_chapter_progress(
+    State(state): State<AppState>,
+    Path((id, label)): Path<(i64, String)>,
+    Json(req): Json<ReadProgressRequest>,
+) -> Result<impl IntoResponse> {
+    let (media_type, tmdb_id, _, _) = reading_group(&state, id).await?;
+    state
+        .library
+        .db
+        .set_chapter_progress(&media_type, tmdb_id, &label, req.read, req.page)?;
     Ok(Json(json!({ "success": true })))
 }
 

@@ -153,6 +153,23 @@ impl Database {
                 episodes_json TEXT NOT NULL DEFAULT '[]',
                 fetched_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (media_type, tmdb_id)
+            );
+            CREATE TABLE IF NOT EXISTS reader_source (
+                media_type TEXT NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                series_ref TEXT NOT NULL,
+                series_title TEXT,
+                PRIMARY KEY (media_type, tmdb_id)
+            );
+            CREATE TABLE IF NOT EXISTS chapter_progress (
+                media_type TEXT NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                chapter TEXT NOT NULL,
+                read INTEGER NOT NULL DEFAULT 0,
+                page INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (media_type, tmdb_id, chapter)
             );",
         )?;
         // Migrate: drop the obsolete "keep" column if a pre-removal database
@@ -205,6 +222,65 @@ impl Database {
             conn.execute("DELETE FROM tmdb_meta WHERE media_type IN ('manga', 'comic')", [])?;
             conn.execute(
                 "INSERT INTO meta_migration (k, v) VALUES ('reading_meta_reset', 1)",
+                [],
+            )?;
+        }
+        // One-time repair: manga ids were 64-bit UUID hashes, which lose
+        // precision in JavaScript (2^53) — the frontend requested metadata
+        // for a *rounded* id and got nothing. Re-key every manga row that
+        // carries its UUID (ext_key) with the 52-bit-safe hash, dragging the
+        // group-scoped tables along. Rows without an ext_key keep their id:
+        // there is nothing to recompute from.
+        let manga_id_safe: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM meta_migration WHERE k = 'manga_id_52bit')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !manga_id_safe {
+            let pairs: Vec<(i64, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT DISTINCT tmdb_id, ext_key FROM library
+                     WHERE media_type = 'manga' AND ext_key IS NOT NULL AND tmdb_id IS NOT NULL",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            for (old, ext) in pairs {
+                let new = crate::reading::mangadex_id_hash(&ext);
+                if new == old {
+                    continue;
+                }
+                conn.execute_batch(&format!(
+                    "UPDATE OR IGNORE library SET tmdb_id = {new} WHERE media_type = 'manga' AND tmdb_id = {old};
+                     UPDATE OR IGNORE tmdb_meta SET tmdb_id = {new} WHERE media_type = 'manga' AND tmdb_id = {old};
+                     UPDATE OR IGNORE reader_source SET tmdb_id = {new} WHERE media_type = 'manga' AND tmdb_id = {old};
+                     UPDATE OR IGNORE chapter_progress SET tmdb_id = {new} WHERE media_type = 'manga' AND tmdb_id = {old};"
+                ))?;
+            }
+            conn.execute(
+                "INSERT INTO meta_migration (k, v) VALUES ('manga_id_52bit', 1)",
+                [],
+            )?;
+        }
+        // One-time repair: the manga catalogue moved from MangaDex (which
+        // delists licensed chapters) to Weeb Central. Manga meta rows hold
+        // MangaDex payloads and reader_source rows point at the removed
+        // MangaDex source — drop both; the next open re-sweeps from Weeb
+        // Central and the sweep heals legacy rows onto their new ids.
+        let wc_catalogue: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM meta_migration WHERE k = 'weebcentral_catalogue')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !wc_catalogue {
+            conn.execute_batch(
+                "DELETE FROM tmdb_meta WHERE media_type = 'manga';
+                 DELETE FROM reader_source WHERE source = 'mangadex';",
+            )?;
+            conn.execute(
+                "INSERT INTO meta_migration (k, v) VALUES ('weebcentral_catalogue', 1)",
                 [],
             )?;
         }
@@ -665,6 +741,169 @@ impl Database {
         )?;
         Ok(())
     }
+
+    // ---- reading: source binding & chapter progress ----
+
+    /// The reading source a manga/comic group is bound to (where chapter
+    /// pages come from). One binding per group, chosen once — never per
+    /// chapter.
+    pub fn get_reader_source(&self, media_type: &str, tmdb_id: i64) -> Result<Option<ReaderSourceRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT source, series_ref, series_title
+             FROM reader_source WHERE media_type = ?1 AND tmdb_id = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![media_type, tmdb_id], |row| {
+            Ok(ReaderSourceRow {
+                source: row.get(0)?,
+                series_ref: row.get(1)?,
+                series_title: row.get(2)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_reader_source(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+        source: &str,
+        series_ref: &str,
+        series_title: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO reader_source (media_type, tmdb_id, source, series_ref, series_title)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(media_type, tmdb_id) DO UPDATE SET
+                 source = excluded.source,
+                 series_ref = excluded.series_ref,
+                 series_title = excluded.series_title",
+            params![media_type, tmdb_id, source, series_ref, series_title],
+        )?;
+        Ok(())
+    }
+
+    /// Every chapter progress row of a group (read flags + last page for the
+    /// reader's scroll restore), plus the most recently touched chapter.
+    pub fn list_chapter_progress(&self, media_type: &str, tmdb_id: i64) -> Result<Vec<ChapterProgressRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT chapter, read, page, updated_at FROM chapter_progress
+             WHERE media_type = ?1 AND tmdb_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![media_type, tmdb_id], |row| {
+            Ok(ChapterProgressRow {
+                chapter: row.get(0)?,
+                read: row.get::<_, i64>(1)? != 0,
+                page: row.get(2)?,
+                updated_at: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Upsert one chapter's progress. `read` is sticky: a chapter that was
+    /// finished stays finished unless explicitly cleared.
+    pub fn set_chapter_progress(
+        &self,
+        media_type: &str,
+        tmdb_id: i64,
+        chapter: &str,
+        read: Option<bool>,
+        page: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chapter_progress (media_type, tmdb_id, chapter, read, page, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(media_type, tmdb_id, chapter) DO UPDATE SET
+                 read = MAX(read, excluded.read),
+                 page = excluded.page,
+                 updated_at = excluded.updated_at",
+            params![
+                media_type,
+                tmdb_id,
+                chapter,
+                read.unwrap_or(false) as i64,
+                page.unwrap_or(0),
+                now_secs()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the reading state of a group (group deleted).
+    pub fn clear_reading_state(&self, media_type: &str, tmdb_id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM reader_source WHERE media_type = ?1 AND tmdb_id = ?2",
+            params![media_type, tmdb_id],
+        )?;
+        conn.execute(
+            "DELETE FROM chapter_progress WHERE media_type = ?1 AND tmdb_id = ?2",
+            params![media_type, tmdb_id],
+        )?;
+        Ok(())
+    }
+
+    /// Heal a legacy reading group onto its Weeb Central series id: re-key
+    /// the library rows (ext_key + derived numeric id) and drag the
+    /// group-scoped meta/source/progress rows along. Used by the manga
+    /// sweep when a row predates the Weeb Central catalogue.
+    pub fn rekey_reading_group(&self, media_type: &str, old_tmdb_id: i64, new_ext: &str) -> Result<()> {
+        let new_id = crate::reading::ext_id_hash(new_ext);
+        if new_id == old_tmdb_id {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE OR IGNORE library SET tmdb_id = ?3, ext_key = ?4
+             WHERE media_type = ?1 AND tmdb_id = ?2",
+            params![media_type, old_tmdb_id, new_id, new_ext],
+        )?;
+        for table in ["tmdb_meta", "reader_source", "chapter_progress"] {
+            conn.execute(
+                &format!(
+                    "UPDATE OR IGNORE {table} SET tmdb_id = ?3
+                     WHERE media_type = ?1 AND tmdb_id = ?2"
+                ),
+                params![media_type, old_tmdb_id, new_id],
+            )?;
+        }
+        Ok(())
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A group's bound reading source.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReaderSourceRow {
+    pub source: String,
+    pub series_ref: String,
+    pub series_title: Option<String>,
+}
+
+/// One chapter's saved progress.
+#[derive(Debug, Clone)]
+pub struct ChapterProgressRow {
+    pub chapter: String,
+    pub read: bool,
+    pub page: i64,
+    pub updated_at: i64,
 }
 
 #[cfg(test)]
@@ -1114,6 +1353,94 @@ mod tests {
         cleanup(&dir);
     }
 
+    /// One-time repair: manga ids were 64-bit UUID hashes, which JavaScript
+    /// rounds above 2^53. The first open must re-key rows (and their
+    /// group-scoped meta/source/progress rows) to the 52-bit hash; later
+    /// opens must not touch anything.
+    #[test]
+    fn test_manga_ids_migrated_to_52bit_once() {
+        let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "chadtorrent_db_test_{}_{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.db");
+        {
+            // Pre-repair database: a manga row carrying the old 64-bit hash
+            // plus meta/source/progress rows under the same id.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE library (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    magnet TEXT NOT NULL, title TEXT, state TEXT,
+                    added_at DATETIME, file_path TEXT, size_bytes INTEGER,
+                    rqbit_id INTEGER, poster_path TEXT, year INTEGER,
+                    tmdb_id INTEGER, media_type TEXT, sequential INTEGER,
+                    torrent_bytes BLOB, playhead REAL, overview TEXT, ext_key TEXT);
+                 CREATE TABLE tmdb_meta (
+                    media_type TEXT NOT NULL, tmdb_id INTEGER NOT NULL, overview TEXT,
+                    seasons_json TEXT NOT NULL DEFAULT '[]',
+                    episodes_json TEXT NOT NULL DEFAULT '[]',
+                    fetched_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (media_type, tmdb_id));
+                 CREATE TABLE reader_source (
+                    media_type TEXT NOT NULL, tmdb_id INTEGER NOT NULL,
+                    source TEXT NOT NULL, series_ref TEXT NOT NULL, series_title TEXT,
+                    PRIMARY KEY (media_type, tmdb_id));
+                 CREATE TABLE chapter_progress (
+                    media_type TEXT NOT NULL, tmdb_id INTEGER NOT NULL, chapter TEXT NOT NULL,
+                    read INTEGER NOT NULL DEFAULT 0, page INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (media_type, tmdb_id, chapter));
+                 CREATE TABLE meta_migration (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+                 CREATE TABLE party (id INTEGER, relay TEXT, room TEXT, room_key TEXT, magnet TEXT,
+                    tmdb_id INTEGER, media_type TEXT, title TEXT, year INTEGER, poster_path TEXT,
+                    item_id INTEGER, name TEXT, file TEXT);
+                 INSERT INTO meta_migration (k, v) VALUES ('reading_meta_reset', 1);
+                 INSERT INTO library (magnet, state, media_type, tmdb_id, ext_key) VALUES
+                    ('', 'ready', 'manga', -9217439369956013684, '801513ba-a712-498c-8f57-cae55b38cc92');
+                 INSERT INTO tmdb_meta (media_type, tmdb_id, overview) VALUES ('manga', -9217439369956013684, 'Guts.');
+                 INSERT INTO reader_source (media_type, tmdb_id, source, series_ref) VALUES
+                    ('manga', -9217439369956013684, 'mangadex', '801513ba-a712-498c-8f57-cae55b38cc92');
+                 INSERT INTO chapter_progress (media_type, tmdb_id, chapter, read, page, updated_at) VALUES
+                    ('manga', -9217439369956013684, '3', 1, 17, 100);",
+            )
+            .unwrap();
+        }
+        let want = crate::reading::mangadex_id_hash("801513ba-a712-498c-8f57-cae55b38cc92");
+        assert_ne!(want, -9217439369956013684i64, "fixture uses the old hash");
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        let got: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT tmdb_id FROM library WHERE media_type = 'manga'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, want);
+        // The Weeb Central catalogue swap (same first open) drops MangaDex-era
+        // meta and source bindings; the sweep re-creates them from Weeb
+        // Central and heals the row onto its new id. Progress survives.
+        assert!(db.get_tmdb_meta("manga", want).unwrap().is_none());
+        assert!(db.get_reader_source("manga", want).unwrap().is_none());
+        assert_eq!(
+            db.list_chapter_progress("manga", want).unwrap().len(),
+            1
+        );
+        // Idempotent: a second open doesn't move anything.
+        drop(db);
+        let db2 = Database::new(path.to_str().unwrap()).unwrap();
+        let got2: i64 = db2
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT tmdb_id FROM library WHERE media_type = 'manga'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got2, want);
+        cleanup(&dir);
+    }
+
     #[test]
     fn test_tmdb_meta_episodes_migrate() {
         use crate::metadata::{EpisodeInfo, SeasonEpisodes};
@@ -1161,6 +1488,67 @@ mod tests {
         assert_eq!(m.overview.as_deref(), Some("Old show."));
         assert_eq!(m.fetched_at, 5);
         assert_eq!(m.episodes_by_season()[&2].len(), 1);
+        cleanup(&dir);
+    }
+
+    /// Reading source binding: one per group, upsert replaces, groups are
+    /// isolated.
+    #[test]
+    fn test_reader_source_roundtrip() {
+        let (db, dir) = temp_db();
+        assert!(db.get_reader_source("manga", 30002).unwrap().is_none());
+        db.set_reader_source("manga", 30002, "weebcentral", "01J76XY7EF75DJNQCV04HTPDZK", Some("Berserk"))
+            .unwrap();
+        let b = db.get_reader_source("manga", 30002).unwrap().unwrap();
+        assert_eq!(b.source, "weebcentral");
+        assert_eq!(b.series_ref, "01J76XY7EF75DJNQCV04HTPDZK");
+        assert_eq!(b.series_title.as_deref(), Some("Berserk"));
+        // rebind to another source overwrites
+        db.set_reader_source("manga", 30002, "mangadex", "801513ba-a712-498c-8f57-cae55b38cc92", None)
+            .unwrap();
+        let b = db.get_reader_source("manga", 30002).unwrap().unwrap();
+        assert_eq!(b.source, "mangadex");
+        assert_eq!(b.series_title, None);
+        // other group / media type isolated
+        assert!(db.get_reader_source("comic", 30002).unwrap().is_none());
+        assert!(db.get_reader_source("manga", 1).unwrap().is_none());
+        // survives a reopen (migration creates the table)
+        drop(db);
+        let db2 = Database::new(dir.join("test.db").to_str().unwrap()).unwrap();
+        assert!(db2.get_reader_source("manga", 30002).unwrap().is_some());
+        cleanup(&dir);
+    }
+
+    /// Chapter progress: upsert, sticky read flag, per-chapter isolation,
+    /// group cleanup.
+    #[test]
+    fn test_chapter_progress_roundtrip() {
+        let (db, dir) = temp_db();
+        assert!(db.list_chapter_progress("manga", 7).unwrap().is_empty());
+        db.set_chapter_progress("manga", 7, "386", Some(true), Some(37)).unwrap();
+        db.set_chapter_progress("manga", 7, "385", None, Some(4)).unwrap();
+        let rows = db.list_chapter_progress("manga", 7).unwrap();
+        assert_eq!(rows.len(), 2);
+        let r386 = rows.iter().find(|r| r.chapter == "386").unwrap();
+        assert!(r386.read);
+        assert_eq!(r386.page, 37);
+        let r385 = rows.iter().find(|r| r.chapter == "385").unwrap();
+        assert!(!r385.read);
+        assert_eq!(r385.page, 4);
+        // page upserts; read stays sticky across a later page-only write
+        db.set_chapter_progress("manga", 7, "386", None, Some(12)).unwrap();
+        let r386 = db.list_chapter_progress("manga", 7)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.chapter == "386")
+            .unwrap();
+        assert!(r386.read);
+        assert_eq!(r386.page, 12);
+        // group isolation + clear
+        assert!(db.list_chapter_progress("comic", 7).unwrap().is_empty());
+        db.clear_reading_state("manga", 7).unwrap();
+        assert!(db.list_chapter_progress("manga", 7).unwrap().is_empty());
+        assert!(db.get_reader_source("manga", 7).unwrap().is_none());
         cleanup(&dir);
     }
 }

@@ -7,6 +7,7 @@ mod library;
 mod metadata;
 mod party;
 mod reading;
+mod reader;
 mod remux;
 mod segmenter;
 mod subtitles;
@@ -113,12 +114,17 @@ async fn main() {
 
     let party = PartyManager::new(library.clone());
 
+    // Weeb Central: the manga catalogue (ground truth) and the reading
+    // source (chapter pages). Keyless.
+    let reader_client = Arc::new(reader::ReaderClient::new());
+
     // The meta cache serves every catalogue: TMDB for movies/shows (only with
     // a key), MangaDex/Comic Vine for manga/comics (always available).
     let meta = Arc::new(metadata::MetaCache::new(
         library.db.clone(),
         tmdb.clone(),
         reading.clone(),
+        reader_client.clone(),
     ));
 
     let state = AppState {
@@ -129,6 +135,7 @@ async fn main() {
         subs,
         party,
         reading,
+        reader: reader_client,
     };
 
     let router = http::build_router(state);

@@ -900,6 +900,13 @@ impl LibraryManager {
             // different titles. A torrent row with no media_type at all
             // (added by raw magnet, never tagged) follows its group head.
             if let (Some(tmdb_id), Some(media_type)) = (item.tmdb_id, item.media_type.as_deref()) {
+                // Reading groups carry extra state: the bound page source and
+                // per-chapter progress. Both are group-scoped, so they go now.
+                if matches!(media_type, "manga" | "comic") {
+                    if let Err(e) = self.db.clear_reading_state(media_type, tmdb_id) {
+                        warn!("Failed to clear reading state for {media_type}:{tmdb_id}: {e}");
+                    }
+                }
                 let siblings: Vec<i64> = self
                     .db
                     .list_items()?

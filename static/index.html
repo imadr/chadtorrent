@@ -360,6 +360,49 @@
   .ppwrap .subpanel.open { display: flex; flex-direction: column; gap: 8px; }
   .ppwrap .pt-invite input { font-size: 10px; }
   .ppwrap .pt-conn { font-size: 11px; }
+
+  /* ---------- manga reader ---------- */
+  .rdwrap { position: absolute; inset: 0; display: flex; flex-direction: column; background: #0a0a0c; }
+  .rdscroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: auto; }
+  .rdcol { display: flex; flex-direction: column; align-items: center; max-width: 980px; margin: 0 auto; padding: 0 0 24px; }
+  /* Every page reserves its box via an aspect-ratio estimate (seeded from
+     this chapter's own first loaded pages — page scans are uniform), so the
+     scroll height barely changes as images stream in. */
+  .rdpage { display: block; width: 100%; max-width: 980px; aspect-ratio: var(--rd-ar, 2 / 3);
+    background: #141418; margin: 0; }
+  .rdpage.rdy { aspect-ratio: auto; }
+  .rdload { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: center; color: #bbb; background: #0a0a0c; z-index: 4; }
+  .rdload .spin { width: 34px; height: 34px; border: 3px solid #333; border-top-color: #888;
+    border-radius: 50%; animation: rdspp 1s linear infinite; }
+  @keyframes rdspp { to { transform: rotate(360deg); } }
+  .rderr { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: center; color: #ddd; background: #0a0a0c; z-index: 4; padding: 30px; text-align: center; }
+  .rderr .msg { max-width: 480px; line-height: 1.5; }
+  .rdnext { margin: 26px auto 8px; display: block; padding: 12px 26px; font-size: 14px;
+    background: var(--accent); color: var(--accent-ink); border: 0.5px solid var(--line-hi); cursor: pointer; }
+  .rdnext:hover { filter: brightness(1.35); }
+  .rddone { margin: 10px 0 30px; color: var(--muted, #9a9aa5); font-size: 12px; }
+
+  /* chapter rows (detail page) */
+  #mv-chapters .row.chrow { cursor: pointer; min-height: 52px; }
+  #mv-chapters .row.chrow:hover { background: var(--panel2); }
+  #mv-chapters .row.chrow .rdflag { color: var(--muted); font-size: 11.5px; white-space: nowrap; flex-shrink: 0; }
+  #mv-chapters .row.chrow.read .t { color: var(--muted); }
+
+  /* source picker */
+  .rdsrc { width: 520px; max-width: 94vw; }
+  .rds-row { border: 1px solid var(--line); padding: 12px 14px; margin-bottom: 10px; }
+  .rds-row .rds-head { display: flex; align-items: center; gap: 10px; }
+  .rds-row .rds-name { font-weight: 600; flex: 1; }
+  .rds-row .rds-sub { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.45; }
+  .rds-row .rds-sub .m { color: var(--fg); }
+  .rds-search { display: flex; gap: 8px; margin-top: 10px; }
+  .rds-search input { flex: 1; }
+  .rds-hits { margin-top: 8px; max-height: 180px; overflow-y: auto; border: 1px solid var(--line); }
+  .rds-hits .h { padding: 8px 10px; cursor: pointer; font-size: 13px; }
+  .rds-hits .h:hover, .rds-hits .h.sel { background: var(--panel2); }
+
 </style>
 
 <div class="floats">
@@ -469,6 +512,28 @@
     <div class="cf-actions">
       <button class="btn" id="cf-no">Cancel</button>
       <button class="btn danger" id="cf-yes">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="rdsrc-modal" hidden>
+  <div class="panel rdsrc">
+    <div class="phead"><span>Read from…</span><button class="x" id="rds-close">✕</button></div>
+    <div id="rds-body"></div>
+  </div>
+</div>
+
+<div class="modal" id="reader-modal" hidden>
+  <div class="rdwrap">
+    <button class="pback" id="rd-back" title="Back">← Back</button>
+    <div class="rdscroll" id="rd-scroll"><div class="rdcol" id="rd-col"></div></div>
+    <div class="rdload" id="rd-load" hidden><div class="spin"></div><span id="rd-loadtxt">Loading chapter…</span></div>
+    <div class="rderr" id="rd-err" hidden>
+      <div class="msg" id="rd-errmsg"></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn" id="rd-retry">Retry</button>
+        <button class="btn" id="rd-switch">Switch source</button>
+      </div>
     </div>
   </div>
 </div>
@@ -926,7 +991,9 @@ function renderMovie() {
     $('mv-dl-sec').hidden = true;
     $('mv-searchsec').hidden = true;
     const ov = $('mv-overview');
-    const t = (rep.overview || '').trim();
+    // Row overview (from the search hit) or the swept catalogue synopsis —
+    // catalogue search rows carry no description until the first sweep.
+    const t = (rep.overview || (mvMetaByTmdb.get(mvMetaKey(rep)) || {}).overview || '').trim();
     if (t) { ov.hidden = false; ov.textContent = t; }
     else ov.hidden = true;
     // Chapters/issues come from the same cached meta payload as TV episodes
@@ -1129,9 +1196,8 @@ function tvSeasonsOf(rep) {
 function applyMvOverview(rep) {
   const el = $('mv-overview');
   if (!el || !rep || !rep.tmdb_id) return;
-  // Reading entries never reach here (their synopsis is set in renderMovie);
-  // movies/shows prefer the cached TMDB payload, falling back to the
-  // synopsis the search result carried.
+  // Reading entries reach here on the post-sweep repaint too: prefer the
+  // cached catalogue synopsis, fall back to the search hit's description.
   const m = mvMetaByTmdb.get(mvMetaKey(rep));
   const t = (m && m.overview && String(m.overview).trim()) || (rep.overview || '').trim();
   if (t) { el.hidden = false; el.textContent = t; }
@@ -1166,7 +1232,9 @@ function repaintMvMeta(rep) {
 /* The chapter (manga) / issue (comic) list. Stored in the same cached meta
  * payload as TV episodes — one season ("1") whose episodes are the rows —
  * swept from MangaDex (real chapter titles) or Comic Vine (real issue
- * names + cover dates). Rows are inert: no reader yet, nothing plays.
+ * names + cover dates). Rows open the reader via the group's bound reading
+ * source; read markers and the continue point come from /read/progress
+ * (loaded once per group, then updated locally as chapters finish).
  * "Date" = recency order (highest number first by default); the button
  * flips the arrow. */
 var chDesc = true;
@@ -1177,20 +1245,68 @@ function renderChapters(rep) {
   let list = m && m.episodes && m.episodes['1'];
   if (!Array.isArray(list) || !list.length) { sec.hidden = true; return; }
   const isComic = rep.media_type === 'comic';
+  const unit = isComic ? 'Issue' : 'Chapter';
+  const key = rdKey(rep);
+  const prog = rdProgressByGroup.get(key);
+  const src = rdSourceByGroup.get(key);
   list = [...list].sort((a, b) => (chDesc
     ? (b.episode_number || 0) - (a.episode_number || 0)   // ↓ newest first
     : (a.episode_number || 0) - (b.episode_number || 0))); // ↑ oldest first
+
+  // Source chip: what the pages come from. Unbound = "choose" — the picker
+  // also opens automatically on the first Read click.
+  const srcLabel = src && src.source ? rdSourceLabelOf(src.source) : null;
   $('mv-ch-title').innerHTML = (isComic ? 'Issues' : 'Chapters') +
-    ' <button id="mv-ch-sort" class="minibtn sel">Date ' + (chDesc ? '↓' : '↑') + '</button>';
+    ' <button id="mv-ch-sort" class="minibtn sel">Date ' + (chDesc ? '↓' : '↑') + '</button>' +
+    ' <button id="mv-src" class="minibtn">Source: ' + esc(srcLabel || 'choose') + ' ▾</button>';
   $('mv-ch-sort').onclick = () => { chDesc = !chDesc; renderChapters(rep); };
+  $('mv-src').onclick = () => openSourcePicker(rep, null);
   box.innerHTML = list.map(ch => {
+    const label = chapterLabelOf(ch);
     const n = ch.episode_number;
-    const label = ch.name ? n + ' · ' + ch.name : (isComic ? 'Issue ' + n : 'Chapter ' + n);
+    const name = ch.name ? n + ' · ' + ch.name : unit + ' ' + n;
     const sub = ch.air_date || '';
-    return '<div class="row"><div class="nm"><div class="t">' + esc(label) + '</div>' +
-           (sub ? '<div class="s">' + esc(sub) + '</div>' : '') + '</div></div>';
+    const pc = prog && prog.chapters && prog.chapters[label];
+    const read = pc && pc.read;
+    return '<div class="row chrow' + (read ? ' read' : '') + '" data-label="' + esc(label) + '">' +
+           '<div class="nm"><div class="t">' + esc(name) + '</div>' +
+           (sub ? '<div class="s">' + esc(sub) + '</div>' : '') + '</div>' +
+           '<div class="rdflag">' + (read ? '✓ read' : '') + '</div>' +
+           '</div>';
   }).join('');
+  [...box.querySelectorAll('.chrow')].forEach(el => {
+    el.onclick = () => openReader(rep, el.dataset.label);
+  });
   sec.hidden = false;
+  // The reader opened before the chapter list landed (deep link / refresh):
+  // its "End of the latest" tail can now become the real Next chapter.
+  if (rdCur && rdCur.rep && rdKey(rdCur.rep) === key && rdCur.pages && !rdCur.nextSet) {
+    const next = rdNextLabel(rep, rdCur.label);
+    if (next) {
+      rdCur.nextSet = true;
+      const col = $('rd-col');
+      const done = col.querySelector('.rddone');
+      const btn = document.createElement('button');
+      btn.className = 'rdnext';
+      btn.textContent = 'Next ' + (isComic ? 'issue' : 'chapter') + ' → ' + next;
+      btn.onclick = () => openReader(rdCur.rep, next);
+      if (done) col.replaceChild(btn, done);
+      else col.appendChild(btn);
+    }
+  }
+  // Lazily pull what's missing (binding chip, read markers); each repaints
+  // once it lands — and only then: the in-flight marker is null, and a
+  // repaint on null would re-enter this very loader.
+  if (!src) rdEnsureSource(rep).then(d => {
+    if (!d) return;
+    const me = currentMovie && movieRep(currentMovie.rows);
+    if (me && mvMetaKey(me) === mvMetaKey(rep)) renderChapters(rep);
+  }).catch(() => {});
+  if (!prog) rdEnsureProgress(rep).then(d => {
+    if (!d) return;
+    const me = currentMovie && movieRep(currentMovie.rows);
+    if (me && mvMetaKey(me) === mvMetaKey(rep)) renderChapters(rep);
+  });
 }
 /* Pull the cached payload (one request, served from SQLite). Replaces any
    existing entry, so it also works as the post-refresh reload. */
@@ -1761,6 +1877,411 @@ async function doSearch(q) {
     if (seq === amSeq && !$('add-modal').hidden)
       box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
   }
+}
+
+/* ---------- manga reader & reading sources ----------
+ * The chapter list is ground truth from the catalogue (MangaDex / Comic
+ * Vine, cached in tmdb_meta); WHERE the pages come from is a separate,
+ * per-title binding (`reader_source` in SQLite, via /read/source). The
+ * source is picked once per title — never per chapter — on the first Read
+ * click, and can be changed any time from the detail page's source chip or
+ * the reader's error escape hatch. Pages are proxied through the server
+ * (no CORS / referer games in the browser); the reader itself is a plain
+ * vertical continuous scroll of lazily-loaded images. */
+var rdSourceByGroup = new Map();    // rdKey -> {source, series_ref, series_title, sources:[]}
+var rdProgressByGroup = new Map();  // rdKey -> {chapters: {label: {read, page}}, last}
+var rdSourceLoading = new Map();    // rdKey -> in-flight promise (dedupe)
+var rdProgressLoading = new Map();  // rdKey -> in-flight promise (dedupe)
+var RD_SOURCE_LABELS = { weebcentral: 'Weeb Central' };
+var rdCur = null;                   // live reader session
+var rdGen = 0;                      // session generation; stale loads are dropped
+var rdRatioSum = 0, rdRatioN = 0;   // running aspect-ratio estimate (w/h) for this chapter
+var rdSaveTimer = null;
+var rdPicker = null;                // {rep, pendingLabel} while the picker is open
+
+function rdKey(rep) { return rep.media_type + ':' + rep.tmdb_id; }
+/* Raw chapter number of a ground-truth row: sub-chapter rows carry
+   "Ch. 1.5 · <title>" in `name`; integer rows are just their number. */
+function chapterLabelOf(ch) {
+  const m = (ch.name || '').match(/^Ch\. (\d+(?:\.\d+)?)/);
+  return m ? m[1] : String(ch.episode_number);
+}
+function rdChaptersAsc(rep) {
+  const m = mvMetaByTmdb.get(mvMetaKey(rep));
+  const list = (m && m.episodes && m.episodes['1']) || [];
+  return [...list].sort((a, b) => {
+    const x = parseFloat(chapterLabelOf(a)) || 0, y = parseFloat(chapterLabelOf(b)) || 0;
+    return x - y || chapterLabelOf(a).localeCompare(chapterLabelOf(b));
+  });
+}
+function rdNextLabel(rep, label) {
+  const cur = parseFloat(label) || 0;
+  const next = rdChaptersAsc(rep).map(chapterLabelOf).find(l => (parseFloat(l) || 0) > cur);
+  return next || null;
+}
+function rdSourceLabelOf(id) { return RD_SOURCE_LABELS[id] || id; }
+
+function rdEnsureSource(rep) {
+  const key = rdKey(rep);
+  if (rdSourceByGroup.has(key)) return Promise.resolve(rdSourceByGroup.get(key));
+  if (rdSourceLoading.has(key)) return rdSourceLoading.get(key);
+  // Concurrent callers share one promise: a repaint landing mid-flight must
+  // never re-enter the load (a resolve-null -> repaint -> reload chain is an
+  // endless microtask loop that starves the very fetch it waits for).
+  const p = api('/api/library/' + rep.id + '/read/source')
+    .then(d => { rdSourceLoading.delete(key); rdSourceByGroup.set(key, d); return d; })
+    .catch(e => { rdSourceLoading.delete(key); throw e; });
+  rdSourceLoading.set(key, p);
+  return p;
+}
+function rdEnsureProgress(rep) {
+  const key = rdKey(rep);
+  if (rdProgressByGroup.has(key)) return Promise.resolve(rdProgressByGroup.get(key));
+  if (rdProgressLoading.has(key)) return rdProgressLoading.get(key);
+  const p = api('/api/library/' + rep.id + '/read/progress')
+    .then(d => { rdProgressLoading.delete(key); rdProgressByGroup.set(key, d); return d; })
+    .catch(() => { rdProgressLoading.delete(key); return null; });
+  rdProgressLoading.set(key, p);
+  return p;
+}
+/* Local progress upsert so the detail rows repaint without a refetch. */
+function rdLocalProgress(rep, label, read, page) {
+  const key = rdKey(rep);
+  const p = rdProgressByGroup.get(key);
+  if (!p) return;
+  const prev = p.chapters[label] || { read: false, page: 0 };
+  p.chapters[label] = { read: prev.read || !!read, page: page != null ? page : prev.page };
+  p.last = label;
+}
+
+/* ---------- reader ---------- */
+function rdShowLoad(on, txt) {
+  $('rd-load').hidden = !on;
+  if (txt) $('rd-loadtxt').textContent = txt;
+  if (on) { $('rd-err').hidden = true; }
+}
+function rdShowError(msg) {
+  $('rd-load').hidden = true;
+  $('rd-errmsg').textContent = msg;
+  $('rd-err').hidden = false;
+}
+/* Reader URL routing: /library/<movie>/read/<label>. Opened from a chapter
+ * click → pushed; chapter switches inside the reader → replaced; the back
+ * button and Escape pop history (popstate → handleRoute closes the reader);
+ * a refresh on a read route re-opens the same chapter and restores the
+ * exact saved page. */
+function rdRouteFor(label) { return movieRoute() + '/read/' + encodeURIComponent(label); }
+function rdRouteLabel() {
+  const parts = location.pathname.split('/').filter(Boolean);
+  if (parts.length >= 4 && parts[0] === 'library' && parts[2] === 'read') {
+    return decodeURIComponent(parts.slice(3).join('/'));
+  }
+  return null;
+}
+async function openReader(rep, label, fromRoute = false) {
+  const gen = ++rdGen;
+  const alreadyOpen = !$('reader-modal').hidden;
+  rdCur = { rep, label, gen, pages: 0, page: 0, marked: false };
+  if (!fromRoute) {
+    if (alreadyOpen) history.replaceState({}, '', rdRouteFor(label));
+    else pushRoute(rdRouteFor(label));
+  }
+  $('reader-modal').hidden = false;
+  $('rd-back').classList.remove('on');
+  $('rd-col').innerHTML = '';
+  $('rd-col').style.removeProperty('--rd-ar');   // back to the 2/3 default until this chapter's pages report in
+  rdRatioSum = 0; rdRatioN = 0;
+  $('rd-scroll').scrollTop = 0;
+  rdShowLoad(true, 'Loading chapter…');
+  let src;
+  try { src = await rdEnsureSource(rep); }
+  catch (e) { if (rdCur && rdCur.gen === gen) rdShowError('Could not load the reading source: ' + e.message); return; }
+  if (!rdCur || rdCur.gen !== gen) return;
+  if (!src || !src.source) {
+    // The catalogue IS Weeb Central: a native row's ext_key is already the
+    // series id — bind it silently (exact, zero ambiguity). Anything else
+    // (legacy rows) shows the picker: match by title or search manually.
+    if (rep.ext_key && /^[A-Z0-9]{26}$/.test(rep.ext_key)) {
+      try {
+        const b = await api('/api/library/' + rep.id + '/read/source', {
+          method: 'PUT', body: JSON.stringify({ source: 'weebcentral' })
+        });
+        rdSourceByGroup.set(rdKey(rep), Object.assign(
+          (rdSourceByGroup.get(rdKey(rep)) || { sources: Object.keys(RD_SOURCE_LABELS).map(id => ({ id, label: RD_SOURCE_LABELS[id] })) }),
+          b));
+        $('reader-modal').hidden = false;
+        rdCur = { rep, label, gen, pages: 0, page: 0, marked: false };
+        rdShowLoad(true, 'Loading chapter…');
+      } catch (e) {
+        $('reader-modal').hidden = true;
+        rdCur = null;
+        openSourcePicker(rep, label);
+        return;
+      }
+    } else {
+      $('reader-modal').hidden = true;
+      rdCur = null;
+      openSourcePicker(rep, label);
+      return;
+    }
+  }
+  let d;
+  try {
+    d = await api('/api/library/' + rep.id + '/read/chapter/' + encodeURIComponent(label));
+  } catch (e) {
+    if (rdCur && rdCur.gen === gen)
+      rdShowError((e.message || 'The chapter could not be loaded.') +
+        '\nThis source may not have ' + (rep.media_type === 'comic' ? 'issue ' : 'chapter ') + label + '.');
+    return;
+  }
+  if (!rdCur || rdCur.gen !== gen) return;
+  rdCur.pages = d.count;
+  const col = $('rd-col');
+  for (let i = 0; i < d.pages.length; i++) {
+    const img = document.createElement('img');
+    img.className = 'rdpage';
+    img.loading = 'lazy';
+    img.decoding = 'async';
+    img.alt = 'Page ' + (i + 1);
+    img.src = d.pages[i];
+    img.onload = () => { img.classList.add('rdy'); rdNoteRatio(img); };
+    col.appendChild(img);
+  }
+  const next = rdNextLabel(rep, label);
+  if (next) {
+    rdCur.nextSet = true;
+    const btn = document.createElement('button');
+    btn.className = 'rdnext';
+    btn.textContent = 'Next ' + (rep.media_type === 'comic' ? 'issue' : 'chapter') + ' → ' + next;
+    btn.onclick = () => openReader(rep, next);
+    col.appendChild(btn);
+  } else {
+    const done = document.createElement('div');
+    done.className = 'rddone';
+    done.textContent = 'End of the latest ' + (rep.media_type === 'comic' ? 'issue' : 'chapter');
+    col.appendChild(done);
+  }
+  rdShowLoad(false);
+  // Resume exactly where the chapter was left (silently — nothing shows).
+  const prog = rdProgressByGroup.get(rdKey(rep));
+  const saved = prog && prog.chapters && prog.chapters[label];
+  const target = saved && !saved.read && saved.page > 0 ? saved.page : 0;
+  rdCur.page = target;
+  requestAnimationFrame(() => {
+    const imgs = col.querySelectorAll('.rdpage');
+    if (imgs[target]) imgs[target].scrollIntoView({ block: 'start' });
+    rdMarkVisible();
+  });
+}
+function rdCurrentPageIdx() {
+  const imgs = [...$('rd-col').querySelectorAll('.rdpage')];
+  if (!imgs.length) return 0;
+  const sc = $('rd-scroll');
+  const mid = sc.scrollTop + sc.clientHeight * 0.4;
+  let idx = 0;
+  for (let i = 0; i < imgs.length; i++) {
+    if (imgs[i].offsetTop <= mid) idx = i; else break;
+  }
+  return idx;
+}
+function rdMarkVisible() {
+  if (!rdCur) return;
+  rdCur.page = rdCurrentPageIdx();
+  const sc = $('rd-scroll');
+  const atBottom = sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 220;
+  if (atBottom && !rdCur.marked) rdMarkRead();
+  rdSaveProgress();
+}
+function rdMarkRead() {
+  if (!rdCur || rdCur.marked) return;
+  rdCur.marked = true;
+  rdLocalProgress(rdCur.rep, rdCur.label, true, rdCur.pages - 1);
+  api('/api/library/' + rdCur.rep.id + '/read/chapter/' + encodeURIComponent(rdCur.label) + '/progress', {
+    method: 'POST', body: JSON.stringify({ read: true, page: rdCur.pages - 1 })
+  }).catch(() => {});
+}
+function rdSaveProgress() {
+  if (!rdCur) return;
+  clearTimeout(rdSaveTimer);
+  rdSaveTimer = setTimeout(() => {
+    if (!rdCur || rdCur.marked) return;
+    rdLocalProgress(rdCur.rep, rdCur.label, false, rdCur.page);
+    api('/api/library/' + rdCur.rep.id + '/read/chapter/' + encodeURIComponent(rdCur.label) + '/progress', {
+      method: 'POST', body: JSON.stringify({ page: rdCur.page })
+    }).catch(() => {});
+  }, 1500);
+}
+/* silent=true when history already moved (popstate / route change) — only
+ * stop reading and clean up; never touch history from inside. */
+function closeReader(silent = false) {
+  if (!$('reader-modal').hidden && rdCur && !rdCur.marked && rdCur.pages) {
+    // final flush of the scroll position
+    clearTimeout(rdSaveTimer);
+    rdLocalProgress(rdCur.rep, rdCur.label, false, rdCur.page);
+    api('/api/library/' + rdCur.rep.id + '/read/chapter/' + encodeURIComponent(rdCur.label) + '/progress', {
+      method: 'POST', body: JSON.stringify({ page: rdCur.page })
+    }).catch(() => {});
+  }
+  rdCur = null;
+  rdGen++;
+  $('reader-modal').hidden = true;
+  $('rd-col').innerHTML = '';
+  // Read marks may have changed: repaint the chapter list behind us.
+  const me = currentMovie && movieRep(currentMovie.rows);
+  if (me && isReading(me)) renderChapters(me);
+  // User-initiated close while sitting on a read route: pop back to the
+  // title page (popstate → handleRoute → the reader is already closed).
+  if (!silent && rdRouteLabel() !== null) history.back();
+}
+$('rd-back').addEventListener('click', () => closeReader());
+$('rd-scroll').addEventListener('scroll', () => { if (rdCur) rdMarkVisible(); }, { passive: true });
+$('rd-retry').addEventListener('click', () => {
+  if (rdCur) { const c = rdCur; openReader(c.rep, c.label); }
+});
+$('rd-switch').addEventListener('click', () => {
+  if (!rdCur) return;
+  const c = rdCur;
+  closeReader(true);
+  openSourcePicker(c.rep, c.label);
+});
+function rdScrollBy(frac) {
+  const sc = $('rd-scroll');
+  sc.scrollBy({ top: sc.clientHeight * frac, behavior: 'smooth' });
+}
+/* Seed the placeholder aspect ratio from this chapter's own pages: scans are
+   uniform, so the first few loaded images fix the estimate and every still-
+   unloaded page reserves an already-correct box (no scrollbar churn). */
+function rdNoteRatio(img) {
+  if (!rdCur || !img.naturalWidth || !img.naturalHeight) return;
+  rdRatioSum += img.naturalWidth / img.naturalHeight;
+  rdRatioN++;
+  if (rdRatioN <= 5 && $('rd-col')) {
+    $('rd-col').style.setProperty('--rd-ar', (rdRatioSum / rdRatioN).toFixed(4));
+  }
+}
+
+/* ---------- source picker ---------- */
+function openSourcePicker(rep, pendingLabel) {
+  rdPicker = { rep, pendingLabel };
+  $('rdsrc-modal').hidden = false;
+  const body = $('rds-body');
+  body.innerHTML = '';
+  const srcList = (rdSourceByGroup.get(rdKey(rep)) || {}).sources ||
+    Object.keys(RD_SOURCE_LABELS).map(id => ({ id, label: RD_SOURCE_LABELS[id] }));
+  const bound = rdSourceByGroup.get(rdKey(rep));
+  for (const s of srcList) body.appendChild(rdsBuildRow(rep, s, bound));
+}
+function closeSourcePicker() {
+  $('rdsrc-modal').hidden = true;
+  $('rds-body').innerHTML = '';
+  rdPicker = null;
+}
+$('rds-close').addEventListener('click', closeSourcePicker);
+$('rdsrc-modal').addEventListener('click', (e) => {
+  if (e.target === $('rdsrc-modal')) closeSourcePicker();
+});
+function rdsBuildRow(rep, s, bound) {
+  const row = document.createElement('div');
+  row.className = 'rds-row';
+  const isBound = bound && bound.source === s.id;
+  row.innerHTML =
+    '<div class="rds-head">' +
+      '<span class="rds-name">' + esc(s.label) + (isBound ? ' <span style="color:var(--ok)">· current</span>' : '') + '</span>' +
+      '<button class="minibtn rds-change" style="margin-left:0">Change match</button>' +
+      '<button class="btn rds-use">Use</button>' +
+    '</div>' +
+    '<div class="rds-sub rds-sub-line">Matching…</div>' +
+    '<div class="rds-extra" hidden></div>';
+  const sub = row.querySelector('.rds-sub-line');
+  const extra = row.querySelector('.rds-extra');
+  let pick = null; // manual pick from search results
+  // Auto-match preview: the catalogue IS Weeb Central, so a row carrying a
+  // Weeb Central series id binds exactly; anything else matches by title.
+  if (s.id === 'weebcentral' && rep.ext_key && /^[A-Z0-9]{26}$/.test(rep.ext_key)) {
+    sub.innerHTML = 'Exact match — ' + esc(rep.title || 'this title') + ' (catalogue id).';
+  } else {
+    api('/api/library/' + rep.id + '/read/source/' + s.id + '/search?q=' + encodeURIComponent(movieName(rep)))
+      .then(hits => {
+        if (!hits || !hits.length) { sub.textContent = 'No automatic match — pick the series manually.'; return; }
+        const best = hits[0];
+        sub.innerHTML = 'Matched: <span class="m">' + esc(best.title) + '</span>';
+        row.dataset.autoKey = best.key;
+        row.dataset.autoTitle = best.title;
+      })
+      .catch(() => { sub.textContent = 'Match lookup failed — pick the series manually.'; });
+  }
+  row.querySelector('.rds-change').onclick = () => {
+    extra.hidden = !extra.hidden;
+    if (!extra.hidden && !extra.dataset.built) rdsBuildSearch(rep, s.id, extra, row);
+  };
+  row.querySelector('.rds-use').onclick = () => {
+    const seriesRef = pick ? pick.key : (row.dataset.autoKey || (s.id === 'weebcentral' && rep.ext_key && /^[A-Z0-9]{26}$/.test(rep.ext_key) ? rep.ext_key : null));
+    const seriesTitle = pick ? pick.title : (row.dataset.autoTitle || rep.title || null);
+    rdsBind(rep, s.id, seriesRef, seriesTitle);
+  };
+  return row;
+}
+function rdsBuildSearch(rep, sourceId, extra, row) {
+  extra.dataset.built = '1';
+  extra.innerHTML =
+    '<div class="rds-search"><input type="text" placeholder="Search series…">' +
+    '<button class="btn">Search</button></div><div class="rds-hits"></div>';
+  const input = extra.querySelector('input');
+  const hits = extra.querySelector('.rds-hits');
+  let seq = 0;
+  const run = () => {
+    const q = input.value.trim();
+    if (!q) { hits.innerHTML = ''; return; }
+    const my = ++seq;
+    hits.innerHTML = '<div class="h" style="color:var(--muted)">Searching…</div>';
+    api('/api/library/' + rep.id + '/read/source/' + sourceId + '/search?q=' + encodeURIComponent(q))
+      .then(res => {
+        if (my !== seq) return;
+        hits.innerHTML = '';
+        if (!res || !res.length) { hits.innerHTML = '<div class="h" style="color:var(--muted)">No results.</div>'; return; }
+        for (const r of res) {
+          const h = document.createElement('div');
+          h.className = 'h';
+          h.textContent = r.title;
+          h.onclick = () => {
+            [...hits.children].forEach(c => c.classList.remove('sel'));
+            h.classList.add('sel');
+            row.dataset.autoKey = r.key;
+            row.dataset.autoTitle = r.title;
+            row.querySelector('.rds-sub-line').innerHTML = 'Picked: <span class="m">' + esc(r.title) + '</span>';
+          };
+          hits.appendChild(h);
+        }
+      })
+      .catch(e => { if (my === seq) hits.innerHTML = '<div class="h" style="color:var(--muted)">' + esc(e.message) + '</div>'; });
+  };
+  extra.querySelector('button').onclick = run;
+  input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); run(); } };
+  input.value = movieName(rep);
+  run();
+}
+async function rdsBind(rep, sourceId, seriesRef, seriesTitle) {
+  const body = { source: sourceId };
+  if (seriesRef) { body.series_ref = seriesRef; body.series_title = seriesTitle; }
+  try {
+    const b = await api('/api/library/' + rep.id + '/read/source', { method: 'PUT', body: JSON.stringify(body) });
+    rdSourceByGroup.set(rdKey(rep), Object.assign(
+      (rdSourceByGroup.get(rdKey(rep)) || { sources: Object.keys(RD_SOURCE_LABELS).map(id => ({ id, label: RD_SOURCE_LABELS[id] })) }),
+      b));
+    const pending = rdPicker && rdPicker.pendingLabel;
+    closeSourcePicker();
+    if (currentMovie && movieRep(currentMovie.rows) === rep) renderChapters(rep);
+    if (pending) openReader(rep, pending);
+  } catch (e) {
+    alertMsg('Could not bind the source: ' + e.message);
+  }
+}
+function alertMsg(m) {  // tiny non-blocking notice (rare path errors)
+  const t = document.createElement('div');
+  t.textContent = m;
+  t.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#3a2020;color:#ffb4b4;padding:10px 16px;border-radius:8px;z-index:99;font-size:13px;max-width:80vw';
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 4200);
 }
 
 /* ---------- WebCodecs segment player ----------
@@ -3630,8 +4151,19 @@ function handleRoute() {
   if (!mkey) { showLibraryRoute(); return; }
   const playerOpen = currentId !== null;
   openMovie(mkey, false);
+  // /library/<movie>/read/<label> — open (or switch) the reader for that
+  // chapter. A refresh lands here: the reader restores the exact saved page.
+  if (parts[2] === 'read' && parts.length >= 4) {
+    const label = decodeURIComponent(parts.slice(3).join('/'));
+    const rep = movieRep(mrows);
+    if (rep && isReading(rep)) {
+      if (!rdCur || rdCur.label !== label || $('reader-modal').hidden) openReader(rep, label, true);
+      return;
+    }
+  }
   if (parts.length < 3) {
     if (playerOpen) { stopPlayback(); $('player-modal').hidden = true; }
+    if (!$('reader-modal').hidden) closeReader(true);
     return;
   }
   // 3 parts = torrent (default file); 4 parts = torrent + specific episode file.
@@ -3659,6 +4191,7 @@ function handleRoute() {
 function showLibraryRoute() {
   if (currentId !== null) stopPlayback();
   $('player-modal').hidden = true;
+  if (!$('reader-modal').hidden) closeReader(true);
   currentMovie = null;
   setView(false);
 }
@@ -3674,13 +4207,19 @@ function syncCtrlVis() {
 }
 document.addEventListener('mousemove', (e) => {
   lastMouse = { x: e.clientX, y: e.clientY };
-  if ($('player-modal').hidden) return;
-  syncCtrlVis();
-  const br = $('pback').getBoundingClientRect();
-  const pad = 30;
-  const near = e.clientX >= br.left - pad && e.clientX <= br.right + pad &&
-               e.clientY >= br.top - pad && e.clientY <= br.bottom + pad;
-  $('pback').classList.toggle('on', near);
+  if (!$('player-modal').hidden) {
+    syncCtrlVis();
+    const br = $('pback').getBoundingClientRect();
+    const pad = 30;
+    const near = e.clientX >= br.left - pad && e.clientX <= br.right + pad &&
+                 e.clientY >= br.top - pad && e.clientY <= br.bottom + pad;
+    $('pback').classList.toggle('on', near);
+  }
+  // Reader: the back button only shows near the upper-left corner (~10% zone).
+  if (!$('reader-modal').hidden) {
+    const near = e.clientX <= innerWidth * 0.1 && e.clientY <= innerHeight * 0.1;
+    $('rd-back').classList.toggle('on', near);
+  }
 });
 
 /* Hide the cursor the instant it stops moving in the player — no grace delay.
@@ -3708,6 +4247,7 @@ setInterval(() => {
  * plain data backed by a default table, and edits persist via localStorage.
  */
 const KCTX_PLAYER  = 'player';   /* player modal open            */
+const KCTX_READER  = 'reader';   /* manga reader open             */
 const KCTX_MODAL   = 'modal';    /* add/settings/confirm overlay  */
 const KCTX_MOVIE   = 'movie';    /* movie detail page open        */
 const KCTX_LIBRARY = 'library';  /* library grid open             */
@@ -3722,6 +4262,10 @@ const DEFAULT_KEYBIND = [
   { id: 'pl-fs',       ctx: KCTX_PLAYER, code: 'KeyF',       label: 'Toggle fullscreen',      fn: toggleFs },
   { id: 'pl-mute',     ctx: KCTX_PLAYER, code: 'KeyM',       label: 'Toggle mute',            fn: toggleMute },
   { id: 'pl-exit',     ctx: KCTX_PLAYER, code: 'Escape',     label: 'Exit player',            fn: exitPlayer },
+  { id: 'rd-exit',     ctx: KCTX_READER, code: 'Escape',     label: 'Close reader',           fn: closeReader },
+  { id: 'rd-up',       ctx: KCTX_READER, code: 'ArrowUp',    label: 'Scroll up',              fn: () => rdScrollBy(-0.85) },
+  { id: 'rd-down',     ctx: KCTX_READER, code: 'ArrowDown',  label: 'Scroll down',            fn: () => rdScrollBy(0.85) },
+  { id: 'rd-nextpage', ctx: KCTX_READER, code: 'Space',      label: 'Page down',              fn: () => rdScrollBy(0.9) },
   { id: 'mv-back',     ctx: KCTX_MOVIE,  code: 'Escape',     label: 'Back to library',        fn: () => $('btn-back').click() },
   { id: 'mv-next',     ctx: KCTX_MOVIE,  code: 'ArrowDown',  label: 'Next item / torrent',    fn: selNext },
   { id: 'mv-prev',     ctx: KCTX_MOVIE,  code: 'ArrowUp',    label: 'Previous item',          fn: selPrev },
@@ -3737,7 +4281,7 @@ const DEFAULT_KEYBIND = [
   { id: 'modal-close', ctx: KCTX_MODAL,  code: 'Escape',     label: 'Close',                  fn: closeModal },
 ];
 
-const KCTX_NAMES = { player: 'Player', modal: 'Modal', movie: 'Movie', library: 'Library' };
+const KCTX_NAMES = { player: 'Player', reader: 'Reader', modal: 'Modal', movie: 'Movie', library: 'Library' };
 const KB_STORE = 'chadtorrent.keybinds';
 const KB_DEL_STORE = 'chadtorrent.keybinds.deleted';
 
@@ -3816,8 +4360,10 @@ function saveKeybinds() {
   } catch (e) {}
 }
 function activeKeyCtx() {
+  if (!$('reader-modal').hidden) return KCTX_READER;
   if (!$('party-modal').hidden) return KCTX_MODAL;
   if (!$('player-modal').hidden) return KCTX_PLAYER;
+  if (!$('rdsrc-modal').hidden) return KCTX_MODAL;
   if (!$('party-modal').hidden) return KCTX_MODAL;
   if (!$('settings-modal').hidden) return KCTX_MODAL;
   if (!$('add-modal').hidden) return KCTX_MODAL;
@@ -3895,6 +4441,7 @@ function mvFlat() {
   // search results. Out of order, up/down jump between sections backwards and
   // wrap around the visual layout. Hidden chip bars are skipped so a stale
   // innerHTML can't put invisible buttons in the nav.
+  for (const el of document.querySelectorAll('#mv-chapters:not([hidden]) > .row.chrow')) out.push({ kind: 'chapter', el });
   for (const el of document.querySelectorAll('#mv-seasonchips:not([hidden]) button.s-chip')) out.push({ kind: 'season', el });
   for (const el of document.querySelectorAll('#mv-epselect:not([hidden]) button.s-chip'))    out.push({ kind: 'epbtn',  el });
   for (const el of document.querySelectorAll('#mv-epfiles > .ep'))            out.push({ kind: 'episode', el });
@@ -3940,7 +4487,7 @@ function selOpen() {
   }
   const x = mvFlat()[mvSelIdx];
   if (!x) return;
-  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn') {
+  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'chapter') {
     x.el.click();
     return;
   }
@@ -4156,6 +4703,7 @@ function closeSettings() {
  * dialog instead of letting the movie/library binding underneath fire. */
 function closeModal() {
   if (!$('party-modal').hidden) { closePartyModal(); return; }
+  if (!$('rdsrc-modal').hidden) { closeSourcePicker(); return; }
   if (!$('settings-modal').hidden) { closeSettings(); return; }
   if (!$('add-modal').hidden) { closeAdd(); return; }
   if (!$('confirm-modal').hidden) { $('cf-cancel').click(); return; }

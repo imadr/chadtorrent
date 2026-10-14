@@ -376,8 +376,11 @@ pub struct MetaCache {
     /// TMDB covers movie/tv sweeps; `None` when no key is configured (those
     /// media types then error on refresh, but reading types still work).
     tmdb: Option<Arc<TmdbClient>>,
-    /// Reading catalogues (MangaDex / Comic Vine) back the manga/comic sweeps.
+    /// Comic Vine backs the comic sweep; AniList supplies manga covers.
     reading: Arc<crate::reading::ReadingClient>,
+    /// Weeb Central client — the manga catalogue (search/synopsis/complete
+    /// chapter lists) and the reading source. Keyless.
+    reader: Arc<crate::reader::ReaderClient>,
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -391,11 +394,13 @@ impl MetaCache {
         db: Arc<Database>,
         tmdb: Option<Arc<TmdbClient>>,
         reading: Arc<crate::reading::ReadingClient>,
+        reader: Arc<crate::reader::ReaderClient>,
     ) -> Self {
         Self {
             db,
             tmdb,
             reading,
+            reader,
             inflight: Mutex::new(HashMap::new()),
         }
     }
@@ -479,25 +484,57 @@ impl MetaCache {
         }
         let detail = match media_type {
             "manga" => {
-                // ext_key is the MangaDex UUID; the title is the fallback for
-                // rows added before MangaDex became the source.
+                // The catalogue is Weeb Central: rows whose ext_key is a
+                // series id sweep directly; legacy rows (MangaDex-era UUIDs)
+                // resolve by title and are healed onto the new id.
                 let source = self.db.get_reading_source(media_type, id)?;
-                match source {
-                    Some((Some(uuid), _)) => self.reading.manga_detail(&uuid).await?,
-                    Some((None, Some(title))) => self
-                        .reading
-                        .manga_detail_by_title(&title)
-                        .await
-                        .unwrap_or(ReadingDetail {
-                            overview: None,
-                            episodes: Vec::new(),
-                            poster: None,
-                        }),
-                    _ => ReadingDetail {
-                        overview: None,
-                        episodes: Vec::new(),
-                        poster: None,
-                    },
+                let (ext, title) = source.unwrap_or((None, None));
+                let mut healed = false;
+                let mut series_id = ext.clone().filter(|e| crate::reading::is_weebcentral_ref(e));
+                if series_id.is_none() {
+                    match self.reader.auto_match("weebcentral", &title.clone().unwrap_or_default()).await {
+                        Some(m) => {
+                            series_id = Some(m.key);
+                            healed = true;
+                        }
+                        None => {
+                            return Ok(false); // nothing matches; retry on a later open
+                        }
+                    }
+                }
+                let sid = series_id.unwrap_or_default();
+                let (meta, mut episodes) = match self.reader.catalogue_detail(&sid).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("manga sweep failed for {media_type}:{id}: {e}");
+                        return Err(e);
+                    }
+                };
+                // Chapter names: Weeb Central carries none; MangaDex (where
+                // its feed survived the delisting) is the only titled source —
+                // merge by chapter number, strictly for the same title.
+                let titles = self
+                    .reading
+                    .chapter_titles(&if meta.title.is_empty() {
+                        title.clone().unwrap_or_default()
+                    } else {
+                        meta.title.clone()
+                    })
+                    .await;
+                crate::reading::apply_chapter_titles(&mut episodes, &titles);
+                if healed {
+                    // Legacy row: re-key the group (rows + meta + source +
+                    // progress) onto the Weeb Central id.
+                    if let Err(e) = self.db.rekey_reading_group(media_type, id, &sid) {
+                        warn!("reading rekey failed for {media_type}:{id}: {e}");
+                    }
+                }
+                let display_title = if meta.title.is_empty() { title.unwrap_or_default() } else { meta.title };
+                let poster = self.reading.anilist_cover_for(&display_title).await;
+                ReadingDetail {
+                    overview: meta.description,
+                    episodes,
+                    poster,
                 }
             }
             _ => self.reading.comic_detail(id).await?,

@@ -1,11 +1,12 @@
-//! Reading (manga & comics) metadata search + chapter lists.
+//! Reading (manga & comics) metadata: ground-truth catalogues + helpers.
 //!
-//! One source per catalogue, plus one deliberate helper:
-//!   - **MangaDex** (manga): search, synopsis and the real per-chapter list
-//!     (numbers + titles). Keyless. Its cover uploads are NOT used for
-//!     display — hotlinked browsers get a placeholder logo — so covers come
-//!     from **AniList**, title-matched (keyless). Misses fall back to the
-//!     MangaDex cover URL.
+//!   - **Manga** catalogue: **Weeb Central** (`reader.rs` owns the client —
+//!     search, series synopsis and the complete chapter list all come from
+//!     there; this module only shapes the rows). MangaDex is gone: it
+//!     delists licensed chapters (Gantz 0/383, One Piece 4/1100+), so its
+//!     feed was never "every chapter that exists". AniList still supplies
+//!     cover art, title-matched (keyless) — Weeb Central covers are fine to
+//!     hotlink but AniList art is larger.
 //!   - **Comic Vine** (western comics): volume search + issue lists. Needs a
 //!     free API key in `chadtorrent.json` (`comicvine_api_key`).
 //!
@@ -25,7 +26,6 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 
 const MANGADEX_API: &str = "https://api.mangadex.org";
-const MANGADEX_COVERS: &str = "https://uploads.mangadex.org/covers";
 const ANILIST_URL: &str = "https://graphql.anilist.co";
 /// Text search lives on `/search/` (with `resources=volume`); the `/volumes/`
 /// browse endpoint silently ignores `query` and returns the whole catalogue.
@@ -87,50 +87,93 @@ pub fn chapter_info(
     }
 }
 
-/// MangaDex ids are UUIDs; the library groups rows by a numeric id, so the
-/// UUID is folded to a stable 64-bit value (first 16 hex digits).
+/// Legacy: MangaDex UUIDs folded to 52-bit ids (kept only so the one-time
+/// `manga_id_52bit` migration can re-key pre-Weeb-Central rows).
 pub fn mangadex_id_hash(uuid: &str) -> i64 {
     let hex: String = uuid
         .chars()
         .filter(|c| c.is_ascii_hexdigit())
-        .take(16)
+        .take(13)
         .collect();
     u64::from_str_radix(&hex, 16)
         .map(|v| v as i64)
         .unwrap_or(0)
 }
 
-/// One feed row → display row. Integer chapters keep their number and title;
-/// sub-chapters ("1.5", "0.01" specials) get a "Ch. <raw> · <title>" label
-/// so nothing is lost or silently renumbered.
-pub fn chapter_rows(
-    chapters: Vec<(Option<String>, Option<String>)>,
-) -> Vec<crate::metadata::EpisodeInfo> {
-    let mut parsed: Vec<(f64, String, Option<String>)> = chapters
-        .into_iter()
-        .filter_map(|(number, title)| {
-            let raw = number?;
-            let value = raw.trim().parse::<f64>().ok()?;
-            Some((value, raw, title))
-        })
-        .collect();
+/// A Weeb Central series id: 26-char uppercase ULID (no dashes).
+pub fn is_weebcentral_ref(s: &str) -> bool {
+    s.len() == 26 && s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Stable 52-bit id for a Weeb Central series id (FNV-1a, masked to 52 bits
+/// so the value round-trips JavaScript's exact-integer range untouched).
+pub fn ext_id_hash(s: &str) -> i64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h & 0x000f_ffff_ffff_ffff) as i64
+}
+
+/// Numbered chapter rows for the catalogue sweep (Weeb Central lists carry
+/// no titles): dedupe, sort ascending, sub-chapters ("37.5") keep their raw
+/// number in the label so the frontend can address them exactly.
+pub fn chapter_rows_from_labels(labels: Vec<String>) -> Vec<crate::metadata::EpisodeInfo> {
+    let mut seen: Vec<String> = Vec::with_capacity(labels.len());
+    let mut parsed: Vec<(f64, String)> = Vec::with_capacity(labels.len());
+    for raw in labels {
+        let Ok(value) = raw.trim().parse::<f64>() else { continue };
+        if seen.iter().any(|l| l == &raw) {
+            continue;
+        }
+        seen.push(raw.clone());
+        parsed.push((value, raw));
+    }
     parsed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     parsed
         .into_iter()
-        .map(|(value, raw, title)| {
+        .map(|(value, raw)| {
             let whole = value.trunc();
             let is_integer = (value - whole).abs() < f64::EPSILON && value >= 0.0;
-            let name = if is_integer {
-                title
-            } else {
-                Some(match title {
-                    Some(t) => format!("Ch. {raw} · {t}"),
-                    None => format!("Ch. {raw}"),
-                })
-            };
+            let name = if is_integer { None } else { Some(format!("Ch. {raw}")) };
             chapter_info(whole.max(0.0) as i64, name, None, None)
         })
         .collect()
+}
+
+/// Map key for a chapter label: the value scaled ×1000, so "37.5" and
+/// "37.50" collide and "0.01" stays distinct.
+pub fn title_map_key(label: &str) -> Option<i64> {
+    label.trim().parse::<f64>().ok().map(|v| (v * 1000.0).round() as i64)
+}
+
+/// Merge swept chapter titles into catalogue rows. Each row's raw label is
+/// recovered from the row itself (integer rows are their number;
+/// sub-chapter rows carry "Ch. <raw>" in `name`). Integer chapters take the
+/// plain title; sub-chapters keep the "Ch. <raw> · <title>" convention (the
+/// frontend extracts the raw label from it). Unnamed chapters stay unnamed —
+/// never invent names.
+pub fn apply_chapter_titles(rows: &mut [crate::metadata::EpisodeInfo], titles: &HashMap<i64, String>) {
+    if titles.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        let raw_label = match row.name.as_deref().and_then(|n| n.strip_prefix("Ch. ")) {
+            Some(rest) => rest.split(" · ").next().unwrap_or(rest).to_string(),
+            None => row.episode_number.to_string(),
+        };
+        let Some(key) = title_map_key(&raw_label) else { continue };
+        let Some(t) = titles.get(&key) else { continue };
+        if t.trim().is_empty() {
+            continue;
+        }
+        row.name = Some(if raw_label.contains('.') {
+            format!("Ch. {raw_label} · {t}")
+        } else {
+            t.clone()
+        });
+    }
 }
 
 /// ComicVine issue numbers are strings: "3", "2.5" (→ 2), "Annual 1" (no
@@ -277,168 +320,99 @@ impl ReadingClient {
         map.get(&norm_title(title)).cloned().or_else(|| map.values().next().cloned())
     }
 
-    /// Manga search via MangaDex (keyless). Covers ride along via the
-    /// `cover_art` include; english title/description when available.
-    pub async fn search_manga(&self, query: &str) -> Result<Vec<ReadingResult>> {
-        let resp = self
+    /// Chapter titles from MangaDex, keyed by `title_map_key(label)`.
+    /// Best-effort enrichment only — MangaDex is NOT the catalogue (it
+    /// delists licensed chapters), but where its feed survives it is the
+    /// only source that still carries real chapter names. English titles
+    /// win; gaps fall back to any language (first by lang code), so a
+    /// chapter gets at most one name.
+    pub async fn chapter_titles(&self, title: &str) -> HashMap<i64, String> {
+        let norm = norm_title(title);
+        if norm.is_empty() {
+            return HashMap::new();
+        }
+        // Resolve the MangaDex entry by exact normalized title; a mismatch
+        // means "not this series" — never glue another series' names on.
+        let Ok(resp) = self
             .http
             .get(format!("{MANGADEX_API}/manga"))
             .query(&[
-                ("title", query),
-                ("limit", "24"),
-                ("includes[]", "cover_art"),
+                ("title", title),
+                ("limit", "8"),
                 ("contentRating[]", "safe"),
                 ("contentRating[]", "suggestive"),
                 ("contentRating[]", "erotica"),
             ])
             .send()
             .await
-            .map_err(|e| Error::BadRequest(format!("mangadex search failed: {e}")))?
-            .json::<MdCollection<MdManga>>()
-            .await
-            .map_err(|e| Error::BadRequest(format!("mangadex response invalid: {e}")))?;
-        // AniList art wins for every hit whose title matches; the rest keep
-        // their MangaDex cover URL as fallback.
-        let covers = self.anilist_cover_map(query).await;
-        Ok(resp
-            .data
-            .into_iter()
-            .map(|m| {
-                let cover = m
-                    .relationships
-                    .iter()
-                    .find(|r| r.r#type == "cover_art")
-                    .and_then(|r| r.attributes.as_ref())
-                    .and_then(|c| c.file_name.clone());
-                // fileName already carries its extension ("uuid.jpg").
-                let md_poster = cover.map(|f| format!("{MANGADEX_COVERS}/{}/{f}", m.id));
-                let title = m.attributes.pick_title();
-                let poster = covers
-                    .get(&norm_title(&title))
-                    .cloned()
-                    .or(md_poster);
-                ReadingResult {
-                    id: mangadex_id_hash(&m.id),
-                    title,
-                    year: m.attributes.year,
-                    poster_path: poster,
-                    media_type: "manga".into(),
-                    overview: m.attributes.description.get("en").map(|d| strip_html(d)),
-                    ext_key: Some(m.id),
-                }
-            })
-            .collect())
-    }
-
-    /// Manga detail: fresh description + the real chapter feed, plus the
-    /// AniList cover for the title (MangaDex uploads show a placeholder logo
-    /// when hotlinked by browsers, so they are never displayed).
-    pub async fn manga_detail(&self, uuid: &str) -> Result<ReadingDetail> {
-        let manga: MdSingle<MdManga> = self
-            .http
-            .get(format!("{MANGADEX_API}/manga/{uuid}"))
-            .send()
-            .await
-            .map_err(|e| Error::BadRequest(format!("mangadex detail failed: {e}")))?
-            .json()
-            .await
-            .map_err(|e| Error::BadRequest(format!("mangadex response invalid: {e}")))?;
-        let title = manga.data.attributes.pick_title();
-        let overview = manga
-            .data
-            .attributes
-            .description
-            .get("en")
-            .map(|d| strip_html(d));
-        let episodes = self.mangadex_chapters(uuid).await.unwrap_or_default();
-        let poster = self.anilist_cover_for(&title).await;
-        Ok(ReadingDetail {
-            overview,
-            episodes,
-            poster,
-        })
-    }
-
-    /// For rows added before MangaDex became the manga source (no `ext_key`):
-    /// resolve the title to a MangaDex entry, then fetch its details.
-    pub async fn manga_detail_by_title(&self, title: &str) -> Result<ReadingDetail> {
-        let hits = self.search_manga(title).await?;
-        let Some(hit) = hits
-            .iter()
-            .find(|h| h.title.to_lowercase() == title.to_lowercase())
-            .or_else(|| hits.first())
         else {
-            return Ok(ReadingDetail {
-                overview: None,
-                episodes: Vec::new(),
-                poster: None,
-            });
+            return HashMap::new();
         };
-        let Some(ext) = hit.ext_key.as_deref() else {
-            return Ok(ReadingDetail {
-                overview: None,
-                episodes: Vec::new(),
-                poster: None,
-            });
+        let Ok(parsed) = resp.json::<MdCollection<MdTitleManga>>().await else {
+            return HashMap::new();
         };
-        self.manga_detail(ext).await
-    }
-
-    /// The chapter feed, english first, paginated (500/page). Falls back to
-    /// any language when the english feed is empty.
-    async fn mangadex_chapters(&self, uuid: &str) -> Result<Vec<crate::metadata::EpisodeInfo>> {
-        let mut rows = self.mangadex_feed(uuid, true).await?;
-        if rows.is_empty() {
-            rows = self.mangadex_feed(uuid, false).await?;
-        }
-        Ok(rows)
-    }
-
-    async fn mangadex_feed(
-        &self,
-        uuid: &str,
-        english_only: bool,
-    ) -> Result<Vec<crate::metadata::EpisodeInfo>> {
-        let mut chapters: Vec<(Option<String>, Option<String>)> = Vec::new();
-        let mut total = i64::MAX; // refined after the first page
-        for offset in (0..2500i64).step_by(500) {
-            if offset >= total {
-                break;
-            }
-            let mut req = self
-                .http
-                .get(format!("{MANGADEX_API}/manga/{uuid}/feed"))
-                .query(&[
-                    ("limit", "500"),
-                    ("offset", offset.to_string().as_str()),
-                    ("order[chapter]", "asc"),
-                    ("contentRating[]", "safe"),
-                    ("contentRating[]", "suggestive"),
-                    ("contentRating[]", "erotica"),
-                    ("includeEmptyPages", "0"),
-                ]);
-            if english_only {
-                req = req.query(&[("translatedLanguage[]", "en")]);
-            }
-            let resp: MdCollection<MdChapter> = req
-                .send()
-                .await
-                .map_err(|e| Error::BadRequest(format!("mangadex feed failed: {e}")))?
-                .json()
-                .await
-                .map_err(|e| Error::BadRequest(format!("mangadex response invalid: {e}")))?;
-            total = resp.total.unwrap_or(0);
-            let got = resp.data.len() as i64;
-            chapters.extend(
-                resp.data
-                    .into_iter()
-                    .map(|c| (c.attributes.chapter, c.attributes.title)),
-            );
-            if got < 500 {
-                break;
+        let Some(entry) = parsed
+            .data
+            .iter()
+            .find(|m| norm_title(&m.attributes.pick_title()) == norm)
+        else {
+            return HashMap::new();
+        };
+        let uuid = entry.id.clone();
+        let mut titles: HashMap<i64, String> = HashMap::new();
+        let mut fallbacks: Vec<(i64, String, String)> = Vec::new();
+        for english_only in [true, false] {
+            let mut total = i64::MAX;
+            for offset in (0..1500i64).step_by(500) {
+                if offset >= total {
+                    break;
+                }
+                let mut req = self
+                    .http
+                    .get(format!("{MANGADEX_API}/manga/{uuid}/feed"))
+                    .query(&[
+                        ("limit", "500"),
+                        ("offset", offset.to_string().as_str()),
+                        ("order[chapter]", "asc"),
+                        ("contentRating[]", "safe"),
+                        ("contentRating[]", "suggestive"),
+                        ("contentRating[]", "erotica"),
+                        ("includeEmptyPages", "0"),
+                    ]);
+                if english_only {
+                    req = req.query(&[("translatedLanguage[]", "en")]);
+                }
+                let Ok(resp) = req.send().await else { break };
+                let Ok(feed) = resp.json::<MdCollection<MdTitleChapter>>().await else { break };
+                total = feed.total.unwrap_or(0);
+                for c in &feed.data {
+                    let Some(raw) = c.attributes.chapter.as_deref() else { continue };
+                    let Some(key) = title_map_key(raw) else { continue };
+                    let name = c.attributes.title.clone().unwrap_or_default();
+                    if name.trim().is_empty() {
+                        continue;
+                    }
+                    if english_only {
+                        titles.entry(key).or_insert(name);
+                    } else if !titles.contains_key(&key) {
+                        fallbacks.push((
+                            key,
+                            c.attributes.translated_language.clone().unwrap_or_default(),
+                            name,
+                        ));
+                    }
+                }
+                if feed.data.len() < 500 {
+                    break;
+                }
             }
         }
-        Ok(chapter_rows(chapters))
+        // deterministic fill: lang code, then title, per key
+        fallbacks.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (key, _, name) in fallbacks {
+            titles.entry(key).or_insert(name);
+        }
+        titles
     }
 
     /// Comics (volume) search via Comic Vine. Errors with setup instructions
@@ -555,86 +529,57 @@ impl ReadingClient {
     }
 }
 
-// ---- MangaDex response types ----
+// ---- MangaDex response types (title enrichment only) ----
 
 #[derive(Debug, Deserialize)]
 struct MdCollection<T> {
+    #[serde(default)]
     data: Vec<T>,
     #[serde(default)]
     total: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct MdSingle<T> {
-    data: T,
-}
-
-#[derive(Debug, Deserialize)]
-struct MdManga {
+#[derive(Debug, Deserialize, Default)]
+struct MdTitleManga {
     id: String,
     #[serde(default)]
-    attributes: MdMangaAttrs,
-    #[serde(default)]
-    relationships: Vec<MdRelationship>,
+    attributes: MdTitleAttrs,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct MdMangaAttrs {
+struct MdTitleAttrs {
     #[serde(default)]
     title: HashMap<String, String>,
     #[serde(rename = "altTitles", default)]
     alt_titles: Vec<HashMap<String, String>>,
-    #[serde(default)]
-    description: HashMap<String, String>,
-    #[serde(default)]
-    year: Option<i32>,
 }
 
-impl MdMangaAttrs {
-    /// Display title: english map entry, else english alt title, else the
-    /// first title/alt the entry carries (romaji, native…).
+impl MdTitleAttrs {
     fn pick_title(&self) -> String {
-        let from_map = |m: &HashMap<String, String>| {
-            m.get("en")
-                .cloned()
-                .or_else(|| m.values().next().cloned())
-        };
         self.title
             .get("en")
             .cloned()
+            .or_else(|| self.title.values().next().cloned())
             .or_else(|| self.alt_titles.iter().find_map(|t| t.get("en").cloned()))
-            .or_else(|| from_map(&self.title))
-            .or_else(|| self.alt_titles.iter().find_map(from_map))
-            .unwrap_or_else(|| "Manga".into())
+            .or_else(|| self.alt_titles.iter().find_map(|t| t.values().next().cloned()))
+            .unwrap_or_default()
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct MdRelationship {
-    #[serde(rename = "type", default)]
-    r#type: String,
+#[derive(Debug, Deserialize, Default)]
+struct MdTitleChapter {
     #[serde(default)]
-    attributes: Option<MdCoverAttrs>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MdCoverAttrs {
-    #[serde(rename = "fileName", default)]
-    file_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct MdChapter {
-    #[serde(default)]
-    attributes: MdChapterAttrs,
+    attributes: MdTitleChapterAttrs,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct MdChapterAttrs {
+struct MdTitleChapterAttrs {
     #[serde(default)]
     chapter: Option<String>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(rename = "translatedLanguage", default)]
+    translated_language: Option<String>,
 }
 
 // ---- Comic Vine response types ----
@@ -797,6 +742,61 @@ mod tests {
         assert_eq!(year_prefix(""), None);
     }
 
+    /// Numbered rows keep their raw label derivable: integers are their
+    /// number, sub-chapters carry "Ch. <raw>" — that's what the title merge
+    /// keys off.
+    #[test]
+    fn test_apply_chapter_titles() {
+        let mut rows = chapter_rows_from_labels(vec![
+            "0.01".into(), "1".into(), "2".into(), "37.5".into(), "386".into(),
+        ]);
+        let titles: HashMap<i64, String> = HashMap::from([
+            (title_map_key("386").unwrap(), "The City of Humans".into()),
+            (title_map_key("37.5").unwrap(), "My Festival".into()),
+            (title_map_key("1").unwrap(), "Roast Goat".into()),
+            (title_map_key("2").unwrap(), "   ".into()), // blank: ignored
+        ]);
+        apply_chapter_titles(&mut rows, &titles);
+        assert_eq!(rows[0].name.as_deref(), Some("Ch. 0.01")); // no title anywhere: label kept
+        assert_eq!(rows[1].name.as_deref(), Some("Roast Goat"));
+        assert_eq!(rows[2].name.as_deref(), None); // blank title never applies
+        assert_eq!(rows[3].name.as_deref(), Some("Ch. 37.5 · My Festival"));
+        assert_eq!(rows[4].name.as_deref(), Some("The City of Humans"));
+        // raw labels survive the merge — the frontend needs them to resolve
+        let raw = rows[3].name.as_deref().unwrap().strip_prefix("Ch. ").unwrap();
+        assert_eq!(raw.split(" · ").next(), Some("37.5"));
+    }
+
+    /// MangaDex title-enrichment payload: search hit (title maps/altTitles)
+    /// and feed rows (chapter + title + language).
+    #[test]
+    fn test_mangadex_title_payload_parses() {
+        let search = r#"{
+            "data": [
+                { "id": "801513ba-0000",
+                  "attributes": { "title": { "ja-ro": "Berserk" },
+                                  "altTitles": [{ "en": "Berserk" }] } }
+            ]
+        }"#;
+        let parsed: MdCollection<MdTitleManga> = serde_json::from_str(search).unwrap();
+        assert_eq!(parsed.data[0].attributes.pick_title(), "Berserk");
+        let feed = r#"{
+            "total": 2,
+            "data": [
+                { "attributes": { "chapter": "386", "title": "The City of Humans", "translatedLanguage": "en" } },
+                { "attributes": { "chapter": "37.50", "title": "My Festival", "translatedLanguage": "fr" } }
+            ]
+        }"#;
+        let feed: MdCollection<MdTitleChapter> = serde_json::from_str(feed).unwrap();
+        assert_eq!(feed.total, Some(2));
+        assert_eq!(feed.data[0].attributes.chapter.as_deref(), Some("386"));
+        // "37.50" and "37.5" share a map key
+        assert_eq!(
+            title_map_key(feed.data[1].attributes.chapter.as_deref().unwrap()),
+            title_map_key("37.5")
+        );
+    }
+
     #[test]
     fn test_issue_number_parsing() {
         assert_eq!(issue_number("1"), Some(1));
@@ -806,9 +806,9 @@ mod tests {
         assert_eq!(issue_number(""), None);
     }
 
-    /// UUID → stable numeric id: deterministic and collision-free enough for
-    /// a personal library (the UUID's first 16 hex digits, as i64 — sign bit
-    /// included, the value is opaque).
+    /// UUID → stable numeric id: deterministic, distinct per UUID, and
+    /// always inside JavaScript's exact-integer range (±2^53) so the value
+    /// survives the browser round-trip.
     #[test]
     fn test_mangadex_id_hash() {
         let a = mangadex_id_hash("801513ba-a712-498c-8f57-cae55b38cc92");
@@ -816,74 +816,8 @@ mod tests {
         let c = mangadex_id_hash("dc332d04-d3b0-413c-a767-70f5e451b031");
         assert_eq!(a, b);
         assert_ne!(a, c);
-    }
-
-    /// MangaDex search payload: en title falls back through altTitles, cover
-    /// art rides in the relationships.
-    #[test]
-    fn test_mangadex_search_payload_parses() {
-        let payload = r#"{
-            "data": [
-                {
-                    "id": "801513ba-a712-498c-8f57-cae55b38cc92",
-                    "type": "manga",
-                    "attributes": {
-                        "title": { "ja-ro": "Berserk" },
-                        "altTitles": [{ "ja": "ベルセルク" }, { "en": "Berserk" }],
-                        "description": { "en": "Guts, known as the <b>Black Swordsman</b>." },
-                        "year": 1989
-                    },
-                    "relationships": [
-                        { "id": "rel1", "type": "author" },
-                        { "id": "rel2", "type": "cover_art",
-                          "attributes": { "fileName": "81e1c82d-6672-400c-8c58-4ff9bfb89031.jpg" } }
-                    ]
-                }
-            ],
-            "total": 22
-        }"#;
-        let parsed: MdCollection<MdManga> = serde_json::from_str(payload).unwrap();
-        assert_eq!(parsed.total, Some(22));
-        let m = &parsed.data[0];
-        assert_eq!(m.attributes.pick_title(), "Berserk");
-        assert_eq!(m.attributes.year, Some(1989));
-        assert_eq!(
-            m.attributes.description.get("en").map(|d| strip_html(d)),
-            Some("Guts, known as the Black Swordsman.".into())
-        );
-        let cover = m
-            .relationships
-            .iter()
-            .find(|r| r.r#type == "cover_art")
-            .and_then(|r| r.attributes.as_ref())
-            .and_then(|c| c.file_name.clone());
-        assert_eq!(
-            cover.as_deref(),
-            Some("81e1c82d-6672-400c-8c58-4ff9bfb89031.jpg")
-        );
-    }
-
-    /// Chapter feed mapping: integers keep number+title; specials like
-    /// "0.01" get a labelled row; ordering follows the numeric value.
-    #[test]
-    fn test_chapter_rows() {
-        let rows = chapter_rows(vec![
-            (Some("1".into()), Some("Roast Goat".into())),
-            (Some("0.01".into()), Some("The Black Swordsman".into())),
-            (Some("2".into()), None),
-            (Some("1.5".into()), None),
-            (None, Some("external only".into())),
-        ]);
-        // external-only chapter is dropped; the rest sort numerically.
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].episode_number, 0);
-        assert_eq!(rows[0].name.as_deref(), Some("Ch. 0.01 · The Black Swordsman"));
-        assert_eq!(rows[1].episode_number, 1);
-        assert_eq!(rows[1].name.as_deref(), Some("Roast Goat"));
-        assert_eq!(rows[2].episode_number, 1); // 1.5 truncates, label keeps truth
-        assert_eq!(rows[2].name.as_deref(), Some("Ch. 1.5"));
-        assert_eq!(rows[3].episode_number, 2);
-        assert_eq!(rows[3].name, None);
+        assert!(a.unsigned_abs() < (1u64 << 52), "hash must stay under 2^53 (JS-safe)");
+        assert!(c.unsigned_abs() < (1u64 << 52), "hash must stay under 2^53 (JS-safe)");
     }
 
     /// AniList cover payload (covers only): english title preferred, the

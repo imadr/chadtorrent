@@ -46,8 +46,9 @@ async fn start_http(
         library.db.clone(),
         None,
         Arc::new(ReadingClient::new(None)),
+        Arc::new(chadtorrent::reader::ReaderClient::new()),
     );
-    let router = build_router(AppState { library, index_html, tmdb: None, meta: Some(Arc::new(meta)), subs: None, party: party.clone(), reading: Arc::new(ReadingClient::new(None)) });
+    let router = build_router(AppState { library, index_html, tmdb: None, meta: Some(Arc::new(meta)), subs: None, party: party.clone(), reading: Arc::new(ReadingClient::new(None)), reader: Arc::new(chadtorrent::reader::ReaderClient::new()) });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -174,6 +175,7 @@ async fn tmdb_meta_serves_seasons_and_episodes_from_cache() {
         library.db.clone(),
         Some(Arc::new(TmdbClient::new("bogus-key".into()))),
         Arc::new(ReadingClient::new(None)),
+        Arc::new(chadtorrent::reader::ReaderClient::new()),
     );
     let index_html = include_str!("../static/index.html").to_string();
     let party = PartyManager::new(library.clone());
@@ -185,6 +187,7 @@ async fn tmdb_meta_serves_seasons_and_episodes_from_cache() {
         subs: None,
         party: party.clone(),
         reading: Arc::new(ReadingClient::new(None)),
+        reader: Arc::new(chadtorrent::reader::ReaderClient::new()),
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

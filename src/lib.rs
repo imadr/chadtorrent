@@ -7,6 +7,7 @@ pub mod library;
 pub mod metadata;
 pub mod party;
 pub mod reading;
+pub mod reader;
 pub mod remux;
 pub mod segmenter;
 pub mod subtitles;
