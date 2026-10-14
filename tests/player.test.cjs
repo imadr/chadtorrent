@@ -60,3 +60,30 @@ test('trex defaults are inherited and missing durations fail instead of inventin
   assert.equal(samples[2].dts, 180);
   assert.throws(() => c.parseSeg(fragment(), tracks({ size: 4 })), /duration/);
 });
+
+test('fetched EOF cannot complete a seek before target decoder output', () => {
+  const c = engine();
+  Object.assign(c.P, { id: 1, eof: true, lastT: 71.3, seekFloor: 71.3, noAudio: true });
+  vm.runInContext('pendSeek = 71.3', c);
+  c.finishSeek();
+  assert.equal(vm.runInContext('pendSeek', c), 71.3);
+});
+test('seek completion keeps rejecting in-flight preroll and waits for both tracks', () => {
+  const c = engine();
+  c.VideoDecoder = class { constructor(callbacks) { this.callbacks = callbacks; } };
+  c.AudioDecoder = c.VideoDecoder;
+  Object.assign(c.P, { id: 1, seekFloor: 10 });
+  vm.runInContext('pendSeek = 10', c);
+  c.P.vdec = c.mkVdec(); c.P.adec = c.mkAdec();
+  const output = (decoder, ts, dur) => {
+    const f = { timestamp: ts * 1e6, duration: dur * 1e6, close() { this.closed = true; } };
+    decoder.callbacks.output(f); return f;
+  };
+  assert.equal(output(c.P.vdec, 5, 0.04).closed, true);
+  output(c.P.vdec, 9.99, 0.04);
+  assert.equal(vm.runInContext('pendSeek', c), 10);
+  output(c.P.adec, 9.99, 0.02);
+  assert.equal(vm.runInContext('pendSeek', c), null);
+  assert.equal(output(c.P.vdec, 6, 0.04).closed, true);
+  assert.equal(c.P.seekFloor, 10);
+});

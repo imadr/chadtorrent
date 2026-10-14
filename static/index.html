@@ -2310,6 +2310,7 @@ const P = {
   chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
   fetchN: 1, fedUntil: 0, eof: false, endedFired: false, needKey: false,
   seekFloor: 0,               // after a seek: drop decoded outputs older than this
+  seekVideoReady: false, seekAudioReady: false,
   aStepUs: 0,                 // container's per-packet audio duration (clock truth)
   aTrimUs: 0,                 // AAC decoder-delay trim (native-player parity, see startEngine)
   ctx: null, gain: null, nextAt: 0,
@@ -2636,8 +2637,10 @@ function mkVdec() {
   const dec = new VideoDecoder({
     output: (frame) => {
       if (P.vdec !== dec) { try { frame.close(); } catch (e) {} return; }
-      if (P.seekFloor && frame.timestamp / 1e6 < P.seekFloor) { try { frame.close(); } catch (e) {} return; }
+      if (P.seekFloor > 0 && frame.timestamp / 1e6 + (frame.duration || 0) / 1e6 <= P.seekFloor) { frame.close(); return; }
       P.vq.push(frame);
+      P.seekVideoReady = true;
+      finishSeek();
     },
     error: (e) => { if (P.vdec === dec) onDecErr('video')(e); },
   });
@@ -2648,8 +2651,10 @@ function mkAdec() {
     output: (ad) => {
       if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
-      if (P.seekFloor && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 < P.seekFloor) { try { ad.close(); } catch (e) {} return; }
+      if (P.seekFloor > 0 && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 <= P.seekFloor) { ad.close(); return; }
       P.aq.push(ad);
+      P.seekAudioReady = true;
+      finishSeek();
     },
     error: (e) => { if (P.adec === dec) onAudioDecErr(e); },
   });
@@ -2722,7 +2727,7 @@ function pumpAudio() {
   // seconds (the "seeks make it laggy again" + desync report). Holding the
   // schedule costs ≤250ms (pendSeek clears seekFloor once the first kept
   // frame lands) and audio+video then start at the target together.
-  if (P.seekFloor && !P.vq.length) return;
+  if (pendSeek != null) return;
   if (P.nextAt < P.ctx.currentTime) P.nextAt = P.ctx.currentTime + 0.01;
   while (P.aq.length && P.nextAt < P.ctx.currentTime + 1.5) {
     const ad = P.aq.shift();
@@ -2749,6 +2754,16 @@ function paint(frame) {
     cv.width = frame.displayWidth; cv.height = frame.displayHeight;
   }
   cv.getContext('2d').drawImage(frame, 0, 0);
+}
+
+// Readiness is evidence from decoder output, never the requested clock position
+// or fetched EOF. Keep the floor for this decoder generation: completing a seek
+// must not admit pre-target outputs that are still in flight.
+function finishSeek() {
+  if (pendSeek == null || !P.seekVideoReady || (!P.noAudio && !P.seekAudioReady)) return;
+  P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: pendSeek };
+  pendSeek = null; pendSeekAt = 0;
+  v.dispatchEvent(new Event('seeked'));
 }
 
 let lastTU = 0, wasWaiting = false;
@@ -2800,17 +2815,7 @@ setInterval(() => {
     wasWaiting = false;
     v.dispatchEvent(new Event('playing'));
   }
-  // pending seek: resolved once a decoded frame at/after the target exists
-  // (the seek floor keeps everything older than target-0.35s out of vq, so
-  // the first queued frame qualifies; the audio arm covers streams whose
-  // video decode lags but whose clock already crossed the target)
-  if (pendSeek != null
-      && ((P.vq.length && P.vq[0].timestamp / 1e6 >= pendSeek - 0.4)
-          || (P.anchor && P.anchor.media > pendSeek)
-          || (P.eof && mediaNow() >= Math.min(pendSeek, (fullDur || Infinity) - 0.05)))) {
-    pendSeek = null; pendSeekAt = 0; P.seekFloor = 0;
-    v.dispatchEvent(new Event('seeked'));
-  }
+  finishSeek();
   // end of the stream: manifest complete, everything fed, everything played.
   // Video-only: no anchor, just all queues drained. With audio: everything
   // decoded AND sounded (audioEnded covers decode side, anchor.ctx the sound
@@ -3160,7 +3165,8 @@ function seekTo(globalT, partyOrigin) {
   segAbort = new AbortController();
   P.fetchN = segContaining(globalT);
   P.needKey = true;                     // decode from the first sync sample
-  P.seekFloor = Math.max(0, globalT - 0.35);  // ...but only PRESENT from here on
+  P.seekFloor = globalT;                // discard outputs ending before the target
+  P.seekVideoReady = false; P.seekAudioReady = false;
   P.eof = false; P.endedFired = false;
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }
