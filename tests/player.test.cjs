@@ -142,7 +142,7 @@ test('explicit SBR ASC carries both object types and the original core configura
 test('EOF waits for asynchronous decoder flush output before completing playback', async () => {
   const c = engine();
   let release;
-  Object.assign(c.P, { id: 1, noAudio: true, eof: true, lastT: 100 });
+  Object.assign(c.P, { id: 1, noAudio: true, eof: true, lastT: 100, paused: false });
   c.P.vdec = { flush: () => new Promise(r => release = r) };
   let ended = 0;
   c.v.addEventListener('ended', () => ended++);
@@ -297,4 +297,13 @@ test('missing known segments refresh the manifest and recover after a server res
   await c.feedLoop(0, 1);
   assert.equal(rebuilds, 1);
   assert.equal(fetches, 1);
+});
+test('a paused seek to EOF does not trigger the autoplay loop', () => {
+  const c = engine();
+  Object.assign(c.P, { id: 1, noAudio: true, vDrained: true, aDrained: true, videoEnd: 100, lastT: 100, paused: true });
+  let ended = 0;
+  c.v.addEventListener('ended', () => ended++);
+  c.timers[0]();
+  assert.equal(ended, 0);
+  assert.equal(c.P.paused, true);
 });

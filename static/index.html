@@ -2881,7 +2881,7 @@ setInterval(() => {
   // Video-only: no anchor, just all queues drained. With audio: everything
   // decoded AND sounded (audioEnded covers decode side, anchor.ctx the sound
   // side — during the video tail the wall clock has already drained vq).
-  if (P.vDrained && !P.endedFired && !P.vq.length && !P.aq.length
+  if (!P.paused && pendSeek == null && P.vDrained && !P.endedFired && !P.vq.length && !P.aq.length
       && mediaNow() >= P.videoEnd - 0.01 && (P.noAudio || audioEnded())) {
     P.endedFired = true;
     v.dispatchEvent(new Event('ended'));
