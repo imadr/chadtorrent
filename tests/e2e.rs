@@ -595,20 +595,34 @@ async fn segment_stream_pipeline() {
     assert!(segs[0]["t"].as_f64().unwrap() < 1.0, "first segment starts at the head");
 
     // init + first segment serve as fMP4 with immutable caching.
-    let resp = client.get(format!("{http}/mse/{id}/init")).send().await.unwrap();
+    let generation = manifest["generation"].as_str().unwrap();
+    let resp = client.get(format!("{http}/mse/{id}/init?g={generation}")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["content-type"], "video/mp4");
     let init = resp.bytes().await.unwrap();
     assert!(&init[4..8] == b"ftyp");
 
-    let resp = client.get(format!("{http}/mse/{id}/seg/1")).send().await.unwrap();
+    let resp = client.get(format!("{http}/mse/{id}/seg/1?g={generation}")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let seg = resp.bytes().await.unwrap();
     assert!(&seg[4..8] == b"moof" || &seg[4..8] == b"sidx" || &seg[4..8] == b"styp");
 
     // Unknown segment + unknown item -> 404.
-    let resp = client.get(format!("{http}/mse/{id}/seg/99999")).send().await.unwrap();
+    let resp = client.get(format!("{http}/mse/{id}/seg/99999?g={generation}")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
+
+    // A changed source gets new immutable URLs; stale browser cache entries
+    // cannot be mixed with the new init/segments.
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&file).unwrap()
+            .write_all(&[0, 0, 0, 8, b'f', b'r', b'e', b'e']).unwrap();
+    }
+    let changed: serde_json::Value = client.get(format!("{http}/api/library/{id}/stream"))
+        .send().await.unwrap().json().await.unwrap();
+    assert_ne!(changed["generation"], manifest["generation"]);
+    let resp = client.get(format!("{http}/mse/{id}/init?g={generation}")).send().await.unwrap();
+    assert_eq!(resp.status(), 410);
     let resp = client.get(format!("{http}/api/library/999999/stream")).send().await.unwrap();
     assert_eq!(resp.status(), 404);
 

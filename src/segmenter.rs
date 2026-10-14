@@ -47,6 +47,7 @@ pub struct SegMeta {
 
 #[derive(Debug, Default, Clone)]
 pub struct SegInfo {
+    pub generation: String,
     pub running: bool,
     pub done: bool,
     pub error: Option<String>,
@@ -91,7 +92,7 @@ impl Segmenter {
             id,
             file,
             dir,
-            info: Mutex::new(SegInfo::default()),
+            info: Mutex::new(SegInfo { generation: generation_id(), ..SegInfo::default() }),
             task: Mutex::new(None),
         }
     }
@@ -115,6 +116,12 @@ impl Segmenter {
         info.running = false;
         info.error = Some(msg);
     }
+}
+
+fn generation_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    format!("{time:x}-{:x}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 enum Input {
@@ -258,7 +265,7 @@ impl SegmenterManager {
     pub async fn ensure(&self, id: i64, file: Option<String>) -> Arc<Segmenter> {
         let key = (id, file.clone());
         let mut map = self.map.lock().await;
-        if let Some(seg) = map.get(&key) {
+        if let Some(seg) = map.get(&key).cloned() {
             // If the source file changed since we last cut it (torrent resumed
             // mid-stream, piece reverification, re-download), the cached
             // segments no longer match the file: reset and re-cut.
@@ -274,51 +281,44 @@ impl SegmenterManager {
                     "source changed for item {} file {:?} — re-cutting segments",
                     id, file
                 );
-                if let Some(t) = seg.task.lock().unwrap().take() {
+                let task = seg.task.lock().unwrap().take();
+                if let Some(t) = task {
                     t.abort();
+                    let _ = t.await;
                 }
                 if let Err(e) = tokio::fs::remove_dir_all(&seg.dir).await {
                     warn!("failed to wipe stale segment dir {:?}: {e}", seg.dir);
                 }
-                if let Err(e) = tokio::fs::create_dir_all(&seg.dir).await {
-                    warn!("failed to create segment dir {:?}: {e}", seg.dir);
+                map.remove(&key);
+            } else {
+                // Retry unresolved torrent metadata, serializing startup so two
+                // manifest requests cannot launch writers for the same cache.
+                let needs_start = {
+                    let info = seg.info.lock().unwrap();
+                    info.error.is_none() && !info.done && seg.task.lock().unwrap().is_none()
+                };
+                if needs_start {
+                    if let Some(input) = self.resolve_input(&seg).await {
+                        let seg2 = seg.clone();
+                        let h = tokio::spawn(async move { run_segmenter(seg2, input).await });
+                        *seg.task.lock().unwrap() = Some(h);
+                    }
                 }
-                *seg.info.lock().unwrap() = SegInfo::default();
-                if let Some(input) = self.resolve_input(seg).await {
-                    let seg2 = seg.clone();
-                    let h = tokio::spawn(async move { run_segmenter(seg2, input).await });
-                    *seg.task.lock().unwrap() = Some(h);
-                }
-                return seg.clone();
-            }
-            // The input may only become resolvable later (metadata still
-            // downloading, torrent still registering) — retry on each poll
-            // until a task is actually running or the run has concluded.
-            let needs_start = {
-                let info = seg.info.lock().unwrap();
-                info.error.is_none() && !info.done && seg.task.lock().unwrap().is_none()
-            };
-            if needs_start {
-                if let Some(input) = self.resolve_input(seg).await {
-                    let seg2 = seg.clone();
-                    let h = tokio::spawn(async move { run_segmenter(seg2, input).await });
-                    *seg.task.lock().unwrap() = Some(h);
-                }
-            }
-            return seg.clone();
-        }
-        let dir = self.seg_dir(id, file.as_deref());
-        if dir.exists() {
-            if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
-                warn!("failed to wipe stale segment dir {:?}: {e}", dir);
+                return seg;
             }
         }
+        let parent = self.seg_dir(id, file.as_deref());
+        if parent.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&parent).await {
+                warn!("failed to wipe stale segment dir {:?}: {e}", parent);
+            }
+        }
+        let dir = parent.join(generation_id());
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
             warn!("failed to create segment dir {:?}: {e}", dir);
         }
         let seg = Arc::new(Segmenter::new(id, file, dir));
         map.insert(key, seg.clone());
-        drop(map);
 
         if let Some(input) = self.resolve_input(&seg).await {
             let seg2 = seg.clone();
@@ -334,7 +334,7 @@ impl SegmenterManager {
 
     fn seg_dir(&self, id: i64, file: Option<&str>) -> PathBuf {
         match file {
-            None => self.seg_root(id),
+            None => self.seg_root(id).join("default"),
             Some(path) => self.seg_root(id).join(format!("{:016x}", fnv1a(path))),
         }
     }

@@ -12,6 +12,7 @@ function engine() {
   const c = vm.createContext({
     console, Uint8Array, DataView, Map, Event, EventTarget, AbortController,
     performance, setTimeout, clearTimeout,
+    URLSearchParams,
     setInterval: fn => timers.push(fn), requestAnimationFrame: () => 1,
     window: {}, v: new EventTarget(), fullDur: 100,
     $: () => ({ getContext: () => ({ drawImage() {} }) }),
@@ -174,4 +175,13 @@ test('manifest errors after playback starts are surfaced, not retried forever', 
   await assert.rejects(c.refreshManifest(0, 1), /no playable segments/);
   c.api = async () => { throw new Error('server unreachable'); };
   await assert.rejects(c.refreshManifest(0, 1), /server unreachable/);
+});
+test('a new segment generation rebuilds playback instead of retaining stale manifest entries', async () => {
+  const c = engine();
+  c.P.id = 1; c.P.generation = 'old'; c.segFileQ = () => '';
+  c.api = async () => ({ generation: 'new', segments: [] });
+  let rebuilt = false;
+  c.reloadStream = async () => { rebuilt = true; };
+  await c.refreshManifest(0, 1);
+  assert.equal(rebuilt, true);
 });

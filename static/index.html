@@ -2314,6 +2314,7 @@ function waitFeed(ms = 250) {
 
 const P = {
   id: null, tracks: null, segs: new Map(), segMaxN: 0, done: false,
+  generation: null,
   vdec: null, adec: null,
   vq: [], aq: [],             // decoded, not yet shown/played
   chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
@@ -2620,7 +2621,13 @@ function ascExplicitSbr(asc) {
 }
 
 async function fetchSegBuf(id, name) {
-  const r = await fetch('/mse/' + id + '/' + name + segFileQ(), { signal: segAbort ? segAbort.signal : undefined });
+  const q = new URLSearchParams();
+  if (currentFile) q.set('file', currentFile);
+  if (P.generation) q.set('g', P.generation);
+  const r = await fetch('/mse/' + id + '/' + name + '?' + q, { signal: segAbort ? segAbort.signal : undefined });
+  if (r.status === 410) {
+    const error = new Error('Stream cache changed'); error.streamChanged = true; throw error;
+  }
   if (r.status === 404) return null;
   if (!r.ok) {
     console.error('[ct] segment fetch failed:', name, 'HTTP', r.status);
@@ -2877,6 +2884,9 @@ setInterval(() => {
 async function refreshManifest(gen, id) {
   const info = await api('/api/library/' + id + '/stream' + segFileQ(), { signal: segAbort?.signal });
   if (gen !== segGen || P.id !== id) return;
+  if (P.generation && info.generation !== P.generation) {
+    await reloadStream(); return;
+  }
   if (info.error) throw new Error(info.error);
   if (info.state === 'error') throw new Error('Torrent failed to download');
   if (info.done && !info.segments.length) throw new Error('Remux produced no playable segments');
@@ -2884,6 +2894,17 @@ async function refreshManifest(gen, id) {
   P.done = !!info.done;
   for (const s of info.segments) if (!P.segs.has(s.n)) P.segs.set(s.n, s.t);
   if (info.segments.length) P.segMaxN = info.segments[info.segments.length - 1].n;
+}
+
+async function reloadStream() {
+  const id = P.id, position = P.lastT, paused = P.paused;
+  teardownWC(true);
+  P.id = id; P.lastT = position; P.paused = paused;
+  showBufProgress();
+  const startup = startEngine(position), gen = segGen;
+  try { await startup; }
+  catch (e) { if (gen === segGen && P.id === id) segFatal(e); return; }
+  if (activeSub) applySubTrack();
 }
 
 function seekChunks(ch, target) {
@@ -2905,7 +2926,10 @@ function seekChunks(ch, target) {
 async function feedLoop(gen, id) {
   let fetching = null, failure = null, pollAt = 0;
   while (gen === segGen && P.id === id) {
-    if (failure) throw failure;
+    if (failure) {
+      if (failure.streamChanged) { await reloadStream(); return; }
+      throw failure;
+    }
     let worked = false;
     if (P.chunksA.length && P.aq.length < 700 && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
       for (let i = 0; i < 64 && P.chunksA.length && P.aq.length < 700 && P.adec.decodeQueueSize < 80; i++) P.adec.decode(P.chunksA.shift());
@@ -2971,14 +2995,16 @@ function segContaining(t) {
  * is silently rejected, the clock pins, video freezes on one frame. So the
  * synchronous part of playTorrent — still inside the click handler — creates
  * and resumes it, and startEngine reuses whatever survived. */
-function ensureCtx() {
+function ensureCtx(resume = true) {
   if (!P.ctx) {
     P.ctx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (!P.gain) {
     P.gain = P.ctx.createGain();
     P.gain.gain.value = P.muted ? 0 : P.vol;
     P.gain.connect(P.ctx.destination);
   }
-  if (P.ctx.state === 'suspended') P.ctx.resume().catch(() => {});
+  if (resume && P.ctx.state === 'suspended') P.ctx.resume().catch(() => {});
   return P.ctx;
 }
 
@@ -2993,7 +3019,7 @@ function playerPause() {
   if (!P.paused) { P.paused = true; v.dispatchEvent(new Event('pause')); }
 }
 
-async function startEngine() {
+async function startEngine(position = 0) {
   const gen = ++segGen;
   const id = P.id;
   if (segAbort) segAbort.abort();
@@ -3025,6 +3051,7 @@ async function startEngine() {
   if (gen !== segGen || P.id !== id) return;
   fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
   P.done = !!info.done;
+  P.generation = info.generation;
   P.segs = new Map(info.segments.map(s => [s.n, s.t]));
   P.segMaxN = info.segments.length ? info.segments[info.segments.length - 1].n : 0;
   const codecs = parseMime(info.mime);
@@ -3046,7 +3073,7 @@ async function startEngine() {
   P.noAudio = !atr;
   P.acfgs = null; P.acfgIdx = 0;
 
-  ensureCtx();
+  ensureCtx(!P.paused);
   P.nextAt = 0;
   P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: 0 };   // video-only master base
 
@@ -3169,7 +3196,8 @@ async function startEngine() {
   v.dispatchEvent(new Event('loadedmetadata'));
   P.canplaySent = false;
   if (!P.tickOn) { P.tickOn = true; P.raf = requestAnimationFrame(drawTick); }
-  feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
+  if (position > 0) seekTo(position);
+  else feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
 }
 
 async function playTorrent(item, file) {
@@ -3297,13 +3325,14 @@ function segFatal(e) {
   showBuf('Playback error: ' + (e.message || e), true);
 }
 
-function teardownWC() {
+function teardownWC(keepContext = false) {
   wakeFeed();
   if (P.raf) cancelAnimationFrame(P.raf);
   P.raf = 0;
   pendSeek = null; pendSeekAt = 0;
   if (segAbort) { segAbort.abort(); segAbort = null; }
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
+  P.generation = null;
   P.vcfg = null; P.acfgs = null; P.acfgIdx = 0;
   P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0; P.aTrimUs = 0;
   P.vDrained = false; P.aDrained = false; P.flushV = null; P.flushA = null; P.videoEnd = 0;
@@ -3316,7 +3345,7 @@ function teardownWC() {
   if (P.vdec) { try { P.vdec.close(); } catch (e) {} P.vdec = null; }
   if (P.adec) { try { P.adec.close(); } catch (e) {} P.adec = null; }
   if (P.gain) { try { P.gain.disconnect(); } catch (e) {} P.gain = null; }
-  if (P.ctx) { const c = P.ctx; P.ctx = null; c.close().catch(() => {}); }
+  if (P.ctx && !keepContext) { const c = P.ctx; P.ctx = null; c.close().catch(() => {}); }
   P.anchor = null; P.nextAt = 0; P.sched = []; P.noAudio = false; P.wall = null; P.paused = true; P.lastT = 0; P.flow = 0;
   P.fetchN = 1; P.fedUntil = 0; P.tickOn = false; P.canplaySent = false;
   wasWaiting = false;

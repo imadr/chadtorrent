@@ -903,6 +903,7 @@ async fn stream_info(
         .map(|i| i.state)
         .unwrap_or_default();
     Ok(Json(json!({
+        "generation": snap.generation,
         "mime": snap.mime,
         "duration": snap.duration,
         "done": snap.done,
@@ -945,6 +946,9 @@ async fn seg_init(
     let Some(seg) = state.library.segments.get(id, file).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if params.get("g").and_then(|g| g.as_str()) != Some(seg.snapshot().generation.as_str()) {
+        return StatusCode::GONE.into_response();
+    }
     serve_seg_file(&seg.dir, "init.mp4").await
 }
 
@@ -959,6 +963,9 @@ async fn seg_n(
     let Some(seg) = state.library.segments.get(id, file).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if params.get("g").and_then(|g| g.as_str()) != Some(seg.snapshot().generation.as_str()) {
+        return StatusCode::GONE.into_response();
+    }
     serve_seg_file(&seg.dir, &format!("seg-{n}.m4s")).await
 }
 
