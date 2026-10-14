@@ -2309,6 +2309,8 @@ const P = {
   vq: [], aq: [],             // decoded, not yet shown/played
   chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
   fetchN: 1, fedUntil: 0, eof: false, endedFired: false, needKey: false,
+  vDrained: false, aDrained: false, flushV: null, flushA: null, videoEnd: 0,
+  seekLastFrame: null,
   seekFloor: 0,               // after a seek: drop decoded outputs older than this
   seekVideoReady: false, seekAudioReady: false,
   aStepUs: 0,                 // container's per-packet audio duration (clock truth)
@@ -2337,8 +2339,7 @@ const P = {
  *  - no audio track at all: the wall clock IS the master (anchored at each
  *    seek; ctx.suspend on pause freezes it like the audio clock). */
 function audioEnded() {
-  if (!P.eof || P.chunksA.length || P.aq.length) return false;
-  if (P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize > 0) return false;
+  if (!P.aDrained || P.aq.length) return false;
   if (!P.anchor) return true;   // e.g. a seek past the last audio packet
   return P.anchor.ctx <= P.ctx.currentTime + 0.02;
 }
@@ -2634,15 +2635,24 @@ function onDecErr(which) {
  * re-anchored at the segment start 1106.6, pendSeek unresolved ~8s). Closing
  * them lets the keyframe→target tail decode at full speed; the first KEPT
  * output is already at the target. */
-function mkVdec() {
-  const dec = new VideoDecoder({
-    output: (frame) => {
+function queueVideoFrame(dec, frame) {
       if (P.vdec !== dec) { try { frame.close(); } catch (e) {} return; }
-      if (P.seekFloor > 0 && frame.timestamp / 1e6 + (frame.duration || 0) / 1e6 <= P.seekFloor) { frame.close(); return; }
+      P.videoEnd = Math.max(P.videoEnd, (frame.timestamp + (frame.duration || 0)) / 1e6);
+      if (P.seekFloor > 0 && frame.timestamp / 1e6 + (frame.duration || 0) / 1e6 <= P.seekFloor) {
+        if (pendSeek != null) {
+          if (P.seekLastFrame) P.seekLastFrame.close();
+          P.seekLastFrame = frame; // retain just the last frame for a seek beyond video EOF
+        } else frame.close();
+        return;
+      }
+      if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
       P.vq.push(frame);
       P.seekVideoReady = true;
       finishSeek();
-    },
+}
+function mkVdec() {
+  const dec = new VideoDecoder({
+    output: (frame) => queueVideoFrame(dec, frame),
     error: (e) => { if (P.vdec === dec) onDecErr('video')(e); },
   });
   return dec;
@@ -2761,10 +2771,28 @@ function paint(frame) {
 // or fetched EOF. Keep the floor for this decoder generation: completing a seek
 // must not admit pre-target outputs that are still in flight.
 function finishSeek() {
-  if (pendSeek == null || !P.seekVideoReady || (!P.noAudio && !P.seekAudioReady)) return;
+  if (pendSeek == null || (!P.seekVideoReady && !P.vDrained)
+      || (!P.noAudio && !P.seekAudioReady && !P.aDrained)) return;
   P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: pendSeek };
   pendSeek = null; pendSeekAt = 0;
   v.dispatchEvent(new Event('seeked'));
+}
+
+function flushTail(which, gen) {
+  const video = which === 'V', key = video ? 'flushV' : 'flushA';
+  if (P[key]) return P[key];
+  const dec = video ? P.vdec : P.adec;
+  P[key] = (dec ? dec.flush() : Promise.resolve()).then(() => {
+    if (gen !== segGen || dec !== (video ? P.vdec : P.adec)) return;
+    if (video) {
+      P.vDrained = true;
+      if (!P.seekVideoReady && P.seekLastFrame) {
+        P.vq.push(P.seekLastFrame); P.seekLastFrame = null; P.seekVideoReady = true;
+      }
+    } else P.aDrained = true;
+    finishSeek();
+  });
+  return P[key];
 }
 
 let lastTU = 0, wasWaiting = false;
@@ -2821,8 +2849,8 @@ setInterval(() => {
   // Video-only: no anchor, just all queues drained. With audio: everything
   // decoded AND sounded (audioEnded covers decode side, anchor.ctx the sound
   // side — during the video tail the wall clock has already drained vq).
-  if (P.eof && !P.endedFired && !P.vq.length && !P.aq.length && P.chunksV.length === 0 && P.chunksA.length === 0
-      && (P.noAudio || audioEnded())) {
+  if (P.vDrained && !P.endedFired && !P.vq.length && !P.aq.length
+      && mediaNow() >= P.videoEnd - 0.01 && (P.noAudio || audioEnded())) {
     P.endedFired = true;
     v.dispatchEvent(new Event('ended'));
   }
@@ -2862,12 +2890,14 @@ async function feedLoop(gen, id) {
     if (t === undefined) {
       if (P.done) {
         P.eof = true;
-        // EOF ≠ stop demuxing work: the decode branches above must keep
-        // running until every demuxed chunk is handed to a decoder — a movie
-        // whose video outlasts its audio froze here with minutes of chunksA
-        // undecoded (audio clock pinned, video tail unplayable, 'ended'
-        // never fired). Only leave when there is nothing left to decode.
-        if (!P.chunksA.length && !P.chunksV.length) return;
+        // Drain each track independently. Audio may finish before video; its
+        // flush must complete before the clock can hand off to the video tail.
+        if (!P.chunksA.length) flushTail('A', gen).catch(e => { if (gen === segGen) segFatal(e); });
+        if (!P.chunksV.length) flushTail('V', gen).catch(e => { if (gen === segGen) segFatal(e); });
+        if (!P.chunksA.length && !P.chunksV.length) {
+          await Promise.all([P.flushA, P.flushV]);
+          return;
+        }
         await segSleep(100);
         continue;
       }
@@ -3022,7 +3052,7 @@ async function startEngine() {
     let failed = false;
     let cerr = () => {};
     const dec = new VideoDecoder({
-      output: (f) => { if (P.vdec === dec) P.vq.push(f); else { try { f.close(); } catch (e) {} } },
+      output: (f) => queueVideoFrame(dec, f),
       error: (e) => cerr(e),
     });
     P.vdec = dec;
@@ -3170,6 +3200,8 @@ function seekTo(globalT, partyOrigin) {
   P.seekFloor = globalT;                // discard outputs ending before the target
   P.seekVideoReady = false; P.seekAudioReady = false;
   P.eof = false; P.endedFired = false;
+  P.vDrained = false; P.aDrained = false; P.flushV = null; P.flushA = null; P.videoEnd = 0;
+  if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }
   P.vq.length = 0;
@@ -3235,6 +3267,8 @@ function teardownWC() {
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
   P.vcfg = null; P.acfgs = null; P.acfgIdx = 0;
   P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0; P.aTrimUs = 0;
+  P.vDrained = false; P.aDrained = false; P.flushV = null; P.flushA = null; P.videoEnd = 0;
+  if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
   P.chunksV.length = 0; P.chunksA.length = 0;
   for (const f of P.vq) { try { f.close(); } catch (e) {} }
   P.vq.length = 0;

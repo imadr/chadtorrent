@@ -91,7 +91,9 @@ test('seek completion keeps rejecting in-flight preroll and waits for both track
     const f = { timestamp: ts * 1e6, duration: dur * 1e6, close() { this.closed = true; } };
     decoder.callbacks.output(f); return f;
   };
-  assert.equal(output(c.P.vdec, 5, 0.04).closed, true);
+  const preroll = output(c.P.vdec, 5, 0.04);
+  output(c.P.vdec, 6, 0.04);
+  assert.equal(preroll.closed, true);
   output(c.P.vdec, 9.99, 0.04);
   assert.equal(vm.runInContext('pendSeek', c), 10);
   output(c.P.adec, 9.99, 0.02);
@@ -120,4 +122,31 @@ test('explicit SBR ASC carries both object types and the original core configura
   assert.equal(parseInt(bits.slice(17, 22), 2), 2);
   assert.equal(result.outRate, 44100);
   assert.equal(c.ascExplicitSbr(result.asc), null);
+});
+test('EOF waits for asynchronous decoder flush output before completing playback', async () => {
+  const c = engine();
+  let release;
+  Object.assign(c.P, { id: 1, noAudio: true, eof: true, lastT: 100 });
+  c.P.vdec = { flush: () => new Promise(r => release = r) };
+  let ended = 0;
+  c.v.addEventListener('ended', () => ended++);
+  const draining = c.flushTail('V', 0);
+  c.timers[0]();
+  assert.equal(ended, 0);
+  c.P.vq.push({ timestamp: 99e6, close() {} });
+  c.P.videoEnd = 100;
+  release(); await draining;
+  c.timers[0]();
+  assert.equal(ended, 0);
+  c.P.vq.length = 0;
+  c.timers[0]();
+  assert.equal(ended, 1);
+});
+test('audio EOF is determined by flush completion, not decodeQueueSize', async () => {
+  const c = engine();
+  c.P.adec = { decodeQueueSize: 0, flush: async () => {} };
+  c.P.eof = true;
+  assert.equal(c.audioEnded(), false);
+  await c.flushTail('A', 0);
+  assert.equal(c.audioEnded(), true);
 });
