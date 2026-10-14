@@ -2660,15 +2660,15 @@ function queueVideoFrame(dec, frame) {
   P.seekVideoReady = true;
   finishSeek();
 }
-function mkVdec() {
+function mkVdec(onError = onDecErr('video')) {
   const dec = new VideoDecoder({
     output: (frame) => queueVideoFrame(dec, frame),
-    error: (e) => { if (P.vdec === dec) onDecErr('video')(e); },
+    error: (e) => { if (P.vdec === dec) onError(e); },
   });
   dec.addEventListener?.('dequeue', wakeFeed);
   return dec;
 }
-function mkAdec() {
+function mkAdec(onError = onAudioDecErr) {
   const dec = new AudioDecoder({
     output: (ad) => {
       wakeFeed();
@@ -2693,7 +2693,7 @@ function mkAdec() {
       P.seekAudioReady = true;
       finishSeek();
     },
-    error: (e) => { if (P.adec === dec) onAudioDecErr(e); },
+    error: (e) => { if (P.adec === dec) onError(e); },
   });
   dec.addEventListener?.('dequeue', wakeFeed);
   return dec;
@@ -3048,9 +3048,13 @@ async function startEngine(position = 0) {
   // the head pieces, which is exactly the buffering we want to show.
   let info = null;
   for (;;) {
-    if (gen !== segGen || P.id !== id) return;
-    try { info = await api('/api/library/' + id + '/stream' + segFileQ()); }
-    catch (e) { throw new Error(String(e.message || e).includes('not found') ? 'Item is gone' : 'Server unreachable'); }
+    if (gen !== segGen || P.id !== id) return false;
+    try { info = await api('/api/library/' + id + '/stream' + segFileQ(), { signal: segAbort.signal }); }
+    catch (e) {
+      if (gen !== segGen || P.id !== id) return false;
+      throw new Error(String(e.message || e).includes('not found') ? 'Item is gone' : 'Server unreachable');
+    }
+    if (gen !== segGen || P.id !== id) return false;
     if (info.error) throw new Error(info.error);
     if (info.state === 'error') throw new Error('Torrent failed to download');
     // A finished cut that never produced a codec string: the server could not
@@ -3066,7 +3070,7 @@ async function startEngine(position = 0) {
     if (info.mime && info.timing && info.segments.length && (info.done || !ready)) break;
     await segSleep(500);
   }
-  if (gen !== segGen || P.id !== id) return;
+  if (gen !== segGen || P.id !== id) return false;
   fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
   P.done = !!info.done;
   P.generation = info.generation;
@@ -3078,12 +3082,12 @@ async function startEngine(position = 0) {
   // init segment: sample tables + codec description (hvcC/avcC/esds)
   let initBuf = null;
   for (;;) {
-    if (gen !== segGen || P.id !== id) return;
+    if (gen !== segGen || P.id !== id) return false;
     initBuf = await fetchSegBuf(id, 'init');
     if (initBuf) break;
     await segSleep(500);
   }
-  if (gen !== segGen || P.id !== id) return;
+  if (gen !== segGen || P.id !== id) return false;
   const trks = parseInit(initBuf);
   P.tracks = trks;
   const vtr = [...trks.values()].find(t => t.kind === 'video');
@@ -3130,20 +3134,17 @@ async function startEngine(position = 0) {
     // H.264 it cratered real-browser decode throughput to around playback
     // speed (laggy burst-painted video forever chasing the audio clock).
     if (vtr.w && vtr.h) { c.codedWidth = vtr.w; c.codedHeight = vtr.h; }
-    let failed = false;
-    let cerr = () => {};
-    const dec = new VideoDecoder({
-      output: (f) => queueVideoFrame(dec, f),
-      error: (e) => cerr(e),
-    });
+    let failed = false, accepted = false;
+    const dec = mkVdec(e => { if (accepted) onDecErr('video')(e); else failed = true; });
     P.vdec = dec;
-    try { dec.configure(c); } catch (e) {}
+    try { dec.configure(c); } catch (e) { failed = true; }
     await segSleep(250);   // give an async reject time to surface
+    if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
     if (failed || dec.state !== 'configured') {
-      failed = false; cerr = () => {};
       try { dec.close(); } catch (e) {}
       continue;
     }
+    accepted = true;
     vcfg = c;
     break;
   }
@@ -3179,12 +3180,14 @@ async function startEngine(position = 0) {
     }
     P.acfgIdx = 0;
     for (let i = 0; i < P.acfgs.length; i++) {
-      const dec = mkAdec();
+      let failed = false, accepted = false;
+      const dec = mkAdec(e => { if (accepted) onAudioDecErr(e); else failed = true; });
       P.adec = dec;
       try {
         dec.configure(P.acfgs[i]);
         await segSleep(120);
-        if (dec.state === 'configured') { P.acfgIdx = i; break; }
+        if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
+        if (!failed && dec.state === 'configured') { P.acfgIdx = i; accepted = true; break; }
       } catch (e) {}
       try { dec.close(); } catch (_e) {}
       P.adec = null;
@@ -3197,6 +3200,7 @@ async function startEngine(position = 0) {
   if (!P.tickOn) { P.tickOn = true; P.raf = requestAnimationFrame(drawTick); }
   if (position > 0) seekTo(position);
   else feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
+  return true;
 }
 
 async function playTorrent(item, file) {
@@ -3216,9 +3220,11 @@ async function playTorrent(item, file) {
   $('ctrl').style.display = 'block';
   showBuf('Loading…');
   P.id = item.id;
+  const startup = startEngine(), gen = segGen;
   try {
-    await startEngine();
+    if (!await startup || gen !== segGen || P.id !== item.id) return;
   } catch (e) {
+    if (gen !== segGen || P.id !== item.id) return;
     if (e.name === 'AbortError') return;
     stopPlayback();
     hideBuf();

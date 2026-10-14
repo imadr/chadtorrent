@@ -42,7 +42,7 @@ function fragment({ defaults = [], tfhdFlags = 0, runFlags = 0, rows = [], count
 function tracks(defaults = {}) {
   return new Map([[1, { kind: 'video', timescale: 1000, trex: { dur: 0, size: 0, flags: 0, ...defaults } }]]);
 }
-async function startVideoOnly(c) {
+async function startVideoOnly(c, beforeStart = () => {}) {
   c.api = async () => ({ done: true, mime: 'video/mp4; codecs="avc1.64001E"', timing: { video_offset: 0, audio_offset: null, audio_skip_until: 0 }, duration: 90, segments: [{ n: 1, t: 0 }] });
   c.items = []; c.segFileQ = () => '';
   c.fetchSegBuf = async () => new ArrayBuffer(0);
@@ -52,6 +52,7 @@ async function startVideoOnly(c) {
   c.feedLoop = async () => {};
   c.setTimeout = fn => { queueMicrotask(fn); return 0; };
   c.P.id = 1;
+  beforeStart();
   await c.startEngine();
 }
 
@@ -224,4 +225,34 @@ test('partial final AAC packets trim decoder padding instead of triggering a fal
   c.P.adec.callbacks.output({ timestamp: 1e6, duration: 21333, numberOfFrames: 1024, sampleRate: 48000 });
   assert.equal(c.P.aq.length, 1);
   assert.equal(c.P.audioLengths.get(1e6), 640);
+});
+test('the accepted startup decoder surfaces later decode errors', async () => {
+  const c = engine();
+  let failure;
+  c.segFatal = e => failure = e.message;
+  await startVideoOnly(c, () => {
+    c.VideoDecoder = class {
+      constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; }
+      configure() { this.state = 'configured'; }
+    };
+  });
+  c.P.vdec.callbacks.error(new Error('hardware decoder failed'));
+  assert.match(failure, /hardware decoder failed/);
+});
+test('a superseded startup cannot install its codec into the new session', async () => {
+  const c = engine();
+  await startVideoOnly(c, () => {
+    c.setTimeout = fn => {
+      vm.runInContext('segGen++', c);
+      c.P.id = 2;
+      queueMicrotask(fn); return 0;
+    };
+    c.VideoDecoder = class {
+      constructor() { this.state = 'unconfigured'; }
+      configure() { this.state = 'configured'; }
+      close() { this.state = 'closed'; }
+    };
+  });
+  assert.equal(c.P.id, 2);
+  assert.equal(c.P.vcfg, undefined);
 });
