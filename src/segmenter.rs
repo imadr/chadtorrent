@@ -497,8 +497,6 @@ struct SegmentSplitter {
     /// baseMediaDecodeTime of the first fragment in `current` (in track
     /// timescale ticks).
     seg_start: Option<u64>,
-    /// baseMediaDecodeTime of the most recent fragment.
-    last_tfdt: u64,
     /// Presentation time (tfdt + first composition offset) of the most recent
     /// fragment — matches the browser's buffered timeline, unlike the raw tfdt.
     last_pts: u64,
@@ -519,7 +517,6 @@ impl SegmentSplitter {
             init: Vec::new(),
             init_done: false,
             seg_start: None,
-            last_tfdt: 0,
             last_pts: 0,
             timescale: 0,
             video_track_id: 0,
@@ -552,26 +549,26 @@ impl SegmentSplitter {
 
         match &box_.typ {
             b"moof" => {
-                self.pending.extend_from_slice(&box_.raw);
-                if let Some((tfdt, pts0)) = parse_moof_video_start(box_.body(), self.video_track_id)
+                if let Some((_, pts0)) = parse_moof_video_start(box_.body(), self.video_track_id)
                 {
-                    self.last_tfdt = tfdt;
+                    // The new fragment belongs to the NEXT segment when its
+                    // start reaches the target, not to the segment being closed.
+                    if let Some(start) = self.seg_start {
+                        let span = pts0.saturating_sub(start) as f64 / self.timescale.max(1) as f64;
+                        if span >= SEG_TARGET_SECS {
+                            self.close_segment().await?;
+                        }
+                    }
                     self.last_pts = pts0;
                 }
+                self.pending.extend_from_slice(&box_.raw);
             }
             b"mdat" => {
                 self.current.extend_from_slice(&self.pending);
                 self.pending.clear();
                 self.current.extend_from_slice(&box_.raw);
                 if self.timescale > 0 {
-                    // Segment boundaries in PRESENTATION time: the manifest's
-                    // `t` must match where the browser actually buffers the
-                    // media, or the pump's coverage check misfires.
-                    let start = *self.seg_start.get_or_insert(self.last_pts);
-                    let span = (self.last_pts.saturating_sub(start)) as f64 / self.timescale as f64;
-                    if span >= SEG_TARGET_SECS {
-                        self.close_segment().await?;
-                    }
+                    self.seg_start.get_or_insert(self.last_pts);
                 }
             }
             // sidx and friends belong to the fragment that follows them.
@@ -778,6 +775,9 @@ fn parse_trun_first_cts(body: &[u8]) -> Option<i64> {
     let version = body[0] & 1;
     let flags = u32::from_be_bytes([0, body[1], body[2], body[3]]);
     let count = u32::from_be_bytes([body[4], body[5], body[6], body[7]]) as usize;
+    if count == 0 {
+        return None;
+    }
     let mut p = 8usize;
     if flags & 0x000001 != 0 {
         p += 4; // data_offset
@@ -918,6 +918,27 @@ mod tests {
         v.extend_from_slice(typ);
         v.extend_from_slice(payload);
         v
+    }
+
+    #[tokio::test]
+    async fn cuts_before_the_fragment_at_the_target_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let seg = Arc::new(Segmenter::new(1, None, dir.path().to_owned()));
+        let mut splitter = SegmentSplitter::new(seg.clone()).unwrap();
+        splitter.init_done = true;
+        splitter.video_track_id = 1;
+        splitter.timescale = 1000;
+        for t in [0u32, 2000, 4000, 6000, 8000] {
+            let tfhd = box_bytes(b"tfhd", &[0u32.to_be_bytes(), 1u32.to_be_bytes()].concat());
+            let tfdt = box_bytes(b"tfdt", &[0u32.to_be_bytes(), t.to_be_bytes()].concat());
+            let moof = box_bytes(b"moof", &box_bytes(b"traf", &[tfhd, tfdt].concat()));
+            splitter.feed(&[moof, box_bytes(b"mdat", b"packet")].concat()).await.unwrap();
+        }
+        splitter.finish().await.unwrap();
+        let starts: Vec<f64> = seg.snapshot().segments.iter().map(|s| s.t).collect();
+        assert_eq!(starts, vec![0.0, 4.0, 8.0]);
+        let first = std::fs::read(dir.path().join("seg-1.m4s")).unwrap();
+        assert_eq!(top_boxes(&first).iter().filter(|(ty, _)| *ty == *b"moof").count(), 2);
     }
 
     #[test]
