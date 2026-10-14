@@ -2976,7 +2976,13 @@ async function feedLoop(gen, id) {
       const n = P.fetchN;
       fetching = fetchSegBuf(id, 'seg/' + n).then(async buf => {
         if (gen !== segGen || P.id !== id) return;
-        if (!buf) { pollAt = performance.now() + 400; return; }
+        if (!buf) {
+          // After a server restart its segment map is empty until the manifest
+          // recreates the cache. A known segment's 404 is not always a frontier.
+          await refreshManifest(gen, id);
+          pollAt = performance.now() + 400;
+          return;
+        }
         const parsed = parseSeg(buf, P.tracks);
         if (P.timing?.audio_offset == null && [...parsed.keys()].some(tid => P.tracks.get(tid)?.kind === 'audio')) {
           await refreshManifest(gen, id);

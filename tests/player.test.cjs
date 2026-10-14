@@ -62,6 +62,20 @@ test('single-fragment tails use tfhd timing without neighboring fragments', () =
   assert.deepEqual(Array.from(samples, s => s.dts), [100, 140, 180]);
   assert.equal(samples[1].key, false);
 });
+test('initialization reads trex inside mvex rather than directly under moov', () => {
+  const c = engine();
+  const tkhd = Buffer.alloc(84); tkhd.writeUInt32BE(1, 12);
+  const mdhd = Buffer.alloc(24); mdhd.writeUInt32BE(1000, 12);
+  const hdlr = Buffer.alloc(24); hdlr.write('vide', 8);
+  const entry = Buffer.alloc(86); entry.writeUInt32BE(86, 0); entry.write('avc1', 4);
+  const init = box('moov', box('mvex', box('trex', u32(0, 1, 1, 40, 4, 0x10000))),
+    box('trak', box('tkhd', tkhd), box('mdia', box('mdhd', mdhd), box('hdlr', hdlr),
+      box('minf', box('stbl', box('stsd', u32(0, 1), entry))))));
+  const parsed = c.parseInit(arrayBuffer(init)).get(1);
+  assert.equal(parsed.trex.dur, 40);
+  assert.equal(parsed.trex.size, 4);
+  assert.equal(parsed.trex.flags, 0x10000);
+});
 test('trun explicit zero flags override tfhd defaults and durations can vary', () => {
   const c = engine();
   const samples = c.parseSeg(fragment({ tfhdFlags: 0x38, defaults: [40, 4, 0x10000], runFlags: 0x500, rows: [30, 0, 50, 0x10000, 20, 0x10000] }), tracks()).get(1);
@@ -255,4 +269,32 @@ test('a superseded startup cannot install its codec into the new session', async
   });
   assert.equal(c.P.id, 2);
   assert.equal(c.P.vcfg, undefined);
+});
+test('asynchronous configuration failures advance to the next decoder candidate', async () => {
+  const c = engine();
+  let attempts = 0;
+  await startVideoOnly(c, () => {
+    c.VideoDecoder = class {
+      constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; }
+      configure() {
+        this.state = 'configured';
+        if (++attempts === 1) queueMicrotask(() => this.callbacks.error(new Error('unsupported hardware config')));
+      }
+      close() { this.state = 'closed'; }
+    };
+  });
+  assert.equal(attempts, 2);
+  assert.equal(c.P.vdec.state, 'configured');
+});
+test('missing known segments refresh the manifest and recover after a server restart', async () => {
+  const c = engine();
+  Object.assign(c.P, { id: 1, generation: 'old', done: true, segs: new Map([[1, 0]]) });
+  c.segFileQ = () => '';
+  let fetches = 0, rebuilds = 0;
+  c.fetchSegBuf = async () => { if (++fetches > 3) throw new Error('repeated 404 without recovery'); return null; };
+  c.api = async () => ({ generation: 'new', segments: [{ n: 1, t: 0 }] });
+  c.reloadStream = async () => { rebuilds++; vm.runInContext('segGen++', c); };
+  await c.feedLoop(0, 1);
+  assert.equal(rebuilds, 1);
+  assert.equal(fetches, 1);
 });
