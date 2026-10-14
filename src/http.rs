@@ -884,7 +884,7 @@ async fn stream_info(
     let file = query_file(&params);
     let seg = state.library.segments.ensure(id, file).await;
     let snap = seg.snapshot();
-    if (snap.mime.is_none() || snap.duration.is_none()) && !snap.done {
+    if snap.mime.is_none() || snap.duration.is_none() {
         if let Some(p) = &snap.probe_path {
             if p.exists() {
                 let mime = Remuxer::probe_mse_mime(&p.to_string_lossy()).await;
@@ -906,6 +906,7 @@ async fn stream_info(
         "generation": snap.generation,
         "mime": snap.mime,
         "duration": snap.duration,
+        "timing": snap.timing,
         "done": snap.done,
         "error": snap.error,
         "state": state,

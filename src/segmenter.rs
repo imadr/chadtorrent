@@ -32,6 +32,7 @@ use tracing::{info, warn};
 use crate::db::Database;
 use crate::library::find_largest_video_in;
 use crate::torrent::TorrentEngine;
+use crate::remux::{Remuxer, SourceTiming};
 
 /// Target media duration per segment. Actual cuts happen at fragment
 /// boundaries (keyframes with `frag_keyframe`), so real durations vary.
@@ -54,6 +55,8 @@ pub struct SegInfo {
     pub segments: Vec<SegMeta>,
     pub mime: Option<String>,
     pub duration: Option<f64>,
+    pub timing: Option<StreamTiming>,
+    pub source_timing: Option<SourceTiming>,
     /// On-disk path to probe for codec metadata (the partial file while
     /// streaming). Not part of the manifest JSON.
     pub probe_path: Option<PathBuf>,
@@ -61,6 +64,13 @@ pub struct SegInfo {
     /// If the file has since changed (e.g. the torrent finished writing past
     /// where we cut), the segments are stale and must be re-cut.
     pub src_fingerprint: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StreamTiming {
+    pub video_offset: f64,
+    pub audio_offset: Option<f64>,
+    pub audio_skip_until: f64,
 }
 
 pub struct Segmenter {
@@ -458,6 +468,13 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
         Input::Stream { handle, file_id } => Some(InputProxy::start(StreamSource::Torrent { handle: handle.clone(), file_id: *file_id }).await?),
         _ => None,
     };
+    let source = match input {
+        Input::File(path) => path.to_string_lossy().into_owned(),
+        Input::Stream { .. } => proxy.as_ref().unwrap().url.clone(),
+    };
+    let timing = Remuxer::probe_source_timing(&source).await
+        .ok_or_else(|| anyhow::anyhow!("could not read source packet timestamps"))?;
+    seg.info.lock().unwrap().source_timing = Some(timing);
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error", "-xerror"]);
     match input {
@@ -472,7 +489,10 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
         "-map", "0:v:0?",
         "-map", "0:a:0?",
         "-c", "copy",
-        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        // Signed composition offsets avoid stretching the first audio packet
+        // to cover the video's B-frame decode lead-in. Track offset mapping then
+        // stays constant for every packet, including after the first fragment.
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets",
         "-f", "mp4",
         "pipe:1",
     ])
@@ -568,6 +588,7 @@ struct SegmentSplitter {
     /// The video track's id — tfdt values are per-track in the track's own
     /// timescale, so we must read the video traf's tfdt, not just any.
     video_track_id: u32,
+    audio_track: Option<(u32, u32)>,
     next_n: usize,
 }
 
@@ -584,6 +605,7 @@ impl SegmentSplitter {
             last_pts: 0,
             timescale: 0,
             video_track_id: 0,
+            audio_track: None,
             next_n: 1,
         })
     }
@@ -605,6 +627,7 @@ impl SegmentSplitter {
                     self.video_track_id = track_id;
                     self.timescale = timescale;
                 }
+                self.audio_track = parse_audio_track(&self.init);
                 write_atomic(&self.seg.dir, "init.mp4", &self.init).await?;
                 self.init.clear();
             }
@@ -615,6 +638,18 @@ impl SegmentSplitter {
             b"moof" => {
                 if let Some((_, pts0)) = parse_moof_video_start(box_.body(), self.video_track_id)
                 {
+                    {
+                        let mut info = self.seg.info.lock().unwrap();
+                        if info.timing.is_none() {
+                            if let Some(source) = &info.source_timing {
+                                info.timing = Some(StreamTiming {
+                                    video_offset: pts0 as f64 / self.timescale.max(1) as f64,
+                                    audio_offset: None,
+                                    audio_skip_until: source.audio_start.map(|a| a - source.video_start + source.audio_skip_seconds).unwrap_or(0.0),
+                                });
+                            }
+                        }
+                    }
                     // The new fragment belongs to the NEXT segment when its
                     // start reaches the target, not to the segment being closed.
                     if let Some(start) = self.seg_start {
@@ -624,6 +659,16 @@ impl SegmentSplitter {
                         }
                     }
                     self.last_pts = pts0;
+                }
+                if let Some((id, scale)) = self.audio_track {
+                    if let Some((_, pts)) = parse_moof_video_start(box_.body(), id) {
+                        let mut info = self.seg.info.lock().unwrap();
+                        let offset = info.source_timing.as_ref().and_then(|s| s.audio_start.map(|a|
+                            pts as f64 / scale as f64 - (a - s.video_start)));
+                        if let Some(timing) = &mut info.timing {
+                            if timing.audio_offset.is_none() { timing.audio_offset = offset; }
+                        }
+                    }
                 }
                 self.pending.extend_from_slice(&box_.raw);
             }
@@ -647,7 +692,8 @@ impl SegmentSplitter {
         }
         let n = self.next_n;
         self.next_n += 1;
-        let t = self.seg_start.take().unwrap_or(0) as f64 / self.timescale.max(1) as f64;
+        let offset = self.seg.snapshot().timing.map(|t| t.video_offset).unwrap_or(0.0);
+        let t = self.seg_start.take().unwrap_or(0) as f64 / self.timescale.max(1) as f64 - offset;
         let data = std::mem::take(&mut self.current);
         write_atomic(&self.seg.dir, &format!("seg-{n}.m4s"), &data).await?;
         let mut info = self.seg.info.lock().unwrap();
@@ -896,6 +942,18 @@ fn parse_video_track(init: &[u8]) -> Option<(u32, u32)> {
             }
         }
         return first;
+    }
+    None
+}
+
+fn parse_audio_track(init: &[u8]) -> Option<(u32, u32)> {
+    for (typ, raw) in top_boxes(init) {
+        if typ != *b"moov" { continue; }
+        for (typ, trak) in moov_children(raw) {
+            if typ == *b"trak" && trak_handler(trak) == Some(*b"soun") {
+                return trak_info(trak);
+            }
+        }
     }
     None
 }

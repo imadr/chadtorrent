@@ -43,7 +43,7 @@ function tracks(defaults = {}) {
   return new Map([[1, { kind: 'video', timescale: 1000, trex: { dur: 0, size: 0, flags: 0, ...defaults } }]]);
 }
 async function startVideoOnly(c) {
-  c.api = async () => ({ done: true, mime: 'video/mp4; codecs="avc1.64001E"', duration: 90, segments: [{ n: 1, t: 0 }] });
+  c.api = async () => ({ done: true, mime: 'video/mp4; codecs="avc1.64001E"', timing: { video_offset: 0, audio_offset: null, audio_skip_until: 0 }, duration: 90, segments: [{ n: 1, t: 0 }] });
   c.items = []; c.segFileQ = () => '';
   c.fetchSegBuf = async () => new ArrayBuffer(0);
   c.parseInit = () => new Map([[1, { kind: 'video', w: 64, h: 64, codec4cc: 'avc1' }]]);
@@ -184,4 +184,44 @@ test('a new segment generation rebuilds playback instead of retaining stale mani
   c.reloadStream = async () => { rebuilt = true; };
   await c.refreshManifest(0, 1);
   assert.equal(rebuilt, true);
+});
+
+test('audio trim removes real PCM samples at a seek boundary', () => {
+  const c = engine();
+  let copied, closed = false;
+  c.P.ctx = { createBuffer: (chs, n, rate) => ({ length: n, duration: n / rate, copyToChannel() {} }) };
+  const ad = { numberOfFrames: 1024, numberOfChannels: 1, sampleRate: 48000,
+    copyTo: (_dest, options) => copied = options, close: () => closed = true };
+  const buf = c.audioBufferOf(ad, 512);
+  assert.equal(buf.length, 512);
+  assert.equal(copied.frameOffset, 512);
+  assert.equal(copied.frameCount, 512);
+  assert.equal(closed, true);
+});
+test('audio scheduling preserves timestamp gaps and uses actual PCM duration', () => {
+  const c = engine();
+  const starts = [];
+  c.P.ctx = { currentTime: 0, state: 'running', createBufferSource: () => ({ connect() {}, start: t => starts.push(t) }) };
+  c.P.paused = false; c.P.adec = {}; c.P.gain = {};
+  c.audioBufferOf = () => ({ duration: 0.02 });
+  c.P.aq = [0, 0.1].map(t => ({ timestamp: t * 1e6, numberOfFrames: 960, sampleRate: 48000 }));
+  c.pumpAudio();
+  assert.ok(Math.abs(starts[1] - starts[0] - 0.1) < 1e-9);
+  assert.ok(Math.abs(c.P.anchor.media - 0.12) < 1e-9);
+});
+test('the audio clock accounts for device output timing instead of scheduled-ahead context time', () => {
+  const c = engine();
+  c.P.ctx = { currentTime: 1, state: 'running', outputLatency: 0.08 };
+  c.P.anchor = { ctx: 2, media: 2 };
+  assert.ok(Math.abs(c.mediaNow() - 0.92) < 1e-9);
+});
+test('partial final AAC packets trim decoder padding instead of triggering a false config failure', () => {
+  const c = engine();
+  c.AudioDecoder = class { constructor(callbacks) { this.callbacks = callbacks; } };
+  c.P.adec = c.mkAdec();
+  c.P.audioNominalUs = 21333;
+  c.P.audioDurations.set(1e6, 13333);
+  c.P.adec.callbacks.output({ timestamp: 1e6, duration: 21333, numberOfFrames: 1024, sampleRate: 48000 });
+  assert.equal(c.P.aq.length, 1);
+  assert.equal(c.P.audioLengths.get(1e6), 640);
 });

@@ -2315,6 +2315,7 @@ function waitFeed(ms = 250) {
 const P = {
   id: null, tracks: null, segs: new Map(), segMaxN: 0, done: false,
   generation: null,
+  timing: null, audioSkipUntil: 0, audioDurations: new Map(), audioLengths: new Map(), audioNominalUs: 0, scheduleBase: null,
   vdec: null, adec: null,
   vq: [], aq: [],             // decoded, not yet shown/played
   chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
@@ -2323,8 +2324,6 @@ const P = {
   seekLastFrame: null,
   seekFloor: 0,               // after a seek: drop decoded outputs older than this
   seekVideoReady: false, seekAudioReady: false,
-  aStepUs: 0,                 // container's per-packet audio duration (clock truth)
-  aTrimUs: 0,                 // AAC decoder-delay trim (native-player parity, see startEngine)
   ctx: null, gain: null, nextAt: 0,
   anchor: null,               // {ctx, media} — media time at the end of the last scheduled audio buffer
   noAudio: false,             // no usable audio track/decoder: wall clock is the master
@@ -2336,28 +2335,28 @@ const P = {
   raf: 0,
 };
 
-/* Master clock. Audio is scheduled ahead on the WebAudio timeline; the
- * playhead interpolates linearly towards the end of the last scheduled buffer.
- * Suspending the AudioContext on pause freezes ctx.currentTime and therefore
- * the playhead, for free.
- *
- * Two standard handoffs (the same model mpv uses):
- *  - audio EOF with video remaining (credits after the last audio packet):
- *    once every audio chunk is decoded AND scheduled AND sounded, advance the
- *    playhead by wall time past the last anchor — otherwise the clock pins at
- *    the audio end and the video tail can never play (Django: video 1.14s
- *    longer than audio; 'ended' never fired, the movie just froze).
- *  - no audio track at all: the wall clock IS the master (anchored at each
- *    seek; ctx.suspend on pause freezes it like the audio clock). */
+/* Audio-master clock: one second of actual PCM equals one second of media.
+ * Read the device output position, not the schedule-ahead position. At drained
+ * audio EOF the same clock continues through the video tail; video-only files
+ * use a wall anchor. Context suspension freezes either clock on pause. */
 function audioEnded() {
   if (!P.aDrained || P.aq.length) return false;
   if (!P.anchor) return true;   // e.g. a seek past the last audio packet
-  return P.anchor.ctx <= P.ctx.currentTime + 0.02;
+  return P.anchor.ctx <= outputContextTime() + 0.001;
+}
+function outputContextTime() {
+  if (!P.ctx) return 0;
+  if (P.ctx.state !== 'running') return P.ctx.currentTime;
+  const stamp = P.ctx.getOutputTimestamp?.();
+  if (stamp && stamp.performanceTime > 0 && stamp.contextTime > 0) {
+    return Math.min(P.ctx.currentTime, Math.max(0, stamp.contextTime + (performance.now() - stamp.performanceTime) / 1000));
+  }
+  return Math.max(0, P.ctx.currentTime - (P.ctx.outputLatency || 0));
 }
 function mediaNow() {
   if (!P.ctx) return P.lastT;
   if (pendSeek != null) return P.lastT;
-  const now = P.ctx.currentTime;
+  const now = P.noAudio ? P.ctx.currentTime : outputContextTime();
   if (P.anchor) {
     const behind = P.anchor.ctx - now;
     if (behind > 0) return Math.max(0, P.anchor.media - behind);
@@ -2558,20 +2557,12 @@ function segToChunks(buf, parsed) {
     const tr = P.tracks.get(tid);
     if (!tr) continue;
     const dst = tr.kind === 'video' ? res.V : res.A;
-    let prevTs = -1;
     for (const s of samples) {
       if (s.off < 0 || s.off + s.size > u8.length || !s.size) continue;
-      const ts = Math.round((tr.kind === 'video' ? s.pts : s.dts) * 1e6 / tr.timescale);
+      const offset = tr.kind === 'video' ? (P.timing?.video_offset || 0) : P.timing?.audio_offset;
+      if (tr.kind === 'audio' && offset == null) throw new Error('Audio timeline is not available');
+      const ts = Math.round(((tr.kind === 'video' ? s.pts : s.dts) / tr.timescale - (offset || 0)) * 1e6);
       const durUs = Math.max(1, Math.round(s.dur * 1e6 / tr.timescale));
-      if (tr.kind === 'audio') {
-        // Container timing truth: the step between successive packet
-        // timestamps (trun often writes no per-sample durations — the 1-tick
-        // default would make durUs garbage). Used by pumpAudio as the clock's
-        // media step.
-        const step = prevTs >= 0 ? ts - prevTs : durUs;
-        if (step > 1000 && step < 1000000) P.aStepUs = step;
-        prevTs = ts;
-      }
       dst.push({ data: u8.slice(s.off, s.off + s.size), ts, durUs, key: s.key });
     }
   }
@@ -2654,20 +2645,20 @@ function onDecErr(which) {
  * them lets the keyframe→target tail decode at full speed; the first KEPT
  * output is already at the target. */
 function queueVideoFrame(dec, frame) {
-      wakeFeed();
-      if (P.vdec !== dec) { try { frame.close(); } catch (e) {} return; }
-      P.videoEnd = Math.max(P.videoEnd, (frame.timestamp + (frame.duration || 0)) / 1e6);
-      if (P.seekFloor > 0 && frame.timestamp / 1e6 + (frame.duration || 0) / 1e6 <= P.seekFloor) {
-        if (pendSeek != null) {
-          if (P.seekLastFrame) P.seekLastFrame.close();
-          P.seekLastFrame = frame; // retain just the last frame for a seek beyond video EOF
-        } else frame.close();
-        return;
-      }
-      if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
-      P.vq.push(frame);
-      P.seekVideoReady = true;
-      finishSeek();
+  wakeFeed();
+  if (P.vdec !== dec) { frame.close(); return; }
+  P.videoEnd = Math.max(P.videoEnd, (frame.timestamp + (frame.duration || 0)) / 1e6);
+  if (P.seekFloor > 0 && frame.timestamp / 1e6 + (frame.duration || 0) / 1e6 <= P.seekFloor) {
+    if (pendSeek != null) {
+      if (P.seekLastFrame) P.seekLastFrame.close();
+      P.seekLastFrame = frame; // retain just the last frame for a seek beyond video EOF
+    } else frame.close();
+    return;
+  }
+  if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
+  P.vq.push(frame);
+  P.seekVideoReady = true;
+  finishSeek();
 }
 function mkVdec() {
   const dec = new VideoDecoder({
@@ -2683,7 +2674,21 @@ function mkAdec() {
       wakeFeed();
       if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
+      const expected = P.audioDurations.get(ad.timestamp);
+      P.audioDurations.delete(ad.timestamp);
+      const actual = ad.numberOfFrames / ad.sampleRate * 1e6;
+      // The last packet can signal fewer playable samples than the codec's
+      // fixed output frame. Trim that padding, rather than rejecting a valid
+      // decoder or stretching the media clock to the untrimmed frame length.
+      const paddedTail = expected && expected < P.audioNominalUs - 2000
+        && Math.abs(actual - P.audioNominalUs) <= 2000;
+      if (expected && !paddedTail && Math.abs(actual - expected) > Math.max(2000, expected * 0.03)) {
+        ad.close();
+        onAudioDecErr(new Error('Decoded audio duration ' + Math.round(actual) + 'us does not match packet ' + expected + 'us at ' + ad.timestamp));
+        return;
+      }
       if (P.seekFloor > 0 && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 <= P.seekFloor) { ad.close(); return; }
+      if (paddedTail) P.audioLengths.set(ad.timestamp, Math.round(expected / 1e6 * ad.sampleRate));
       P.aq.push(ad);
       P.seekAudioReady = true;
       finishSeek();
@@ -2711,72 +2716,74 @@ function onAudioDecErr(e) {
   segFatal(new Error('Audio decode failed: ' + (e.message || e)));
 }
 
-function audioBufferOf(ad) {
+function audioBufferOf(ad, frameOffset = 0, frameLimit = ad.numberOfFrames) {
   try {
-    const n = ad.numberOfFrames, chs = ad.numberOfChannels;
+    const n = Math.min(ad.numberOfFrames, frameLimit) - frameOffset, chs = ad.numberOfChannels;
+    if (n <= 0) return null;
     const buf = P.ctx.createBuffer(chs, n, ad.sampleRate);
     for (let p = 0; p < chs; p++) {
       const f = new Float32Array(n);
-      try { ad.copyTo(f, { planeIndex: p, format: 'f32-planar' }); }
-      catch (e) { ad.copyTo(f, { planeIndex: p }); }
+      ad.copyTo(f, { planeIndex: p, format: 'f32-planar', frameOffset, frameCount: n });
       buf.copyToChannel(f, p);
     }
-    ad.close();
     return buf;
-  } catch (e) { (window.__abufErr = window.__abufErr || []).push(String(e.message || e).slice(0, 80) + ' | fmt=' + ad.format + ' sr=' + ad.sampleRate + ' ch=' + ad.numberOfChannels); try { ad.close(); } catch (_e) {} return null; }
+  } finally { ad.close(); }
 }
 
-/* Move decoded audio onto the WebAudio timeline. The schedule position doubles
- * as the playhead anchor — see mediaNow(). Wall time advances by each buffer's
- * real duration (that is what the DAC plays), but MEDIA time advances by the
- * container's per-packet step: if a decoder config makes buffers shorter or
- * longer than the container step (implicit-SBR rotations do exactly that),
- * deriving the anchor from buf.duration would make the clock drift away from
- * the demuxed timestamps — video and subtitles with it. The container is the
- * timeline. */
-/* Audible position: the media time actually sounding right now. The clock
- * (mediaNow) extrapolates from the LAST scheduled buffer; this walks the
- * schedule ring to the buffer SPANNING ctx.currentTime. Any gap between the
- * two (adrift) is true A/V desync: video follows the clock, the ear follows
- * this. Exposed via __seg() for live diagnosis. */
+/* Schedule real PCM durations at normalized source timestamps. Trim actual
+ * samples at the seek floor and at explicitly signaled source priming; preserve
+ * leading silence and gaps. Never correct a bad decoder by fabricating a clock. */
+/* Scheduled PCM position at the device clock. Null during silence or after
+ * audio EOF. This checks scheduling alignment, not the content's lip sync;
+ * independent source-timestamp and browser regressions cover that mapping. */
 function audibleNow() {
   if (!P.sched || !P.sched.length || !P.ctx) return null;
-  const now = P.ctx.currentTime;
-  let last = null;
+  const now = outputContextTime();
   for (const s of P.sched) {
-    if (now >= s.cs && now < s.cs + s.dur) return s.ts + (now - s.cs) * (s.step / s.dur);
-    if (s.cs <= now) last = s;
+    if (now >= s.cs && now < s.cs + s.dur) return s.ts + now - s.cs;
   }
-  return last ? last.ts + last.step : P.sched[0].ts;
+  return null;
 }
 
 function pumpAudio() {
-  if (!P.ctx || P.ctx.state !== 'running' || !P.adec) return;
-  // Right after a seek, hold the clock until a kept video frame exists.
-  // Audio re-anchors the playhead at the target the moment it is scheduled,
-  // while the video pipeline is still chewing through the keyframe→target
-  // decode tail — the clock then outruns video, every late frame is painted
-  // in a burst or closed unseen, and playback limps behind the audio for
-  // seconds (the "seeks make it laggy again" + desync report). Holding the
-  // schedule costs ≤250ms (pendSeek clears seekFloor once the first kept
-  // frame lands) and audio+video then start at the target together.
+  if (!P.ctx || P.ctx.state !== 'running' || P.paused || !P.adec) return;
+  // Start both tracks together after decoder outputs establish seek readiness.
   if (pendSeek != null) return;
-  if (P.nextAt < P.ctx.currentTime) P.nextAt = P.ctx.currentTime + 0.01;
+  if (!P.scheduleBase) P.scheduleBase = { ctx: P.ctx.currentTime + 0.02, media: P.lastT };
   const queued = P.aq.length;
-  while (P.aq.length && P.nextAt < P.ctx.currentTime + 1.5) {
-    const ad = P.aq.shift();
-    const ts = ad.timestamp / 1e6 - P.aTrimUs / 1e6;   // minus decoder delay (native parity)
-    const step = P.aStepUs ? P.aStepUs / 1e6 : (ad.duration != null && isFinite(ad.duration) ? ad.duration / 1e6 : 0);
-    const buf = audioBufferOf(ad);
+  while (P.aq.length) {
+    const ad = P.aq[0], originalTs = ad.timestamp / 1e6;
+    const floor = Math.max(P.seekFloor, P.audioSkipUntil);
+    const skip = Math.max(0, Math.ceil((floor - originalTs) * ad.sampleRate - 0.1));
+    const limit = P.audioLengths.get(ad.timestamp) ?? ad.numberOfFrames;
+    if (skip >= limit) {
+      P.aq.shift(); P.audioLengths.delete(ad.timestamp); ad.close(); continue;
+    }
+    const ts = originalTs + skip / ad.sampleRate;
+    let at = P.scheduleBase.ctx + ts - P.scheduleBase.media;
+    if (at < P.ctx.currentTime - 0.002) {
+      P.scheduleBase = { ctx: P.ctx.currentTime + 0.01, media: mediaNow() };
+      at = P.scheduleBase.ctx + ts - P.scheduleBase.media;
+    }
+    // A known gap is silence, not an underrun. Give the clock a silence anchor
+    // up to the next buffer even when it is outside the scheduling window.
+    if (at > P.nextAt + 0.002) P.anchor = { ctx: at, media: ts };
+    if (at > P.ctx.currentTime + 1.5) break;
+    P.aq.shift();
+    P.audioLengths.delete(ad.timestamp);
+    let buf;
+    try { buf = audioBufferOf(ad, skip, limit); }
+    catch (e) { onAudioDecErr(e); return; }
     if (!buf) continue;
+    if (Math.abs(at - P.nextAt) < 0.002) at = P.nextAt;
     const src = P.ctx.createBufferSource();
     src.buffer = buf;
     src.connect(P.gain);
-    src.start(P.nextAt);
-    (P.sched = P.sched || []).push({ cs: P.nextAt, ts, dur: buf.duration, step: step || buf.duration });
+    src.start(at);
+    (P.sched = P.sched || []).push({ cs: at, ts, dur: buf.duration, step: buf.duration });
     if (P.sched.length > 240) P.sched.splice(0, 80);
-    P.anchor = { ctx: P.nextAt + buf.duration, media: ts + (step || buf.duration) };
-    P.nextAt += buf.duration;
+    P.anchor = { ctx: at + buf.duration, media: ts + buf.duration };
+    P.nextAt = at + buf.duration;
   }
   // drop ring entries that finished sounding (keep the spanning one)
   if (P.sched) while (P.sched.length > 1 && P.sched[0].cs + P.sched[0].dur < P.ctx.currentTime - 0.5) P.sched.shift();
@@ -2862,7 +2869,7 @@ setInterval(() => {
   // (video-only) frames painting, or the audio-EOF wall tail running
   const flowing = playing && (
     P.noAudio ? (P.flow && performance.now() - P.flow < 1500)
-              : (P.anchor && (P.anchor.ctx > P.ctx.currentTime + 0.02 || audioEnded())));
+              : (P.anchor && (P.anchor.ctx > outputContextTime() + 0.001 || audioEnded())));
   if (playing && !flowing && !P.eof && !audioEnded()) {
     if (!wasWaiting) { wasWaiting = true; v.dispatchEvent(new Event('waiting')); }
   } else if (wasWaiting) {
@@ -2891,6 +2898,7 @@ async function refreshManifest(gen, id) {
   if (info.state === 'error') throw new Error('Torrent failed to download');
   if (info.done && !info.segments.length) throw new Error('Remux produced no playable segments');
   if (info.duration && isFinite(info.duration) && info.duration > fullDur) fullDur = info.duration;
+  if (info.timing) { P.timing = info.timing; P.audioSkipUntil = info.timing.audio_skip_until; }
   P.done = !!info.done;
   for (const s of info.segments) if (!P.segs.has(s.n)) P.segs.set(s.n, s.t);
   if (info.segments.length) P.segMaxN = info.segments[info.segments.length - 1].n;
@@ -2932,7 +2940,12 @@ async function feedLoop(gen, id) {
     }
     let worked = false;
     if (P.chunksA.length && P.aq.length < 700 && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
-      for (let i = 0; i < 64 && P.chunksA.length && P.aq.length < 700 && P.adec.decodeQueueSize < 80; i++) P.adec.decode(P.chunksA.shift());
+      for (let i = 0; i < 64 && P.chunksA.length && P.aq.length < 700 && P.adec.decodeQueueSize < 80; i++) {
+        const chunk = P.chunksA.shift();
+        P.audioDurations.set(chunk.timestamp, chunk.duration);
+        P.audioNominalUs = Math.max(P.audioNominalUs, chunk.duration);
+        P.adec.decode(chunk);
+      }
       worked = true;
     }
     if (P.chunksV.length && P.vdec && P.vdec.state === 'configured') {
@@ -2961,10 +2974,15 @@ async function feedLoop(gen, id) {
     }
     if (t !== undefined && t < mediaNow() + SEG_AHEAD && !fetching && performance.now() >= pollAt) {
       const n = P.fetchN;
-      fetching = fetchSegBuf(id, 'seg/' + n).then(buf => {
+      fetching = fetchSegBuf(id, 'seg/' + n).then(async buf => {
         if (gen !== segGen || P.id !== id) return;
         if (!buf) { pollAt = performance.now() + 400; return; }
-        let ch = segToChunks(buf, parseSeg(buf, P.tracks));
+        const parsed = parseSeg(buf, P.tracks);
+        if (P.timing?.audio_offset == null && [...parsed.keys()].some(tid => P.tracks.get(tid)?.kind === 'audio')) {
+          await refreshManifest(gen, id);
+          if (gen !== segGen || P.id !== id) return;
+        }
+        let ch = segToChunks(buf, parsed);
         if (P.needKey) ch = seekChunks(ch, P.seekFloor);
         for (const c of ch.V) {
           if (P.needKey && !c.key) continue;
@@ -3045,13 +3063,14 @@ async function startEngine(position = 0) {
     // session). Wait for the cut to finish; downloading items have no such
     // moment and use the frontier as always.
     const ready = ((items.find(i => i.id === id) || {}).state === 'ready');
-    if (info.mime && info.segments.length && (info.done || !ready)) break;
+    if (info.mime && info.timing && info.segments.length && (info.done || !ready)) break;
     await segSleep(500);
   }
   if (gen !== segGen || P.id !== id) return;
   fullDur = (info.duration && isFinite(info.duration)) ? info.duration : 0;
   P.done = !!info.done;
   P.generation = info.generation;
+  P.timing = info.timing; P.audioSkipUntil = info.timing.audio_skip_until;
   P.segs = new Map(info.segments.map(s => [s.n, s.t]));
   P.segMaxN = info.segments.length ? info.segments[info.segments.length - 1].n : 0;
   const codecs = parseMime(info.mime);
@@ -3171,26 +3190,6 @@ async function startEngine(position = 0) {
       P.adec = null;
     }
     if (!P.adec) throw new Error('No WebCodecs audio decoder for ' + acodec);
-    // AAC decoder-delay trim. Raw AAC streams start with the codec's
-    // algorithmic delay (priming) baked into the first packets, and every
-    // native player trims it before presenting (CoreAudio/CoreMedia and
-    // ffmpeg-based players alike) — WebCodecs does NOT: decoded AudioData
-    // carries passthrough timestamps, so scheduling them as-is plays the
-    // whole track late by the delay vs the native player (measured against
-    // afconvert ground truth: LC = 2112 samples at the output rate; HE-AAC
-    // varies with the encoder's SBR framing — 2262 samples @22.05k, ~960
-    // @48k — LUT below). Shift every audio media anchor earlier by it; the
-    // priming region then maps before t=0 and is never sounded.
-    if (P.adec) {
-      let trim = 0;
-      if (acodec === 'mp4a.40.5') {
-        const lut = { 22050: 2262, 24000: 1100, 32000: 1400, 44100: 900, 48000: 960 };
-        trim = lut[rate] || Math.round(2112 * rate / 48000);   // ~44ms scaled
-      } else {
-        trim = 2112;
-      }
-      P.aTrimUs = Math.round(trim / rate * 1e6);
-    }
   }
 
   v.dispatchEvent(new Event('loadedmetadata'));
@@ -3272,6 +3271,7 @@ function seekTo(globalT, partyOrigin) {
   for (const a of P.aq) { try { a.close(); } catch (e) {} }
   P.aq.length = 0;
   P.anchor = null; P.nextAt = 0; P.sched = []; P.lastT = globalT;
+  P.scheduleBase = null; P.audioDurations.clear(); P.audioLengths.clear();
   P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: globalT };
   pendSeek = globalT; pendSeekAt = Date.now();
   // orphan buffers already scheduled on the old gain node (they would keep
@@ -3334,7 +3334,8 @@ function teardownWC(keepContext = false) {
   P.id = null; P.tracks = null; P.segs = new Map(); P.segMaxN = 0; P.done = false;
   P.generation = null;
   P.vcfg = null; P.acfgs = null; P.acfgIdx = 0;
-  P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0; P.aStepUs = 0; P.aTrimUs = 0;
+  P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0;
+  P.timing = null; P.audioSkipUntil = 0; P.scheduleBase = null; P.audioDurations.clear(); P.audioLengths.clear(); P.audioNominalUs = 0;
   P.vDrained = false; P.aDrained = false; P.flushV = null; P.flushA = null; P.videoEnd = 0;
   if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
   P.chunksV.length = 0; P.chunksA.length = 0;
@@ -3370,7 +3371,7 @@ window.__seg = () => ({
   aud: audibleNow() != null ? +audibleNow().toFixed(2) : null,
   adrift: audibleNow() != null ? +(mediaNow() - audibleNow()).toFixed(3) : null,
   late: window.__late || 0,
-  seekFloor: P.seekFloor, aStepUs: P.aStepUs, aTrimUs: P.aTrimUs, acfg: P.acfgs && P.acfgIdx,
+  seekFloor: P.seekFloor, audioSkipUntil: P.audioSkipUntil, timing: P.timing, acfg: P.acfgs && P.acfgIdx,
   flowAgo: P.flow ? performance.now() - P.flow : null, pendSeek,
 });
 

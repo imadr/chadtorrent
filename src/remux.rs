@@ -3,7 +3,25 @@ use tokio::process::Command;
 
 pub struct Remuxer;
 
+#[derive(Debug, Clone)]
+pub struct SourceTiming {
+    pub video_start: f64,
+    pub audio_start: Option<f64>,
+    pub audio_skip_seconds: f64,
+}
+
 impl Remuxer {
+    /// Original packet timestamps and explicit priming metadata. These survive
+    /// a container rewrap through an offset mapping; codec/sample-rate guesses
+    /// cannot establish the source's A/V alignment.
+    pub async fn probe_source_timing(path: &str) -> Option<SourceTiming> {
+        let output = Command::new("ffprobe").args([
+            "-v", "error", "-read_intervals", "%+#256", "-show_packets", "-show_streams",
+            "-show_entries", "stream=index,codec_type,start_time,sample_rate:packet=stream_index,pts_time:packet_side_data=skip_samples",
+            "-of", "json", path,
+        ]).kill_on_drop(true).output().await.ok()?;
+        parse_source_timing(&serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()?)
+    }
     /// Build the stream MIME type for a file, e.g.
     /// `video/mp4; codecs="avc1.640028,mp4a.40.5"`. Returns `None` when the
     /// file can't be probed yet (e.g. a partial download without its moov
@@ -71,6 +89,26 @@ impl Remuxer {
         s.trim().parse::<f64>().ok()
     }
 
+}
+
+fn parse_source_timing(json: &serde_json::Value) -> Option<SourceTiming> {
+    let streams = json["streams"].as_array()?;
+    let packets = json["packets"].as_array()?;
+    let first = |stream: &serde_json::Value| packets.iter().find(|p| p["stream_index"] == stream["index"]);
+    let timestamp = |stream: &serde_json::Value| {
+        first(stream).and_then(|p| p["pts_time"].as_str())
+            .or_else(|| stream["start_time"].as_str())?.parse::<f64>().ok().filter(|t| t.is_finite())
+    };
+    let video = streams.iter().find(|s| s["codec_type"] == "video")?;
+    let audio = streams.iter().find(|s| s["codec_type"] == "audio");
+    let skip = audio.and_then(first).and_then(|p| p["side_data_list"].as_array())
+        .and_then(|data| data.iter().find_map(|d| d["skip_samples"].as_u64())).unwrap_or(0);
+    let rate = audio.and_then(|s| s["sample_rate"].as_str()).and_then(|r| r.parse::<f64>().ok()).unwrap_or(0.0);
+    Some(SourceTiming {
+        video_start: timestamp(video)?,
+        audio_start: audio.and_then(timestamp),
+        audio_skip_seconds: if rate > 0.0 { skip as f64 / rate } else { 0.0 },
+    })
 }
 
 /// Bit depth from the ffprobe pixel format ("yuv420p10le" → 10).
@@ -186,6 +224,19 @@ mod tests {
 
     fn st(profile: &str, level: i64, pix_fmt: &str) -> serde_json::Value {
         json!({ "profile": profile, "level": level, "pix_fmt": pix_fmt })
+    }
+
+    #[test]
+    fn source_timing_uses_packet_priming_and_keeps_track_offsets() {
+        let timing = parse_source_timing(&json!({
+            "streams": [{"index":0,"codec_type":"video","start_time":"0"},
+                {"index":1,"codec_type":"audio","sample_rate":"48000","start_time":"0"}],
+            "packets": [{"stream_index":0,"pts_time":"0"},
+                {"stream_index":1,"pts_time":"-0.021333333333","side_data_list":[{"skip_samples":1024}]}]
+        })).unwrap();
+        assert_eq!(timing.video_start, 0.0);
+        assert!((timing.audio_skip_seconds - 1024.0 / 48000.0).abs() < 1e-9);
+        assert!(timing.audio_start.unwrap() < 0.0);
     }
 
     #[test]
