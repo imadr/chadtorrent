@@ -5,7 +5,8 @@
 //! One pipeline for every state:
 //!   - finished file: ffmpeg reads the path once, all segments materialize in
 //!     seconds and are cached in `library_dir/{id}/.seg/`.
-//!   - downloading torrent: ffmpeg reads the librqbit `FileStream` (via stdin),
+//!   - downloading torrent: ffmpeg reads the librqbit `FileStream` (via a private
+//!     seekable HTTP range input),
 //!     which blocks exactly at the download frontier — segments appear as
 //!     pieces arrive, and nothing is ever read that isn't downloaded.
 //!
@@ -17,12 +18,15 @@
 //! `frag_keyframe`).
 
 use std::collections::HashMap;
+use std::boxed::Box as ReaderBox;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use axum::{body::Body, extract::State, http::{header, HeaderMap, Method, StatusCode}, response::{IntoResponse, Response}, routing::get, Router};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::io::ReaderStream;
 use tracing::{info, warn};
 
 use crate::db::Database;
@@ -115,12 +119,102 @@ impl Segmenter {
 
 enum Input {
     File(PathBuf),
-    /// Live torrent: feed the FileStream of `file_id` through stdin; nothing
+    /// Live torrent: expose the FileStream of `file_id` through range requests; nothing
     /// is ever read that isn't already downloaded.
     Stream {
         handle: Arc<librqbit::ManagedTorrent>,
         file_id: usize,
     },
+}
+
+trait InputReader: AsyncRead + AsyncSeek + Send + Unpin {}
+impl<T: AsyncRead + AsyncSeek + Send + Unpin> InputReader for T {}
+
+#[derive(Clone)]
+enum StreamSource {
+    Torrent { handle: Arc<librqbit::ManagedTorrent>, file_id: usize },
+    #[cfg(test)]
+    File(PathBuf),
+}
+
+impl StreamSource {
+    async fn open(&self) -> anyhow::Result<(ReaderBox<dyn InputReader>, u64)> {
+        match self {
+            Self::Torrent { handle, file_id } => {
+                let stream = handle.clone().stream(*file_id).await?;
+                let len = stream.len();
+                Ok((ReaderBox::new(stream), len))
+            }
+            #[cfg(test)]
+            Self::File(path) => {
+                let file = tokio::fs::File::open(path).await?;
+                let len = file.metadata().await?.len();
+                Ok((ReaderBox::new(file), len))
+            }
+        }
+    }
+}
+
+/// A private loopback range server gives ffmpeg a seekable torrent input. Each
+/// request reads through FileStream, so missing pieces still block safely; MP4
+/// moov-at-end and container index seeks no longer require an impossible rewind
+/// of stdin. Dropping the owning segment task closes the listener.
+struct InputProxy {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl InputProxy {
+    async fn start(source: StreamSource) -> anyhow::Result<Self> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let router = Router::new().route("/input", get(serve_input).head(serve_input)).with_state(source);
+        let task = tokio::spawn(async move { let _ = axum::serve(listener, router).await; });
+        Ok(Self { url: format!("http://{addr}/input"), task })
+    }
+}
+
+impl Drop for InputProxy {
+    fn drop(&mut self) { self.task.abort(); }
+}
+
+fn byte_range(value: Option<&str>, len: u64) -> Option<(u64, u64)> {
+    if len == 0 { return None; }
+    let Some(value) = value else { return Some((0, len - 1)); };
+    let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().ok()?;
+        return (suffix > 0).then_some((len.saturating_sub(suffix), len - 1));
+    }
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() { len - 1 } else { end.parse::<u64>().ok()?.min(len - 1) };
+    (start <= end && start < len).then_some((start, end))
+}
+
+async fn serve_input(State(source): State<StreamSource>, headers: HeaderMap, method: Method) -> Response {
+    let (mut stream, len) = match source.open().await {
+        Ok(value) => value,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let Some((start, end)) = byte_range(range, len) else {
+        return (StatusCode::RANGE_NOT_SATISFIABLE, [(header::CONTENT_RANGE, format!("bytes */{len}"))]).into_response();
+    };
+    if let Err(e) = stream.seek(std::io::SeekFrom::Start(start)).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+    let body = if method == Method::HEAD { Body::empty() } else {
+        Body::from_stream(ReaderStream::new(stream.take(end - start + 1)))
+    };
+    let mut response = Response::new(body);
+    let h = response.headers_mut();
+    h.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    h.insert(header::CONTENT_LENGTH, (end - start + 1).to_string().parse().unwrap());
+    if range.is_some() {
+        h.insert(header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}").parse().unwrap());
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+    }
+    response
 }
 
 pub struct SegmenterManager {
@@ -361,6 +455,10 @@ async fn run_segmenter(seg: Arc<Segmenter>, input: Input) {
 }
 
 async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Result<()> {
+    let proxy = match input {
+        Input::Stream { handle, file_id } => Some(InputProxy::start(StreamSource::Torrent { handle: handle.clone(), file_id: *file_id }).await?),
+        _ => None,
+    };
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
     match input {
@@ -368,7 +466,7 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
             cmd.arg("-i").arg(path);
         }
         Input::Stream { .. } => {
-            cmd.arg("-i").arg("pipe:0");
+            cmd.arg("-i").arg(&proxy.as_ref().unwrap().url);
         }
     }
     cmd.args([
@@ -379,7 +477,7 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
         "-f", "mp4",
         "pipe:1",
     ])
-    .stdin(std::process::Stdio::piped())
+    .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped())
     .kill_on_drop(true);
@@ -406,36 +504,6 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
         String::from_utf8_lossy(&collected).trim().to_string()
     });
 
-    // For live torrents: feed the FileStream to ffmpeg's stdin. The FileStream
-    // returns Pending until the requested bytes are downloaded, so ffmpeg
-    // idles at the download frontier — nothing is ever read that isn't there.
-    let mut feed: Option<tokio::task::JoinHandle<()>> = None;
-    if let Input::Stream { handle, file_id } = input {
-        let mut file_stream = handle
-            .clone()
-            .stream(*file_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to open torrent stream: {e}"))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("no stdin on ffmpeg"))?;
-        feed = Some(tokio::spawn(async move {
-            let mut buf = vec![0u8; 256 * 1024];
-            loop {
-                match file_stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stdin.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            let _ = stdin.flush().await;
-        }));
-    }
-
     let mut stdout = child
         .stdout
         .take()
@@ -454,12 +522,6 @@ async fn run_segmenter_inner(seg: &Arc<Segmenter>, input: &Input) -> anyhow::Res
             Err(e) => break Err(e.into()),
         }
     };
-
-    // If the body/segmenter is dropped mid-flight, the abort of this task
-    // kills ffmpeg (kill_on_drop) and the feed task.
-    if let Some(feed) = feed {
-        feed.abort();
-    }
 
     read_result?;
     let status = child
@@ -918,6 +980,36 @@ mod tests {
         v.extend_from_slice(typ);
         v.extend_from_slice(payload);
         v
+    }
+
+    #[test]
+    fn range_requests_support_container_index_and_backward_seeks() {
+        assert_eq!(byte_range(None, 100), Some((0, 99)));
+        assert_eq!(byte_range(Some("bytes=80-"), 100), Some((80, 99)));
+        assert_eq!(byte_range(Some("bytes=0-31"), 100), Some((0, 31)));
+        assert_eq!(byte_range(Some("bytes=-16"), 100), Some((84, 99)));
+        assert_eq!(byte_range(Some("bytes=100-"), 100), None);
+        assert_eq!(byte_range(Some("bytes=3-1"), 100), None);
+        assert_eq!(byte_range(Some("bytes=0-1,3-4"), 100), None);
+    }
+
+    #[tokio::test]
+    async fn non_faststart_mp4_remuxes_through_seekable_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail-moov.mp4");
+        let generated = Command::new("ffmpeg").args([
+            "-v", "error", "-f", "lavfi", "-i", "testsrc2=duration=3:size=640x360:rate=24",
+            "-c:v", "libx264", "-preset", "ultrafast", "-g", "24",
+        ]).arg(&path).output().await;
+        let Ok(generated) = generated else { return; }; // optional ffmpeg dependency
+        assert!(generated.status.success());
+        let proxy = InputProxy::start(StreamSource::File(path)).await.unwrap();
+        let result = Command::new("ffmpeg").args([
+            "-v", "error", "-xerror", "-i", &proxy.url, "-c", "copy",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1",
+        ]).output().await.unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert!(top_boxes(&result.stdout).iter().any(|(ty, _)| *ty == *b"moof"));
     }
 
     #[tokio::test]
