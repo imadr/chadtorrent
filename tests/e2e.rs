@@ -68,6 +68,12 @@ async fn http_error_handling() {
     let (http, _ws, _party, srv) = start_http(library.clone()).await;
     let client = reqwest::Client::new();
 
+    // Search validation is local: neither request should contact an indexer.
+    for path in ["/api/torrents?provider=nyaa", "/api/torrents?q=JoJo&provider=unknown"] {
+        let resp = client.get(format!("{http}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "{path}");
+    }
+
     let resp = client
         .post(format!("{http}/api/library"))
         .json(&serde_json::json!({ "magnet": "notamagnet" }))

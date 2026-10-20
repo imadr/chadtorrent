@@ -491,6 +491,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "librqbit",
+ "quick-xml",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",

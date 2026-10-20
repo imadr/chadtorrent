@@ -9,6 +9,7 @@ cargo build          # fast incremental build
 cargo test -- --test-threads=1   # full suite (~4s, all fast — no real torrent downloads)
 cargo clippy --all-targets
 node --test tests/player.test.cjs
+node --test tests/torrent_search.test.cjs
 # Browser regressions require Python playwright + Chrome (CHROME_BIN overrides it):
 python tests/player_browser.py
 # Installed Playwright Firefox:
@@ -27,6 +28,7 @@ src/
   torrent.rs     TorrentEngine: wraps librqbit Session + ManagedTorrent map
   library.rs     LibraryManager: orchestrates DB + TorrentEngine + file paths
   http.rs        Axum server: REST routes + WS status + streaming + remux + party API
+  indexer.rs     Keyless torrent search adapters: ApiBay, Knaben v2, Nyaa RSS, YTS
   remux.rs       ffprobe helpers: stream MIME (AAC profile-aware) + duration
   segmenter.rs   segment pipeline: ffmpeg `-c copy` → init.mp4 + seg-N.m4s on disk (per item), manifest state
   metadata.rs    TMDB API client (search + detail fetch) + `MetaCache` (tmdb_meta-backed read cache, TTL'd background refresh)
@@ -102,6 +104,8 @@ Each member runs their own instance; the BitTorrent swarm is the content distrib
 - **Sync model**: last-writer-wins actions, no host authority. The browser owns the `<video>`: local play/pause/seek broadcast; remote actions applied behind a `partyApply` guard counter (300ms) to prevent echo loops; drift correction re-seeks when >2.5s off the action anchor. Strict stalls: a member stalled >2s reports `buffering`, everyone auto-pauses with a "Waiting for X…" overlay, auto-resumes when clear. `ready` = ≥60s buffered ahead of the party position (or finished file).
 
 ## Frontend conventions
+
+- **Torrent search**: `/api/torrents?q=...&provider=knaben|apibay|nyaa|yts` returns a common `{name, size_bytes, seeders, leechers, magnet}` array. The API defaults to ApiBay for legacy clients; the frontend defaults to Knaben and remembers the selected provider in `chadtorrent.torrentProvider`. Provider buttons sit directly below **Find torrents**. Switching aborts the old request, clears stale rows, and preserves the movie/provider response guard across detail-page rebuilds. Successful searches with no matches return `[]`; upstream failures return a provider-specific 502 so users can switch. Keep the frontend `TORRENT_PROVIDERS` list in sync with `indexer::Provider` when adding adapters. Parser tests are offline; `tests/torrent_search.test.cjs` covers selection, persistence, errors, and stale requests.
 
 - **No framework**: all vanilla JS. Modules use global functions (no bundler).
 - **Movie grouping**: items grouped by `media_type + ':' + tmdb_id` (or `'r' + id` for standalone torrents). The movie detail shows a placeholder row (tmdb_id, no magnet) plus all attached torrent rows.

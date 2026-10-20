@@ -3,6 +3,7 @@ mod db;
 mod episodes;
 mod error;
 mod http;
+mod indexer;
 mod library;
 mod metadata;
 mod party;

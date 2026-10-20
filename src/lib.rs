@@ -3,6 +3,7 @@ pub mod db;
 pub mod episodes;
 pub mod error;
 pub mod http;
+pub mod indexer;
 pub mod library;
 pub mod metadata;
 pub mod party;

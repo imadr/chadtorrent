@@ -65,11 +65,13 @@
          border: 0.5px solid var(--line); padding: 10px 14px; }
   #mv-seasonchips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
   #mv-seasonchips[hidden] { display: none; }
-  #mv-seasonchips .s-chip, #mv-epselect .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
+  #mv-seasonchips .s-chip, #mv-epselect .s-chip, #mv-providers .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
           background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
-  #mv-seasonchips .s-chip:hover, #mv-epselect .s-chip:hover { border-color: var(--line-hi); }
-  #mv-seasonchips .s-chip.sel, #mv-epselect .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
-  #mv-seasonchips .s-chip.kbd-sel, #mv-epselect .s-chip.kbd-sel { box-shadow: 0 0 0 2px var(--line-hi); }
+  #mv-seasonchips .s-chip:hover, #mv-epselect .s-chip:hover, #mv-providers .s-chip:hover { border-color: var(--line-hi); }
+  #mv-seasonchips .s-chip.sel, #mv-epselect .s-chip.sel, #mv-providers .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
+  #mv-seasonchips .s-chip.kbd-sel, #mv-epselect .s-chip.kbd-sel, #mv-providers .s-chip.kbd-sel { box-shadow: 0 0 0 2px var(--line-hi); }
+  #mv-providers { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
+  #mv-torrent-filter { display: block; width: 100%; }
   #mv-epselect { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
   #mv-epselect[hidden] { display: none; }
   #mv-epfiles .ep { display: flex; align-items: center; gap: 10px;
@@ -915,6 +917,7 @@ function syncMovie() {
 function openMovie(k, push = true) {
   const rows = groupItems(items).get(k) || [];
   if (!rows.length) return;
+  if (!currentMovie || currentMovie.key !== k) torrentNameFilter = '';
   currentMovie = { key: k, rows };
   dlState = {};
   fileLists = new Map();
@@ -944,6 +947,8 @@ const IC_BIN = '<svg viewBox="0 0 24 24"><use href="#ic-bin"/></svg>';
 function renderMovie() {
   const rows = currentMovie.rows;
   const rep = movieRep(rows);
+  const activeFilter = document.activeElement?.id === 'mv-torrent-filter' ? document.activeElement : null;
+  const filterSelection = activeFilter ? [activeFilter.selectionStart, activeFilter.selectionEnd] : null;
   // The whole content area is destroyed and regenerated from scratch on every
   // render: head (poster/title/sub/delete), season chips, torrents, search
   // section. Nothing survives a render, so nothing can leak between shows or
@@ -974,9 +979,16 @@ function renderMovie() {
     '</section>' +
     '<section id="mv-searchsec" hidden>' +
       '<h3>Find torrents</h3>' +
+      '<div id="mv-providers" role="group" aria-label="Torrent search provider"></div>' +
+      '<input id="mv-torrent-filter" type="text" placeholder="Filter torrents by name…" aria-label="Filter torrents by name" autocomplete="off">' +
       '<div class="rows" id="mv-results" style="margin-top:12px"></div>' +
     '</section>';
 
+  $('mv-torrent-filter').value = torrentNameFilter;
+  $('mv-torrent-filter').oninput = e => {
+    torrentNameFilter = e.target.value;
+    renderSearch();
+  };
   $('mv-poster').innerHTML = rep.poster_path
     ? posterTag(posterURL(rep.poster_path, POSTER_MD))
     : placeholder(isReading(rep) ? '▤' : '▷');
@@ -1006,6 +1018,10 @@ function renderMovie() {
   }
 
   $('mv-searchsec').hidden = !rep.tmdb_id;
+  if (filterSelection && rep.tmdb_id) {
+    $('mv-torrent-filter').focus({ preventScroll: true });
+    $('mv-torrent-filter').setSelectionRange(...filterSelection);
+  }
 
   applyMvOverview(rep);
   ensureMvMeta(rep);
@@ -1644,21 +1660,76 @@ $('btn-back').addEventListener('click', () => {
   pushRoute('/library');
 });
 
-let findSeq = 0;
+const TORRENT_PROVIDERS = [
+  { key: 'knaben', label: 'Knaben', hint: 'General torrent search across multiple indexes' },
+  { key: 'apibay', label: 'ApiBay', hint: 'The Pirate Bay index' },
+  { key: 'nyaa', label: 'Nyaa', hint: 'Anime torrents, all languages' },
+  { key: 'yts', label: 'YTS', hint: 'Movies only' },
+];
+var torrentProvider = (() => {
+  try {
+    const saved = localStorage.getItem('chadtorrent.torrentProvider');
+    if (TORRENT_PROVIDERS.some(p => p.key === saved)) return saved;
+  } catch (e) {}
+  return 'knaben';
+})();
+let findSeq = 0, findAbort = null;
+var findState = 'idle', findError = '', curProvider = null;
+var torrentNameFilter = '';
+
+function filterTorrentResults(list, query = torrentNameFilter) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  return list.filter(t => {
+    const name = String(t.name || '').toLowerCase();
+    return terms.every(term => name.includes(term));
+  });
+}
+
+function renderTorrentProviders() {
+  const box = $('mv-providers');
+  if (!box) return;
+  box.innerHTML = '';
+  for (const provider of TORRENT_PROVIDERS) {
+    const button = document.createElement('button');
+    button.className = 's-chip' + (provider.key === torrentProvider ? ' sel' : '');
+    button.dataset.provider = provider.key;
+    button.textContent = provider.label;
+    button.title = provider.hint;
+    button.setAttribute('aria-pressed', String(provider.key === torrentProvider));
+    button.onclick = () => selectTorrentProvider(provider.key);
+    box.appendChild(button);
+  }
+}
+
+function selectTorrentProvider(provider) {
+  if (provider === torrentProvider || !TORRENT_PROVIDERS.some(p => p.key === provider)) return;
+  torrentProvider = provider;
+  try { localStorage.setItem('chadtorrent.torrentProvider', provider); } catch (e) {}
+  renderTorrentProviders();
+  const rep = currentMovie && movieRep(currentMovie.rows);
+  if (rep && rep.tmdb_id && !isReading(rep)) findTorrents(rep);
+}
+
 async function findTorrents(rep) {
   const seq = ++findSeq;
-  const box = $('mv-results');
-  box.innerHTML = '<div class="empty" style="padding:10px 0">Searching…</div>';
+  if (findAbort) findAbort.abort();
+  findAbort = new AbortController();
+  const provider = torrentProvider;
+  searchResults = []; curRep = rep; curProvider = provider;
+  findState = 'loading'; findError = '';
+  renderSearch();
   try {
-    const res = await api('/api/torrents?q=' + encodeURIComponent(rep.title || ''));
+    const res = await api('/api/torrents?q=' + encodeURIComponent(rep.title || '') + '&provider=' + provider,
+      { signal: findAbort.signal });
     if (seq !== findSeq) return;   // a newer search started — discard stale results
     searchResults = res;
-    curRep = rep;
+    findState = 'ready';
     renderSearch();
   } catch (e) {
-    if (seq !== findSeq) return;
+    if (seq !== findSeq || e.name === 'AbortError') return;
     searchResults = [];
-    box.innerHTML = '<div class="empty" style="padding:10px 0">' + esc(e.message) + '</div>';
+    findState = 'error'; findError = e.message;
+    renderSearch();
   }
 }
 
@@ -1682,6 +1753,7 @@ function sortSearchResults(list) {
 }
 
 function renderSearch() {
+  renderTorrentProviders();
   const box = $('mv-results');
   if (!box) return;
   // Stale-response guard: `searchResults`/`curRep` are globals shared across
@@ -1693,10 +1765,24 @@ function renderSearch() {
   // media_type in the guard too: different catalogues (TMDB/MangaDex/Comic
   // Vine) reuse the same numeric ids, so a bare id match could render one
   // catalogue's torrents under another's title.
-  if (!curRep || !rep || curRep.tmdb_id !== rep.tmdb_id || curRep.media_type !== rep.media_type) return;
+  if (!curRep || !rep || curRep.tmdb_id !== rep.tmdb_id || curRep.media_type !== rep.media_type || curProvider !== torrentProvider) return;
   box.innerHTML = '';
+  const providerName = TORRENT_PROVIDERS.find(p => p.key === torrentProvider).label;
+  if (findState === 'loading' || findState === 'error') {
+    box.innerHTML = '<div class="empty" style="padding:10px 0">' +
+      esc(findState === 'loading' ? 'Searching ' + providerName + '…' : findError) + '</div>';
+    mvSyncSel();
+    return;
+  }
   if (!searchResults.length) {
-    box.innerHTML = '<div class="empty" style="padding:10px 0">No results from the indexer.</div>';
+    box.innerHTML = '<div class="empty" style="padding:10px 0">No results from ' + esc(providerName) + '.</div>';
+    mvSyncSel();
+    return;
+  }
+  const filtered = filterTorrentResults(searchResults);
+  if (!filtered.length) {
+    box.innerHTML = '<div class="empty" style="padding:10px 0">No torrents match your name filter.</div>';
+    mvSyncSel();
     return;
   }
   const srow = document.createElement('div');
@@ -1716,7 +1802,7 @@ function renderSearch() {
   }
   box.appendChild(srow);
   const addedHashes = new Set(items.filter(i => i.magnet).map(i => infoHash(i.magnet)).filter(Boolean));
-  for (const t of sortSearchResults(searchResults)) {
+  for (const t of sortSearchResults(filtered)) {
     const row = document.createElement('div');
     row.className = 'row';
     const sz = t.size_bytes ? fmtBytes(t.size_bytes) : '';
@@ -4538,6 +4624,7 @@ function mvFlat() {
   for (const el of document.querySelectorAll('#mv-epselect:not([hidden]) button.s-chip'))    out.push({ kind: 'epbtn',  el });
   for (const el of document.querySelectorAll('#mv-epfiles > .ep'))            out.push({ kind: 'episode', el });
   for (const el of document.querySelectorAll('#mv-torrents > .row[data-id]')) out.push({ kind: 'content', el });
+  for (const el of document.querySelectorAll('#mv-searchsec:not([hidden]) #mv-providers button.s-chip')) out.push({ kind: 'provider', el });
   for (const el of document.querySelectorAll('#mv-results .row'))             out.push({ kind: 'torrent',  el });
   return out;
 }
@@ -4547,7 +4634,7 @@ function mvHighlight(l) {
     const sel = i === mvSelIdx;
     // Chips already use `.sel` to mean "season/episode selected" — a keyboard
     // highlight must not collide with it.
-    if (x.kind === 'season' || x.kind === 'epbtn') x.el.classList.toggle('kbd-sel', sel);
+    if (x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'provider') x.el.classList.toggle('kbd-sel', sel);
     else x.el.classList.toggle('sel', sel);
   });
 }
@@ -4579,7 +4666,7 @@ function selOpen() {
   }
   const x = mvFlat()[mvSelIdx];
   if (!x) return;
-  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'chapter') {
+  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'chapter' || x.kind === 'provider') {
     x.el.click();
     return;
   }

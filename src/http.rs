@@ -388,16 +388,6 @@ async fn add_movie(
     Ok(Json(json!({ "id": id })))
 }
 
-#[derive(Deserialize)]
-struct ApibayItem {
-    name: String,
-    #[serde(rename = "info_hash")]
-    info_hash: String,
-    size: String,
-    seeders: String,
-    leechers: String,
-}
-
 async fn torrent_search(
     axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
 ) -> Result<impl IntoResponse> {
@@ -410,85 +400,8 @@ async fn torrent_search(
     if query.is_empty() {
         return Err(Error::BadRequest("missing query param q (movie title)".into()));
     }
-    let url = format!("https://apibay.org/q.php?q={}&cat=0", urlencoding(&query));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|e| Error::BadRequest(format!("torrent search failed: {e}")))?;
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut last_err: Option<reqwest::Error> = None;
-    for attempt in 0..3 {
-        let fetched: std::result::Result<Vec<ApibayItem>, reqwest::Error> = async {
-            let resp = client.get(&url).send().await?.error_for_status()?;
-            resp.json::<Vec<ApibayItem>>().await
-        }
-        .await;
-        match fetched {
-            Ok(items) => {
-                results = items
-                    .into_iter()
-                    .filter_map(|it| {
-                        let info_hash = it.info_hash.trim().to_string();
-                        if info_hash.len() != 40 || info_hash.bytes().all(|b| b == b'0') {
-                            // apibay signals "no results" with a placeholder
-                            // entry carrying a zeroed info hash: never surface
-                            // it as a torrent.
-                            return None;
-                        }
-                        let magnet = format!(
-                            "magnet:?xt=urn:btih:{info_hash}&dn={}",
-                            urlencoding(&it.name)
-                        );
-                        Some(json!({
-                            "name": it.name,
-                            "size_bytes": it.size.parse::<u64>().ok(),
-                            "seeders": it.seeders.parse::<u64>().ok().unwrap_or(0),
-                            "leechers": it.leechers.parse::<u64>().ok().unwrap_or(0),
-                            "magnet": magnet,
-                        }))
-                    })
-                    .collect();
-                if !results.is_empty() {
-                    break;
-                }
-            }
-            Err(e) => last_err = Some(e),
-        }
-        if attempt < 2 {
-            tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
-        }
-    }
-    if let Some(e) = last_err.as_ref() {
-        warn!("all indexer attempts failed for '{query}': {e}");
-    }
-    if results.is_empty() && last_err.is_some() {
-        return Err(Error::BadRequest(
-            "torrent indexer is temporarily unreachable — try again".into(),
-        ));
-    }
-    results.sort_by(|a, b| {
-        b["seeders"]
-            .as_u64()
-            .unwrap_or(0)
-            .cmp(&a["seeders"].as_u64().unwrap_or(0))
-    });
-    Ok(Json(results))
-}
-
-fn urlencoding(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::new();
-    for &b in bytes {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
+    let provider = crate::indexer::Provider::parse(params.get("provider").and_then(|v| v.as_str()).unwrap_or("apibay"))?;
+    Ok(Json(crate::indexer::search(provider, &query).await?))
 }
 
 async fn list_items(
