@@ -403,8 +403,8 @@
 
 <div class="floats">
   <button class="btn primary" id="btn-add"><svg viewBox="0 0 24 24"><use href="#ic-plus"/></svg>Add</button>
-  <button class="btn" id="btn-party" title="Watch party"><svg viewBox="0 0 24 24"><use href="#ic-users"/></svg>Party</button>
-  <button class="btn" id="btn-settings" title="Settings"><svg viewBox="0 0 24 24"><use href="#ic-settings"/></svg>Settings</button>
+  <button class="btn" id="btn-party"><svg viewBox="0 0 24 24"><use href="#ic-users"/></svg>Party</button>
+  <button class="btn" id="btn-settings"><svg viewBox="0 0 24 24"><use href="#ic-settings"/></svg>Settings</button>
 </div>
 
 <main id="view-library">
@@ -440,8 +440,8 @@
       <div class="ss-head">
         <span class="ss-title">Sync subtitles</span>
         <span class="ss-delay" id="ss-delay"></span>
-        <button class="ss-mini" id="ss-reset" title="Remove the offset">Reset</button>
-        <button class="ss-mini" id="ss-close" title="Close (the sync is kept)">Done</button>
+        <button class="ss-mini" id="ss-reset">Reset</button>
+        <button class="ss-mini" id="ss-close">Done</button>
       </div>
       <div class="ss-scrollwrap">
         <div class="ss-list" id="ss-list">
@@ -449,7 +449,7 @@
         </div>
       </div>
     </div>
-    <button class="pback" id="pback" title="Back">← Back</button>
+    <button class="pback" id="pback">← Back</button>
     <div class="ctrl" id="ctrl">
       <div class="strip">
         <button class="pb" id="ppbtn" title="Play / Pause">
@@ -521,7 +521,7 @@
 
 <div class="modal" id="reader-modal" hidden>
   <div class="rdwrap">
-    <button class="pback" id="rd-back" title="Back">← Back</button>
+    <button class="pback" id="rd-back">← Back</button>
     <div class="rdscroll" id="rd-scroll"><div class="rdcol" id="rd-col"></div></div>
     <div class="rdload" id="rd-load" hidden><div class="spin"></div><span id="rd-loadtxt">Loading chapter…</span></div>
     <div class="rderr" id="rd-err" hidden>
@@ -2122,8 +2122,7 @@ async function openReader(rep, label, fromRoute = false) {
     d = await api('/api/library/' + rep.id + '/read/chapter/' + encodeURIComponent(label));
   } catch (e) {
     if (rdCur && rdCur.gen === gen)
-      rdShowError((e.message || 'The chapter could not be loaded.') +
-        '\nThis source may not have ' + (rep.media_type === 'comic' ? 'issue ' : 'chapter ') + label + '.');
+      rdShowError(e.message || 'Could not load chapter.');
     return;
   }
   if (!rdCur || rdCur.gen !== gen) return;
@@ -2290,17 +2289,17 @@ function rdsBuildRow(rep, s, bound) {
   // Auto-match preview: the catalogue IS Weeb Central, so a row carrying a
   // Weeb Central series id binds exactly; anything else matches by title.
   if (s.id === 'weebcentral' && rep.ext_key && /^[A-Z0-9]{26}$/.test(rep.ext_key)) {
-    sub.innerHTML = 'Exact match — ' + esc(rep.title || 'this title') + ' (catalogue id).';
+    sub.innerHTML = '<span class="m">' + esc(movieName(rep)) + '</span>';
   } else {
     api('/api/library/' + rep.id + '/read/source/' + s.id + '/search?q=' + encodeURIComponent(movieName(rep)))
       .then(hits => {
-        if (!hits || !hits.length) { sub.textContent = 'No automatic match — pick the series manually.'; return; }
+        if (!hits || !hits.length) { sub.textContent = 'No match found.'; return; }
         const best = hits[0];
-        sub.innerHTML = 'Matched: <span class="m">' + esc(best.title) + '</span>';
+        sub.innerHTML = '<span class="m">' + esc(best.title) + '</span>';
         row.dataset.autoKey = best.key;
         row.dataset.autoTitle = best.title;
       })
-      .catch(() => { sub.textContent = 'Match lookup failed — pick the series manually.'; });
+      .catch(() => { sub.textContent = 'Search failed.'; });
   }
   row.querySelector('.rds-change').onclick = () => {
     extra.hidden = !extra.hidden;
@@ -2340,7 +2339,7 @@ function rdsBuildSearch(rep, sourceId, extra, row) {
             h.classList.add('sel');
             row.dataset.autoKey = r.key;
             row.dataset.autoTitle = r.title;
-            row.querySelector('.rds-sub-line').innerHTML = 'Picked: <span class="m">' + esc(r.title) + '</span>';
+            row.querySelector('.rds-sub-line').innerHTML = '<span class="m">' + esc(r.title) + '</span>';
           };
           hits.appendChild(h);
         }
@@ -3898,8 +3897,8 @@ function renderSubPanel() {
   if (activeSub && activeSub.id === currentId) {
     const d = ssLoadDelay();
     html += '<h4>Sync</h4>'
-      + '<div class="subrow" id="ssopen" title="Align subtitles with what you hear">'
-      + '<span class="name">Sync subtitles to the audio</span>'
+      + '<div class="subrow" id="ssopen">'
+      + '<span class="name">Sync subtitles</span>'
       + (Math.abs(d) > 0.05 ? '<span class="dl">' + ssFmtDelay(d) + '</span>' : '')
       + '</div>';
   }
@@ -5294,7 +5293,6 @@ function closePartyModal() {
 function renderPartyBtn() {
   const b = $('btn-party');
   b.classList.toggle('on', !!party);
-  b.title = party ? 'Watch party — active' : 'Watch party';
   const pb = $('partybtn');
   if (pb) {
     pb.classList.toggle('on', !!party);
@@ -5510,7 +5508,7 @@ function renderPartyPop() {
       '<h4>Watch party</h4>' +
       '<div class="pt-join"><input type="text" id="pp-invite" placeholder="Paste an invite…">' +
       '<button class="btn primary" id="pp-join">Join</button></div>' +
-      '<div class="pt-hint">To start one, use the party button on a torrent or episode row.</div>';
+      '<div class="pt-hint">Start a party from a torrent or episode.</div>';
     const inp = $('pp-invite');
     const go = () => { if (inp.value.trim()) partyJoin(inp.value); };
     $('pp-join').onclick = go;
