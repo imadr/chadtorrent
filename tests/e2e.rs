@@ -62,6 +62,63 @@ async fn start_http(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_subtitles_are_episode_scoped_and_normalized_to_video_time() {
+    if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("skipping embedded subtitle fixture: ffmpeg is not installed");
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(tmp.path()).await;
+    let id = library.db.insert_item("").unwrap();
+    library.db.update_state(id, "ready").unwrap();
+    let dir = library.config.library_dir.join(id.to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    library.db.update_file_path(id, &dir.to_string_lossy()).unwrap();
+    for (file, text) in [("one.mkv", "Episode one"), ("two.mkv", "Episode two")] {
+        let subtitle = tmp.path().join("input.srt");
+        std::fs::write(&subtitle, format!("1\n00:00:02,000 --> 00:00:03,000\n{text}\n")).unwrap();
+        let output = std::process::Command::new("ffmpeg").args([
+            "-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=s=64x64:d=4:r=1", "-i",
+        ]).arg(&subtitle).args(["-map", "0:v", "-map", "1:0", "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "srt",
+            "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=English", "-output_ts_offset", "5"])
+            .arg(dir.join(file)).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let (http, _, _, srv) = start_http(library.clone()).await;
+    let client = reqwest::Client::new();
+    let list = |file: &str| format!("{http}/api/library/{id}/subs?file={file}");
+    let one: serde_json::Value = client.get(list("one.mkv")).send().await.unwrap().json().await.unwrap();
+    let two: serde_json::Value = client.get(list("two.mkv")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(one["configured"], false);
+    assert_eq!(one["local"].as_array().unwrap().len(), 1);
+    let name = one["local"][0]["name"].as_str().unwrap();
+    assert_ne!(one["local"][0]["name"], two["local"][0]["name"]);
+    let url = format!("{http}/sub/{id}/{name}?file=one.mkv");
+    let response = client.get(&url).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.headers()["content-type"].to_str().unwrap().starts_with("text/vtt"));
+    let vtt = response.text().await.unwrap();
+    assert!(vtt.contains("00:02.000 --> 00:03.000"), "{vtt}");
+    assert!(vtt.contains("Episode one"));
+    assert_eq!(client.get(&url).send().await.unwrap().text().await.unwrap(), vtt);
+    let wrong_file = client.get(format!("{http}/sub/{id}/{name}?file=two.mkv")).send().await.unwrap();
+    assert_eq!(wrong_file.status(), 404);
+    let traversal: serde_json::Value = client.get(list("..%2Fone.mkv")).send().await.unwrap().json().await.unwrap();
+    assert!(traversal["local"].as_array().unwrap().is_empty());
+    library.db.update_state(id, "paused").unwrap();
+    let paused: serde_json::Value = client.get(list("one.mkv")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(paused["embedded_pending"], true);
+    assert!(paused["local"].as_array().unwrap().is_empty());
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 409);
+    std::fs::write(dir.join("embedded-english.srt"), "1\n00:00:01,000 --> 00:00:02,000\nSidecar caption\n").unwrap();
+    let sidecar = client.get(format!("{http}/sub/{id}/embedded-english.srt")).send().await.unwrap();
+    assert_eq!(sidecar.status(), 200);
+    assert!(sidecar.text().await.unwrap().contains("Sidecar caption"));
+    srv.abort();
+    library.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_error_handling() {
     let tmp = TempDir::new().unwrap();
     let library = setup_app(&tmp.path().join("app")).await;

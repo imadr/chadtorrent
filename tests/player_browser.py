@@ -1,6 +1,7 @@
 """Offline WebCodecs regressions using generated media and the real application.
 
 Requires ffmpeg, ffprobe, Python playwright, and Chrome (or CHROME_BIN).
+Fixtures contain silent audio; browser/player output is muted, including PLAYER_SOURCE.
 Run after cargo build: python tests/player_browser.py
 Set PLAYER_BROWSER=firefox to exercise Playwright's installed Firefox.
 Set PLAYER_HEAAC=1 on macOS to include an AudioToolbox HE-AAC fixture.
@@ -31,7 +32,7 @@ def generate(folder, duration, audio_duration=None, audio_delay=0, he_aac=False,
             f"testsrc2=duration={duration}:size=640x360:rate=24"]
     if audio_duration is not None:
         args += ["-itsoffset", str(audio_delay), "-f", "lavfi", "-i",
-                 f"sine=frequency=440:duration={audio_duration}:sample_rate=48000"]
+                 f"anullsrc=sample_rate=48000:channel_layout=mono:duration={audio_duration}"]
     args += ["-c:v", "libx265" if hevc else "libx264", "-preset", "fast", "-g", "144",
              "-keyint_min", "144", "-bf", "3"]
     if hevc:
@@ -52,11 +53,13 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
     async with async_playwright() as p:
         browser_name = os.environ.get("PLAYER_BROWSER", "chromium")
         if browser_name == "firefox":
-            prefs = {"dom.media.webcodecs.h265.enabled": True, "media.hevc.enabled": True} if os.environ.get("PLAYER_FIREFOX_HEVC") == "1" else {}
+            prefs = {"media.volume_scale": "0.0"}
+            if os.environ.get("PLAYER_FIREFOX_HEVC") == "1":
+                prefs.update({"dom.media.webcodecs.h265.enabled": True, "media.hevc.enabled": True})
             browser = await p.firefox.launch(headless=True, firefox_user_prefs=prefs)
         else:
             browser = await p.chromium.launch(executable_path=chrome, headless=True,
-                                             args=["--autoplay-policy=no-user-gesture-required"])
+                                             args=["--autoplay-policy=no-user-gesture-required", "--mute-audio"])
         try:
             page = await browser.new_page()
             errors = []
@@ -64,8 +67,11 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.on("console", lambda m: messages.append(m.text) if m.type in ("error", "warning") else None)
             await page.goto(url)
-            await page.wait_for_function("n=>items.length === n", arg=5 + int(he_aac) + int(hevc) + int(source is not None))
+            await page.wait_for_function("n=>items.length === n", arg=6 + int(he_aac) + int(hevc) + int(source is not None))
             await page.evaluate("""() => {
+                // Keep decoding/scheduling audio for clock regressions, with
+                // zero output gain in both browsers (also for real episodes).
+                v.muted=true;
                 window.testRecords=[];window.testEnds=[];
                 window.testProbes=[];
                 const configure=configureCandidate;
@@ -78,7 +84,7 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                 v.addEventListener('ended',()=>testEnds.push(testRecords.slice()));
                 const b=document.createElement('button');b.id='test-start';b.textContent='Start';
                 b.style='position:fixed;top:0;right:0;z-index:99999';
-                b.onclick=()=>{testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item,window.testFile||null)};
+                b.onclick=()=>{v.muted=true;testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item,window.testFile||null)};
                 document.body.appendChild(b);
             }""")
 
@@ -87,6 +93,49 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                 await page.evaluate("id=>window.testId=id", item_id)
                 await page.click("#test-start")
                 await page.wait_for_function("testRecords.length > 0", timeout=12000)
+                assert await page.evaluate("v.muted && (!P.gain || P.gain.gain.value===0)")
+
+            async def check_subtitles(item_id, file, expected=None):
+                await page.evaluate("({id,file})=>{window.testId=id;window.testFile=file}", {"id": item_id, "file": file})
+                await page.click("#test-start")
+                await page.wait_for_function("testRecords.length>0 || P.err", timeout=20000)
+                assert not await page.evaluate("P.err && P.err.message")
+                assert await page.evaluate("v.muted && (!P.gain || P.gain.gain.value===0)")
+                await page.evaluate("toggleSubsPanel(true)")
+                tracks = await page.evaluate("subsLocal.filter(s=>s.source==='embedded')")
+                if not tracks and expected is None:
+                    return 0
+                assert tracks, "No embedded subtitles listed"
+                track = next((s for s in tracks if s["lang"] == "en" and "forced" not in s["label"]), tracks[0])
+                row = page.locator('#subpanel .subrow[data-local][data-name="' + track["name"] + '"]')
+                assert track["label"] in await row.inner_text()
+                if expected == "Embedded episode one":
+                    async def fail_subtitle(route):
+                        await route.fulfill(status=503, body="temporary subtitle failure")
+                    await page.route("**/sub/9/**", fail_subtitle)
+                    await row.click(force=True)
+                    await page.wait_for_function("subLoadError.length>0")
+                    assert "Select it again to retry" in await page.locator("#subpanel").inner_text()
+                    await page.unroute("**/sub/9/**", fail_subtitle)
+                await row.click(force=True)
+                await page.wait_for_function("subTrack() && subTrack().cues.length>0", timeout=10000)
+                if expected:
+                    assert await page.evaluate("subTrack().cues[0].text") == expected
+                    assert abs(await page.evaluate("subTrack().cues[0].startTime") - 1) < 0.01
+                await page.evaluate("()=>{toggleSubsPanel(false);v.pause();const c=subTrack().cues[0];seekTo((c.startTime+c.endTime)/2)}")
+                await page.wait_for_function("pendSeek===null && !document.getElementById('suboverlay').hidden", timeout=10000)
+                assert await page.evaluate("document.querySelector('#suboverlay span').textContent.includes(subTrack().cues[0].getCueAsHTML().textContent)")
+                assert await page.evaluate("v.paused")
+                return len(tracks)
+
+            await check_subtitles(9, "one.mkv", "Embedded episode one")
+            await check_subtitles(9, "two.mkv", "Embedded episode two")
+            # Reopening the first file restores its own selection, never the
+            # second episode's track; cached VTT must also render while paused.
+            await page.evaluate("()=>{window.testId=9;window.testFile='one.mkv'}")
+            await page.click("#test-start")
+            await page.wait_for_function("subTrack() && subTrack().cues.length>0", timeout=10000)
+            assert await page.evaluate("subTrack().cues[0].text") == "Embedded episode one"
 
             async def stress_seeks(targets):
                 for target in targets:
@@ -317,12 +366,16 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                 await stress_seeks([114.046, 500.3, 25.1, 113.9, 900.3, 114.04] * 4)
                 await inject_decoder_failure("video", False, 114.04)
                 await inject_decoder_failure("audio", True, 114.04)
+                embedded_tracks = await check_subtitles(8, source.name)
+                print(json.dumps({"existing_source_embedded_tracks": embedded_tracks}))
             assert not errors, errors
             print(json.dumps({"browser": browser_name, "version": browser.version, "seek_ms": latencies,
                               "checks": ["accurate seeks", "video-only", "paused seek", "cache rebuild",
                                          "server restart", "delayed audio", "short B-frame EOF", "audio EOF video tail", "paused EOF seek",
                                          "repeated/rapid seeks", "video decoder recovery", "paused audio decoder recovery", "flush recovery",
-                                         "stream error retry", "bounded retries and retry button"],
+                                         "stream error retry", "bounded retries and retry button",
+                                         "embedded subtitle menu, normalized timing and paused rendering",
+                                         "subtitle error retry", "per-episode subtitle persistence"],
                               "he_aac": he_aac_result,
                               "hevc": hevc_result,
                               "existing_source": str(source) if source else None,
@@ -344,6 +397,14 @@ async def main():
         generate(library / "3", 6, 4, 2)
         generate(library / "4", 0.4, 0.4)
         generate(library / "5", 6, 3)
+        (library / "9").mkdir()
+        for file, text in [("one.mkv", "Embedded episode one"), ("two.mkv", "Embedded episode two")]:
+            subtitle = tmp / "input.srt"
+            subtitle.write_text(f"1\n00:00:01,000 --> 00:00:03,000\n{text}\n")
+            subprocess.run(["ffmpeg", "-v", "error", "-i", str(library / "3" / "clip.mp4"), "-i", str(subtitle),
+                            "-map", "0", "-map", "1:0", "-c", "copy", "-c:s", "srt",
+                            "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=English",
+                            "-output_ts_offset", "5", str(library / "9" / file)], check=True)
         he_aac = os.environ.get("PLAYER_HEAAC") == "1"
         if he_aac:
             generate(library / "6", 6, 6, he_aac=True)
@@ -387,7 +448,7 @@ async def main():
             try:
                 await wait_ready()
                 with sqlite3.connect(tmp / "test.db") as db:
-                    fixture_ids = list(range(1, 6)) + ([6] if he_aac else []) + ([7] if hevc else []) + ([8] if source else [])
+                    fixture_ids = list(range(1, 6)) + [9] + ([6] if he_aac else []) + ([7] if hevc else []) + ([8] if source else [])
                     for item_id in fixture_ids:
                         db.execute("INSERT INTO library (id,magnet,title,state,file_path,added_at) "
                                    "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",

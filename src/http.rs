@@ -954,9 +954,41 @@ async fn video_info(state: &AppState, id: i64, file: Option<&str>) -> Option<(Pa
     Some((full, stem))
 }
 
-/// Local subtitles: everything found in the torrent folder plus anything we
-/// downloaded into `.subs/`.
-async fn subs_list(State(state): State<AppState>, Path(id): Path<i64>) -> Result<impl IntoResponse> {
+/// Select only an owned, fully downloaded media file for subtitle extraction.
+/// Sparse partial files must not be probed/extracted as if their zeros were data.
+async fn subtitle_video(
+    state: &AppState, id: i64, file: Option<&str>,
+) -> Result<Option<(PathBuf, bool)>> {
+    let item = state.library.db.get_item(id)?
+        .ok_or_else(|| Error::NotFound(format!("item {id} not found")))?;
+    let files = state.library.list_item_files(id).await?;
+    let selected = files.iter().find(|f| {
+        f.video && file.map(|p| {
+            crate::episodes::normalize_rel_path(&f.path) == crate::episodes::normalize_rel_path(p)
+        }).unwrap_or(f.default)
+    });
+    let Some(selected) = selected else { return Ok(None) };
+    let verified = !selected.skipped && (item.state == "ready"
+        || (state.library.engine.get_torrent(id).await.is_some()
+            && selected.size > 0 && selected.have >= selected.size));
+    let Some((path, _)) = video_info(state, id, Some(&selected.path)).await else {
+        return Ok(None);
+    };
+    let path = if verified {
+        tokio::fs::canonicalize(path).await?
+    } else {
+        path
+    };
+    Ok(Some((path, verified)))
+}
+
+/// Local sidecars, downloaded subtitles, and embedded text tracks for the
+/// selected episode. Bitmap subtitles require a different renderer.
+async fn subs_list(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
+) -> Result<impl IntoResponse> {
     state
         .library
         .db
@@ -970,9 +1002,29 @@ async fn subs_list(State(state): State<AppState>, Path(id): Path<i64>) -> Result
             local.push(s);
         }
     }
+    let file = query_file(&params);
+    let mut embedded_pending = false;
+    let mut embedded_error = None;
+    if let Some((path, verified)) = subtitle_video(&state, id, file.as_deref()).await? {
+        if verified {
+            match subtitles::embedded_subs(&path).await {
+                Ok(tracks) => local.extend(tracks),
+                Err(error) => {
+                    warn!("embedded subtitles for {id}: {error:#}");
+                    embedded_error = Some("Could not inspect embedded subtitles");
+                }
+            }
+        } else {
+            embedded_pending = true;
+        }
+    } else {
+        embedded_pending = state.library.db.get_item(id)?.is_some_and(|i| i.state != "ready");
+    }
     Ok(Json(json!({
         "configured": state.subs.is_some(),
         "local": local,
+        "embedded_pending": embedded_pending,
+        "embedded_error": embedded_error,
     })))
 }
 
@@ -1097,16 +1149,16 @@ async fn subs_delete(
 async fn sub_file(
     State(state): State<AppState>,
     Path((id, name)): Path<(i64, String)>,
+    axum::extract::Query(params): axum::extract::Query<serde_json::Value>,
 ) -> Response {
     if name.contains("..") || name.contains('/') || name.contains('\\') {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let (item_dir, subs_dir) = subs_dirs(&state, id);
-    // downloaded: already VTT
+    // Existing sidecars retain their names, including ones named embedded-*.
     if let Ok(bytes) = tokio::fs::read(subs_dir.join(&name)).await {
         return vtt_response(bytes);
     }
-    // torrent folder: convert to VTT on the fly
     if let Some(path) = subtitles::resolve_sub_path(&item_dir, &name) {
         if let Ok(bytes) = tokio::fs::read(&path).await {
             return match subtitles::to_vtt(&name, &bytes) {
@@ -1117,6 +1169,45 @@ async fn sub_file(
                 }
             };
         }
+    }
+    if name.starts_with("embedded-") {
+        let file = query_file(&params);
+        let (path, verified) = match subtitle_video(&state, id, file.as_deref()).await {
+            Ok(Some(source)) => source,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(e) => return e.into_response(),
+        };
+        if !verified {
+            return (StatusCode::CONFLICT,
+                "Embedded subtitles are available after this file finishes downloading").into_response();
+        }
+        let Some(index) = subtitles::embedded_index(&path, &name) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let tracks = match subtitles::embedded_subs(&path).await {
+            Ok(tracks) => tracks,
+            Err(error) => {
+                warn!("embedded subtitle probe failed: {error:#}");
+                return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+            }
+        };
+        if !tracks.iter().any(|t| t.name == name) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let video_start = match Remuxer::probe_source_timing(&path.to_string_lossy()).await {
+            Some(timing) => timing.video_start,
+            None => return (StatusCode::UNPROCESSABLE_ENTITY,
+                "Could not read subtitle timeline").into_response(),
+        };
+        let cache = state.library.config.temp_dir
+            .join(id.to_string()).join("embedded-subs");
+        return match subtitles::embedded_vtt(&path, index, video_start, &cache).await {
+            Ok(bytes) => vtt_response(bytes),
+            Err(error) => {
+                warn!("embedded subtitle extraction failed: {error:#}");
+                StatusCode::UNPROCESSABLE_ENTITY.into_response()
+            }
+        };
     }
     StatusCode::NOT_FOUND.into_response()
 }

@@ -16,17 +16,130 @@ use crate::config::{ApiKeys, Usage};
 /// Subtitle file extensions we recognize on disk.
 const SUB_EXTS: &[&str] = &["srt", "vtt", "ass", "ssa"];
 
-/// A subtitle file found locally (torrent folder or downloaded).
+/// A local subtitle file or embedded text track.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LocalSub {
     /// File name (unique within the item's subtitle set).
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// ISO 639 code when known (e.g. "en"), otherwise null.
     pub lang: Option<String>,
     /// Flag emoji for the language.
     pub flag: String,
-    /// Where it came from: found in the torrent, or downloaded by us.
+    /// Where it came from: torrent sidecar, downloaded, or embedded.
     pub source: String,
+}
+
+/// Embedded text tracks have stable per-file identifiers. Text conversion is
+/// separate from the A/V remuxer; no audio or video is ever re-encoded.
+pub async fn embedded_subs(path: &Path) -> anyhow::Result<Vec<LocalSub>> {
+    let output = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v", "error", "-select_streams", "s", "-show_entries",
+            "stream=index,codec_name:stream_tags=language,title:stream_disposition=default,forced",
+            "-of", "json",
+        ])
+        .arg(path)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(), "could not inspect embedded subtitles: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    embedded_from_json(path, &serde_json::from_slice(&output.stdout)?)
+}
+
+fn text_subtitle_codec(codec: &str) -> bool {
+    matches!(
+        codec,
+        "subrip" | "srt" | "ass" | "ssa" | "webvtt" | "mov_text" | "text"
+    )
+}
+
+fn path_hash(path: &Path) -> u64 {
+    path.to_string_lossy().bytes().fold(0xcbf29ce484222325u64, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    })
+}
+
+pub fn embedded_name(path: &Path, index: u32) -> String {
+    format!("embedded-{:016x}-{index}.vtt", path_hash(path))
+}
+
+pub fn embedded_index(path: &Path, name: &str) -> Option<u32> {
+    name.strip_prefix(&format!("embedded-{:016x}-", path_hash(path)))?
+        .strip_suffix(".vtt")?
+        .parse()
+        .ok()
+}
+
+fn embedded_from_json(path: &Path, json: &serde_json::Value) -> anyhow::Result<Vec<LocalSub>> {
+    let streams = json["streams"].as_array()
+        .ok_or_else(|| anyhow!("invalid subtitle stream metadata"))?;
+    Ok(streams.iter().filter_map(|stream| {
+        if !text_subtitle_codec(stream["codec_name"].as_str()?) {
+            return None;
+        }
+        let index = u32::try_from(stream["index"].as_u64()?).ok()?;
+        let language = stream["tags"]["language"].as_str().filter(|s| *s != "und");
+        let lang = language.map(|code| detect_lang(code, None).unwrap_or_else(|| code.to_lowercase()));
+        let title = stream["tags"]["title"].as_str().filter(|s| !s.trim().is_empty());
+        let mut label = title.or(language).map(str::to_owned)
+            .unwrap_or_else(|| format!("Track {index}"));
+        if stream["disposition"]["forced"].as_u64() == Some(1) {
+            label.push_str(" · forced");
+        }
+        if stream["disposition"]["default"].as_u64() == Some(1) {
+            label.push_str(" · default");
+        }
+        Some(LocalSub {
+            name: embedded_name(path, index),
+            label: Some(label),
+            flag: flag_for(lang.as_deref()),
+            lang,
+            source: "embedded".into(),
+        })
+    }).collect())
+}
+
+pub async fn embedded_vtt(
+    path: &Path, index: u32, video_start: f64, cache: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    let metadata = tokio::fs::metadata(path).await?;
+    let modified = metadata.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let key = format!("{:016x}-{}-{modified}", path_hash(path), metadata.len());
+    let dir = cache.join(key);
+    let target = dir.join(format!("{index}.vtt"));
+    if let Ok(bytes) = tokio::fs::read(&target).await {
+        return Ok(bytes);
+    }
+    // Preserve source cue times, then normalize to the same video origin as
+    // the segment player. Starting the first subtitle at zero loses sync.
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-xerror", "-copyts", "-i"])
+        .arg(path)
+        .args([
+            "-map", &format!("0:{index}"), "-c:s", "webvtt",
+            "-output_ts_offset", &(-video_start).to_string(), "-f", "webvtt", "pipe:1",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(), "could not extract embedded subtitle: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    anyhow::ensure!(
+        output.stdout.starts_with(b"WEBVTT"), "invalid embedded subtitle output"
+    );
+    tokio::fs::create_dir_all(&dir).await?;
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let temporary = dir.join(format!("{index}-{nonce}.tmp"));
+    tokio::fs::write(&temporary, &output.stdout).await?;
+    tokio::fs::rename(temporary, target).await?;
+    Ok(output.stdout)
 }
 
 // ---------- language tables ----------
@@ -388,6 +501,7 @@ pub fn scan_local_subs(dir: &Path) -> Vec<LocalSub> {
             let lang = detect_lang(&name, text.as_deref());
             out.push(LocalSub {
                 name,
+                label: None,
                 lang: lang.clone(),
                 flag: flag_for(lang.as_deref()),
                 source: "torrent".to_string(),
@@ -748,6 +862,27 @@ pub fn movie_hash(path: &Path, file_size: u64) -> anyhow::Result<(String, u64)> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_tracks_keep_metadata_and_are_scoped_to_the_video() {
+        let path = Path::new("/library/1/episode.mkv");
+        let tracks = embedded_from_json(path, &serde_json::json!({"streams": [
+            {"index": 3, "codec_name": "subrip", "tags": {"language": "eng", "title": "English [Full]"}, "disposition": {"default": 1}},
+            {"index": 4, "codec_name": "ass", "tags": {"language": "jpn"}, "disposition": {"forced": 1}},
+            {"index": 5, "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "eng"}},
+            {"index": 6, "codec_name": "dvd_subtitle"},
+            {"index": 7, "codec_name": "webvtt", "tags": {"language": "und"}}
+        ]})).unwrap();
+        assert_eq!(tracks.len(), 3);
+        assert_eq!(tracks[0].label.as_deref(), Some("English [Full] · default"));
+        assert_eq!(tracks[0].lang.as_deref(), Some("en"));
+        assert_eq!(tracks[0].flag, "🇬🇧");
+        assert_eq!(tracks[0].source, "embedded");
+        assert_eq!(embedded_index(path, &tracks[0].name), Some(3));
+        assert_eq!(embedded_index(Path::new("/library/1/other.mkv"), &tracks[0].name), None);
+        assert!(tracks[1].label.as_deref().unwrap().contains("forced"));
+        assert_eq!(tracks[2].lang, None);
+    }
 
     #[test]
     fn srt_becomes_vtt() {

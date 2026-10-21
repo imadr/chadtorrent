@@ -3390,8 +3390,10 @@ async function playTorrent(item, file) {
   if (!partyHoldPlay) v.play();
   // restore the subtitle choice for this item (applySubTrack pulls the saved
   // sync offset from storage too); explicit "None" wins.
-  const subPick = subPickStore()[currentId];
-  if (subPick) { activeSub = { id: currentId, name: subPick }; applySubTrack(); }
+  const picks = subPickStore();
+  const legacyPick = picks[currentId];
+  const subPick = picks[subChoiceKey()] || (legacyPick && !legacyPick.startsWith('embedded-') ? legacyPick : null);
+  if (subPick) { activeSub = { id: currentId, file: currentFile || '', name: subPick }; applySubTrack(); }
   else activeSub = null;
 }
 
@@ -3567,6 +3569,10 @@ function stopPlayback() {
   segGen++;
   teardownWC();
   if (activeSub) ssSaveDelay(); // persist any un-committed sync offset
+  subListRequest++; subTrackRequest++;
+  activeSub = null; vSubTrack = null;
+  renderActiveCues(); subRenderStop();
+  subLoadError = ''; subsNotice = '';
   subPanelOpen = false;
   const sp = $('subpanel'); if (sp) sp.classList.remove('open');
   ssToggle(false);
@@ -3807,6 +3813,7 @@ v.addEventListener('volumechange', updVol);
 /* ---------- subtitles ---------- */
 let subPanelOpen = false, subsLocal = [], subsConfigured = false, subsOnline = null;
 let subsLoadedFor = null, activeSub = null, subBusy = false;
+let subsNotice = '', subLoadError = '', subListRequest = 0, subTrackRequest = 0;
 let subDeleteConfirm = null;
 
 const esc2 = esc;
@@ -3840,14 +3847,16 @@ function renderSubPanel() {
   html += '<h4>Subtitles</h4>';
   html += '<div class="subrow' + (!activeSub || activeSub.id !== currentId ? ' active' : '') + '" data-none="1">'
     + '<span class="name">None</span></div>';
-  if (!subsLocal.length) html += '<div class="empty">No subtitles in this torrent</div>';
+  if (subLoadError) html += '<div class="empty">' + esc2(subLoadError) + '</div>';
+  if (subsNotice) html += '<div class="empty">' + esc2(subsNotice) + '</div>';
+  if (!subsLocal.length && !subsNotice) html += '<div class="empty">' + (subBusy ? 'Loading subtitles…' : 'No subtitles in this torrent') + '</div>';
   else for (const s of subsLocal) {
     const del = s.source === 'downloaded' && !s.pending;
     html += '<div class="subrow' + (activeSub && activeSub.name === s.name ? ' active' : '') + '" data-name="' + esc2(s.name) + '" data-local="1"' + (s.pending ? ' data-pending="1"' : '') + '>'
-      + flagSpan(s.flag) + '<span class="name">' + esc2(s.name) + '</span>'
+      + flagSpan(s.flag) + '<span class="name">' + esc2(s.label || s.name) + '</span>'
       + (s.pending ? '<span class="dl">downloading…</span>' : (del
         ? '<span class="dl sub-del' + (s.name === subDeleteConfirm ? ' danger' : '') + '" data-del="1" data-name="' + esc2(s.name) + '">' + (s.name === subDeleteConfirm ? 'confirm?' : 'downloaded') + '</span>'
-        : '')) + '</div>';
+        : (s.source === 'embedded' ? '<span class="dl">embedded</span>' : ''))) + '</div>';
   }
   html += '<div class="oswrap">';
   html += '<h4>OpenSubtitles</h4>';
@@ -3973,14 +3982,15 @@ async function onSubRowClick(row) {
     renderSubPanel();
     return;
   }
-  if (subBusy || row.dataset.pending) return;
+  if (row.dataset.pending) return;
   if (row.dataset.local) {
     const name = row.dataset.name;
-    if (activeSub && activeSub.name === name) disableSub();
+    if (activeSub && activeSub.name === name && !subLoadError) disableSub();
     else enableSub(name);
     renderSubPanel();
     return;
   }
+  if (subBusy) return;
   // Don't toggle subBusy while downloading — the OpenSubtitles result list
   // stays up ("Searching…" would blink), and the row we're downloading is
   // already pre-added below, so the panel size doesn't change either.
@@ -4031,15 +4041,18 @@ async function onSubDelClick(el) {
 function subPickStore() {
   try { return JSON.parse(localStorage.getItem('chadtorrent.subpick') || '{}'); } catch (e) { return {}; }
 }
+function subChoiceKey() { return currentFile ? currentId + '|' + currentFile : String(currentId); }
+function subSourceKey() { return currentId + ':' + (currentFile || ''); }
 function subPickSave(name) {
   if (currentId == null) return;
   const m = subPickStore();
-  if (name) m[currentId] = name; else delete m[currentId];
+  if (name) m[subChoiceKey()] = name; else delete m[subChoiceKey()];
+  if (currentFile) delete m[currentId];
   try { localStorage.setItem('chadtorrent.subpick', JSON.stringify(m)); } catch (e) {}
 }
 
 function enableSub(name) {
-  activeSub = { id: currentId, name };
+  activeSub = { id: currentId, file: currentFile || '', name };
   subPickSave(name);
   applySubTrack();
 }
@@ -4066,8 +4079,11 @@ function parseVtt(text) {
 }
 
 function applySubTrack() {
+  const request = ++subTrackRequest, source = subSourceKey();
+  subLoadError = '';
   vSubTrack = null;
-  if (!activeSub || activeSub.id !== currentId) {
+  renderActiveCues();
+  if (!activeSub || activeSub.id !== currentId || activeSub.file !== (currentFile || '')) {
     if (ssVisible()) ssToggle(false);
     subRenderStop();
     renderActiveCues();
@@ -4075,16 +4091,21 @@ function applySubTrack() {
   }
   ssDelay = ssLoadDelay();
   const want = activeSub;
-  fetch('/sub/' + currentId + '/' + encodeURIComponent(want.name))
+  fetch('/sub/' + currentId + '/' + encodeURIComponent(want.name) + segFileQ())
     .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
     .then(txt => {
-      if (want !== activeSub) return;    // switched away while fetching
+      if (request !== subTrackRequest || source !== subSourceKey() || want !== activeSub) return;
       vSubTrack = parseVtt(txt);
       ssTrackReady(vSubTrack);
       subRenderStart();
       renderActiveCues();
     })
-    .catch(e => console.error('subtitle load failed', e));
+    .catch(e => {
+      if (request !== subTrackRequest || source !== subSourceKey() || want !== activeSub) return;
+      console.error('subtitle load failed', e);
+      subLoadError = 'Could not load this subtitle. Select it again to retry.';
+      if (subPanelOpen) renderSubPanel();
+    });
 }
 
 async function toggleSubsPanel(show) {
@@ -4094,21 +4115,29 @@ async function toggleSubsPanel(show) {
   p.classList.toggle('open', subPanelOpen);
   if (!subPanelOpen) syncCtrlVis(); // back to bottom-10% hide rule right away
   if (!subPanelOpen || currentId == null) return;
-  const subKey = currentId + ':' + (currentFile || '');
+  const subKey = subSourceKey();
   if (subsLoadedFor !== subKey) {
-    subsLocal = []; subsOnline = null; subsConfigured = false; subBusy = true; renderSubPanel();
+    const request = ++subListRequest, id = currentId, fileQ = segFileQ();
+    const stale = () => request !== subListRequest || subKey !== subSourceKey();
+    subsLocal = []; subsOnline = null; subsConfigured = false; subsNotice = ''; subBusy = true; renderSubPanel();
     try {
-      const info = await api('/api/library/' + currentId + '/subs');
+      const info = await api('/api/library/' + id + '/subs' + fileQ);
+      if (stale()) return;
       subsLocal = info.local || []; subsConfigured = !!info.configured;
+      subsNotice = info.embedded_error || (info.embedded_pending ? 'Embedded subtitles become available when this file finishes downloading.' : '');
+      if (!info.embedded_pending && !info.embedded_error) subsLoadedFor = subKey;
+      renderSubPanel();
       if (subsConfigured) {
         subBusy = true; renderSubPanel();
         try {
-          const res = await api('/api/library/' + currentId + '/subs/search' + segFileQ());
+          const res = await api('/api/library/' + id + '/subs/search' + fileQ);
+          if (stale()) return;
           subsOnline = res.results || []; subsConfigured = !!res.configured;
-        } catch (e) { subsOnline = null; }
+        } catch (e) { if (stale()) return; subsOnline = null; }
       }
-    } catch (e) { console.error('subs list failed', e); }
-    subBusy = false; subsLoadedFor = subKey;
+    } catch (e) { if (stale()) return; console.error('subs list failed', e); subsNotice = 'Could not load subtitles. Reopen this menu to retry.'; }
+    if (stale()) return;
+    subBusy = false;
   }
   renderSubPanel();
 }

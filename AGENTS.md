@@ -34,7 +34,7 @@ src/
   metadata.rs    TMDB API client (search + detail fetch) + `MetaCache` (tmdb_meta-backed read cache, TTL'd background refresh)
   reading.rs     Reading catalogues (ground truth): MangaDex search + chapter sweep, Comic Vine issues, AniList covers
   reader.rs      Reading sources (chapter PAGES): MangaDex at-home + Weeb Central scraping, page-image proxy
-  subtitles.rs   OpenSubtitles client (search/download) + local subs scan
+  subtitles.rs   OpenSubtitles client, local subs scan, embedded text tracks → cached WebVTT
   party/         Watch parties (see below): protocol, relay, PartyManager
   bin/relay.rs   `chadtorrent-relay`: standalone stateless relay binary
   error.rs       Error types mapping to HTTP status codes
@@ -61,6 +61,8 @@ tests/
 
 These supersede the historical timing/input details in data-flow item 3 above.
 
+- Subtitle discovery (`GET /api/library/:id/subs?file=...`) includes embedded text tracks of the selected video. Extraction is on demand via FFmpeg to WebVTT, cached under `temp_dir/{id}/embedded-subs/` by canonical source path, size and modification time. Cue timestamps are normalized by the original video's start time, matching the player timeline. Only ready, non-skipped files or fully verified active-torrent files are probed/extracted; partial/paused sparse files show a pending notice. Bitmap subtitles are not advertised as text. Selection persists per item/file; listing and VTT responses are guarded against stale playback/episode requests.
+
 - Segments are keyframe-aligned, with a **4s target**, closed before the next fragment at the target boundary; long source GOPs still make longer segments. Caches live beneath `.seg/default/` or `.seg/<file-hash>/`, in generation-specific directories. The manifest carries `generation` and `timing`; init/segment URLs require `?g=<generation>` (plus `file` when applicable). A stale generation returns 410 and the browser rebuilds at its saved position while retaining its AudioContext and paused state.
 - FFmpeg still uses **`-c copy`**. `negative_cts_offsets` prevents the first audio packet being stretched to cover video B-frame lead-in. Live torrents use a private loopback **HTTP range input backed by FileStream**, so FFmpeg/FFprobe can seek for container indexes without reading unverified bytes. Paused partial downloads stay on FileStream. `-xerror`, stderr, incomplete output, and empty output are terminal failures.
 - Demux sample fields inherit **trun → tfhd → mvex/trex**. Missing durations fail; there is no inferred duration, one-tick video fallback, or universal AAC-frame-size assumption.
@@ -71,6 +73,7 @@ These supersede the historical timing/input details in data-flow item 3 above.
 - Decoded PCM buffers are **not required to match individual packet durations**: timestamp gaps, decoder batching and padding can differ. Only a known complete audio-track end limits tail PCM. Native decoder callbacks, synchronous `decode()` errors and flush failures use the same generation-safe recovery: up to three retries in 30s, conservative video preroll and bounded backoff. Rapid seeks coalesce before native decoder allocation. Recovery retains position, paused state and AudioContext; exhausted retries preserve the session and show a **Retry playback** button. A new user seek resets the retry budget.
 - Browser regressions include repeated/rapid seeks and injected native decoder failures, including paused recovery and retry exhaustion. `PLAYER_SOURCE=/path/to/episode.mkv` adds read-only tests against an existing episode using a temporary database/cache; `PLAYER_FIREFOX_HEVC=1` enables experimental HEVC only in the isolated Firefox test profile.
 - `tests/player.test.cjs` exercises the shipped inline engine. `tests/player_browser.py` runs an isolated server with generated H.264/AAC files (no torrent downloads), checks the normalized timeline against original FFprobe packets, and verifies accurate/paused seeks, video-only files longer than the 45s fetch window, cache rebuilds and server restarts, delayed audio, B-frame EOF, audio-EOF video tails, and paused EOF seeks. Optional `PLAYER_HEAAC=1` uses macOS AudioToolbox; unsupported browser decoders must produce a terminal error, not a spinner.
+- Browser tests must be silent: generate silent audio fixtures, mute the player before playback, and mute browser output. Keep audio decoding and scheduling active for clock checks, including read-only `PLAYER_SOURCE` runs; never play audible test tones.
 
 ## TMDB metadata is cached whole, refreshed by TTL
 
