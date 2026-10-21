@@ -32,6 +32,94 @@ function box(type, ...parts) {
   return Buffer.concat([u32(data.length + 8), Buffer.from(type), data]);
 }
 function arrayBuffer(b) { return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
+
+function wakeEngine(request) {
+  const c = engine();
+  c.document = new EventTarget(); c.document.visibilityState = 'visible';
+  c.navigator = { wakeLock: { request } };
+  Object.assign(c.P, { id: 1, paused: false });
+  const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
+  vm.runInContext(html.slice(html.indexOf("for (const event of ['play', 'playing'"), html.indexOf('const ppic =')), c);
+  return c;
+}
+function wakeSentinel() {
+  const lock = new EventTarget();
+  lock.released = false;
+  lock.release = async () => { lock.released = true; lock.dispatchEvent(new Event('release')); };
+  return lock;
+}
+
+test('screen wake lock follows playback, visibility, EOF and stop without duplicate requests', async () => {
+  const locks = [];
+  const c = wakeEngine(async type => {
+    assert.equal(type, 'screen');
+    const lock = wakeSentinel(); locks.push(lock); return lock;
+  });
+  c.v.dispatchEvent(new Event('play'));
+  c.v.dispatchEvent(new Event('playing'));
+  c.v.dispatchEvent(new Event('canplay'));
+  await c.syncScreenWakeLock();
+  assert.equal(locks.length, 1);
+  assert.equal(locks[0].released, false);
+
+  c.P.paused = true; c.v.dispatchEvent(new Event('pause'));
+  assert.equal(locks[0].released, true);
+  c.P.paused = false; c.v.dispatchEvent(new Event('play'));
+  await c.syncScreenWakeLock();
+  assert.equal(locks.length, 2);
+  c.document.visibilityState = 'hidden'; c.document.dispatchEvent(new Event('visibilitychange'));
+  assert.equal(locks[1].released, true);
+  c.document.visibilityState = 'visible'; c.document.dispatchEvent(new Event('visibilitychange'));
+  await c.syncScreenWakeLock();
+  assert.equal(locks.length, 3);
+
+  c.P.endedFired = true; c.v.dispatchEvent(new Event('ended'));
+  assert.equal(locks[2].released, true);
+  c.P.endedFired = false; c.v.dispatchEvent(new Event('seeked'));
+  await c.syncScreenWakeLock();
+  assert.equal(locks.length, 4);
+  c.P.id = null; await c.syncScreenWakeLock();
+  assert.equal(locks[3].released, true);
+});
+
+test('a wake lock requested before pause or close is released when acquisition finishes', async () => {
+  for (const stop of [c => { c.P.paused = true; }, c => { c.P.id = null; }]) {
+    let resolve;
+    const c = wakeEngine(() => new Promise(r => { resolve = r; }));
+    const pending = c.syncScreenWakeLock();
+    stop(c); await c.syncScreenWakeLock();
+    const lock = wakeSentinel(); resolve(lock); await pending;
+    assert.equal(lock.released, true);
+    assert.equal(vm.runInContext('screenWakeLock', c), null);
+  }
+});
+
+test('browser-released wake locks are reacquired on return to the visible tab', async () => {
+  const locks = [];
+  const c = wakeEngine(async () => { const lock = wakeSentinel(); locks.push(lock); return lock; });
+  await c.syncScreenWakeLock();
+  await locks[0].release();
+  assert.equal(vm.runInContext('screenWakeLock', c), null);
+  c.document.visibilityState = 'hidden'; c.document.dispatchEvent(new Event('visibilitychange'));
+  c.document.visibilityState = 'visible'; c.document.dispatchEvent(new Event('visibilitychange'));
+  await c.syncScreenWakeLock();
+  assert.equal(locks.length, 2);
+  assert.equal(locks[1].released, false);
+});
+
+test('wake-lock denial and unsupported browsers leave playback alone', async () => {
+  let requests = 0;
+  const c = wakeEngine(async () => { requests++; throw new Error('denied'); });
+  await c.syncScreenWakeLock();
+  assert.equal(requests, 1);
+  assert.equal(c.P.err, null);
+  assert.equal(c.P.paused, false);
+  assert.equal(vm.runInContext('screenWakePending', c), false);
+  c.navigator = {};
+  await c.syncScreenWakeLock();
+  assert.equal(requests, 1);
+});
+
 function fragment({ defaults = [], tfhdFlags = 0, runFlags = 0, rows = [], count = 3 } = {}) {
   const tfhd = box('tfhd', u32(0x020000 | tfhdFlags, 1, ...defaults));
   const tfdt = box('tfdt', u32(0, 100));

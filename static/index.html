@@ -2429,6 +2429,35 @@ const P = {
   raf: 0,
 };
 
+let screenWakeLock = null, screenWakePending = false;
+function screenWakeWanted() {
+  return P.id != null && !P.paused && !P.err && !P.endedFired && document.visibilityState === 'visible';
+}
+async function syncScreenWakeLock() {
+  if (!globalThis.navigator?.wakeLock) return;
+  if (!screenWakeWanted()) {
+    const lock = screenWakeLock;
+    screenWakeLock = null;
+    if (lock) lock.release().catch(() => {});
+    return;
+  }
+  if ((screenWakeLock && !screenWakeLock.released) || screenWakePending) return;
+  screenWakePending = true;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    if (!screenWakeWanted()) { lock.release().catch(() => {}); return; }
+    if (lock.released) return;
+    screenWakeLock = lock;
+    lock.addEventListener('release', () => {
+      if (screenWakeLock === lock) screenWakeLock = null;
+    });
+  } catch (e) {
+    // Unsupported contexts and OS/browser denial do not affect playback.
+  } finally {
+    screenWakePending = false;
+  }
+}
+
 /* Audio-master clock: one second of actual PCM equals one second of media.
  * Read the device output position, not the schedule-ahead position. At drained
  * audio EOF the same clock continues through the video tail; video-only files
@@ -2754,6 +2783,7 @@ function handleFeedError(error, gen, id) {
 function holdPlaybackError(error, position = pendSeek ?? mediaNow()) {
   seekTo(position, false, { recovery: true, hold: true });
   P.err = error;
+  syncScreenWakeLock();
   showBuf(error.decoder ? 'Playback interrupted' : 'Playback error: ' + (error.message || error), true);
 }
 
@@ -3582,6 +3612,7 @@ function teardownWC(keepContext = false) {
   if (P.gain) { try { P.gain.disconnect(); } catch (e) {} P.gain = null; }
   if (P.ctx && !keepContext) { const c = P.ctx; P.ctx = null; c.close().catch(() => {}); }
   P.anchor = null; P.nextAt = 0; P.sched = []; P.noAudio = false; P.wall = null; P.paused = true; P.lastT = 0; P.flow = 0;
+  syncScreenWakeLock();
   P.fetchN = 1; P.fedUntil = 0; P.tickOn = false; P.canplaySent = false;
   wasWaiting = false;
   const ov = $('suboverlay');
@@ -3658,6 +3689,10 @@ window.addEventListener('pagehide', () => stopPlayback());
 window.addEventListener('beforeunload', () => stopPlayback());
 
 /* ---------- player controls ---------- */
+for (const event of ['play', 'playing', 'pause', 'ended', 'seeked', 'canplay']) {
+  v.addEventListener(event, syncScreenWakeLock);
+}
+document.addEventListener('visibilitychange', syncScreenWakeLock);
 const ppic = () => $('ppicon');
 v.addEventListener('play',  () => { ppic().innerHTML = '<use href="#ic-pause"/>'; if (partyConsume('play')) { ctlog('player', { ev: 'play', echo: true }); } else { ctlog('player', { ev: 'play', echo: false, apply: partyApply }); partyLocalAction('play'); } });
 v.addEventListener('pause', () => { ppic().innerHTML = '<use href="#ic-play"/>'; if (partyConsume('pause')) { ctlog('player', { ev: 'pause', echo: true }); } else { ctlog('player', { ev: 'pause', echo: false, apply: partyApply }); partyLocalAction('pause'); } });
