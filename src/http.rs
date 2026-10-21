@@ -150,19 +150,19 @@ async fn add_item(
     }
     let id = state
         .library
-        .add_item_with_sequential(&req.magnet, req.sequential)
+        .add_item_with_title(&req.magnet, req.title.as_deref(), req.sequential)
         .await?;
-    if req.title.is_some()
-        || req.year.is_some()
+    if req.year.is_some()
         || req.poster_path.is_some()
         || req.tmdb_id.is_some()
+        || req.media_type.is_some()
     {
         state
             .library
             .db
             .update_metadata(
                 id,
-                req.title.as_deref(),
+                None,
                 req.year,
                 req.poster_path.as_deref(),
                 req.tmdb_id,

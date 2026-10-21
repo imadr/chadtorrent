@@ -199,13 +199,32 @@ impl Database {
         ] {
             let _ = conn.execute_batch(stmt);
         }
-        // Migrate: titles used to carry a " / <largest video file>" suffix
-        // appended by an older register path. The file name is now surfaced
-        // per-file instead, so strip the appended segment.
-        let _ = conn.execute_batch(
-            "UPDATE library SET title = trim(substr(title, 1, instr(title, ' / ') - 1))
-             WHERE title LIKE '% / %'",
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS meta_migration (k TEXT PRIMARY KEY, v INTEGER NOT NULL)")?;
+        // Release names can legitimately contain " / ". Retire the old suffix
+        // cleanup rather than truncating saved titles every time the DB opens.
+        // Recover old search selections from the original magnet display name
+        // only when the saved title is missing or matches the internal torrent
+        // name that the old registration code overwrote it with.
+        let repaired: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM meta_migration WHERE k = 'release_titles')", [], |r| r.get(0),
         )?;
+        if !repaired {
+            let mut stmt = conn.prepare("SELECT id, magnet, title, torrent_bytes FROM library WHERE magnet != ''")?;
+            let old = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?, r.get::<_, Option<Vec<u8>>>(3)?)))?;
+            for row in old {
+                let (id, magnet, title, bytes) = row?;
+                let Some(release) = magnet_display_name(&magnet) else { continue };
+                let internal = bytes.as_deref().and_then(|bytes| librqbit::torrent_from_bytes(bytes).ok())
+                    .and_then(|torrent| torrent.info.data.validate().ok())
+                    .and_then(|info| info.name().map(|name| name.into_owned()));
+                if title.as_deref().is_none_or(|t| t.trim().is_empty() || t.starts_with("magnet:?"))
+                    || (internal.is_some() && internal == title) {
+                    conn.execute("UPDATE library SET title = ?2 WHERE id = ?1", params![id, release])?;
+                }
+            }
+            conn.execute("INSERT INTO meta_migration (k, v) VALUES ('release_titles', 1)", [])?;
+        }
         // One-time repair: manga/comic rows written before the reading sweep
         // existed could hold TMDB payloads (catalogue ids collide — TMDB id
         // 30002 is a Munsters special, a MangaDex id is Berserk). Drop
@@ -296,11 +315,18 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)]
     pub fn insert_item(&self, magnet: &str) -> Result<i64> {
+        self.insert_item_with_title(magnet, None)
+    }
+
+    pub fn insert_item_with_title(&self, magnet: &str, title: Option<&str>) -> Result<i64> {
+        let title = title.filter(|t| !t.trim().is_empty()).map(str::to_owned)
+            .or_else(|| magnet_display_name(magnet));
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO library (magnet, state) VALUES (?1, 'connecting')",
-            params![magnet],
+            "INSERT INTO library (magnet, title, state) VALUES (?1, ?2, 'connecting')",
+            params![magnet, title],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -407,10 +433,22 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn update_title(&self, id: i64, title: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE library SET title = ?2 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(())
+    }
+
+    /// Torrent metadata is only a fallback for raw magnets without a name.
+    /// The SQL predicate also protects against a concurrent title assignment.
+    pub fn set_torrent_title_if_missing(&self, id: i64, title: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE library SET title = ?2 WHERE id = ?1 AND (title IS NULL OR trim(title) = '')",
             params![id, title],
         )?;
         Ok(())
@@ -882,6 +920,12 @@ impl Database {
     }
 }
 
+fn magnet_display_name(magnet: &str) -> Option<String> {
+    reqwest::Url::parse(magnet).ok()?.query_pairs()
+        .find(|(key, value)| key == "dn" && !value.trim().is_empty())
+        .map(|(_, value)| value.into_owned())
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -958,6 +1002,47 @@ mod tests {
         db.update_title(id, "My Torrent").unwrap();
         let item = db.get_item(id).unwrap().unwrap();
         assert_eq!(item.title.unwrap(), "My Torrent");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn selected_release_title_is_atomic_and_survives_metadata_and_restart() {
+        let (db, dir) = temp_db();
+        let release = "[Judas] JoJo's Bizarre Adventure / Dual-Audio [1080p][HEVC]";
+        let id = db.insert_item_with_title("magnet:?xt=urn:btih:abc&dn=short-file.mkv", Some(release)).unwrap();
+        let item = db.get_item(id).unwrap().unwrap();
+        assert_eq!(item.state, "connecting");
+        assert_eq!(item.title.as_deref(), Some(release));
+        for state in ["downloading", "paused", "ready"] {
+            db.set_torrent_title_if_missing(id, "short-file.mkv").unwrap();
+            db.update_state(id, state).unwrap();
+            assert_eq!(db.get_item(id).unwrap().unwrap().title.as_deref(), Some(release));
+        }
+        drop(db);
+        let reopened = Database::new(dir.join("test.db").to_str().unwrap()).unwrap();
+        assert_eq!(reopened.get_item(id).unwrap().unwrap().title.as_deref(), Some(release));
+        drop(reopened);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn old_internal_names_are_recovered_without_renaming_custom_titles() {
+        let (db, dir) = temp_db();
+        let release = "[Judas] JoJo's Bizarre Adventure [1080p][HEVC]";
+        let mut magnet = reqwest::Url::parse("magnet:?xt=urn:btih:abc").unwrap();
+        magnet.query_pairs_mut().append_pair("dn", release);
+        let file = "episode.mkv";
+        let bytes = format!("d4:infod6:lengthi1e4:name{}:{}12:piece lengthi16384e6:pieces20:01234567890123456789ee", file.len(), file).into_bytes();
+        let old = db.insert_item_with_title(magnet.as_str(), Some(file)).unwrap();
+        db.update_torrent_bytes(old, &bytes).unwrap();
+        let custom = db.insert_item_with_title(magnet.as_str(), Some("My chosen title / HEVC")).unwrap();
+        db.update_torrent_bytes(custom, &bytes).unwrap();
+        db.conn.lock().unwrap().execute("DELETE FROM meta_migration WHERE k = 'release_titles'", []).unwrap();
+        drop(db);
+        let db = Database::new(dir.join("test.db").to_str().unwrap()).unwrap();
+        assert_eq!(db.get_item(old).unwrap().unwrap().title.as_deref(), Some(release));
+        assert_eq!(db.get_item(custom).unwrap().unwrap().title.as_deref(), Some("My chosen title / HEVC"));
+        drop(db);
         cleanup(&dir);
     }
 

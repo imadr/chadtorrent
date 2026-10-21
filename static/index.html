@@ -27,6 +27,14 @@
   .btn.primary { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); font-weight: 600; }
   .btn.primary:hover { filter: brightness(1.1); }
   .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
+  /* Shared selection/sort controls; containers only handle placement. */
+  .s-chip, .minibtn { display: inline-flex; align-items: center; justify-content: center;
+                     min-height: 30px; padding: 6px 12px; font-size: 12px; font-weight: 400;
+                     line-height: 16px; background: var(--panel2); border: 1px solid var(--line);
+                     color: var(--text); text-transform: none; letter-spacing: 0; vertical-align: middle; }
+  .s-chip:hover, .minibtn:hover { border-color: var(--line-hi); }
+  .s-chip.sel, .minibtn.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
+  .s-chip.kbd-sel, .minibtn.kbd-sel { box-shadow: 0 0 0 2px var(--line-hi); }
   main { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; }
   main[hidden] { display: none; }
   #view-library { max-width: none; }
@@ -61,30 +69,24 @@
   section { margin: 26px 0; }
   section h3 { font-size: 14px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 0 0 12px; }
   .rows { display: flex; flex-direction: column; gap: 8px; }
-  .row { display: flex; align-items: center; gap: 12px; background: var(--panel);
-         border: 0.5px solid var(--line); padding: 10px 14px; }
+  /* Content rows share their surface and spacing, regardless of row markup. */
+  .row, #mv-epfiles .ep { display: flex; align-items: center; gap: 12px; background: var(--panel);
+                        border: 0.5px solid var(--line); padding: 10px 14px; }
+  #mv-torrents .row, #mv-results .row, #mv-epfiles .ep { min-height: 68px; }
+  .row:hover, #mv-epfiles .ep:hover { background: var(--panel2); border-color: var(--line-hi); }
+  .row.sel, #mv-epfiles .ep.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
+  .row .nm, #mv-epfiles .ep-info { flex: 1; min-width: 0; text-align: left; }
+  .row .nm .t, #mv-epfiles .ep-name { font-weight: 600; font-size: 14px; }
   #mv-seasonchips { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
   #mv-seasonchips[hidden] { display: none; }
-  #mv-seasonchips .s-chip, #mv-epselect .s-chip, #mv-providers .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
-          background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
-  #mv-seasonchips .s-chip:hover, #mv-epselect .s-chip:hover, #mv-providers .s-chip:hover { border-color: var(--line-hi); }
-  #mv-seasonchips .s-chip.sel, #mv-epselect .s-chip.sel, #mv-providers .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
-  #mv-seasonchips .s-chip.kbd-sel, #mv-epselect .s-chip.kbd-sel, #mv-providers .s-chip.kbd-sel { box-shadow: 0 0 0 2px var(--line-hi); }
   #mv-providers { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
   #mv-torrent-filter { display: block; width: 100%; }
   #mv-epselect { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 12px; }
   #mv-epselect[hidden] { display: none; }
-  #mv-epfiles .ep { display: flex; align-items: center; gap: 10px;
-                    border: 0.5px solid var(--line); padding: 0 12px 0 14px;
-                    height: 68px; overflow: hidden; position: relative; }
+  #mv-epfiles .ep { overflow: hidden; position: relative; }
   #mv-epfiles .ep.playable { cursor: pointer; }
-  #mv-epfiles .ep:hover { background: var(--panel2); border-color: var(--line-hi); }
-  #mv-epfiles .ep.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
-  #mv-epfiles .ep-info { flex: 1; min-width: 0; text-align: left; }
-  #mv-epfiles .ep-name { font-size: 14px; font-weight: 600; white-space: nowrap;
-                         overflow: hidden; text-overflow: ellipsis; }
-  #mv-epfiles .ep-file { font-size: 12px; color: var(--muted); margin-top: 3px;
-                         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #mv-epfiles .ep-name { display: -webkit-box;
+                       -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
   #mv-epfiles .ep-side { flex-shrink: 0; min-width: 110px; margin-left: 8px;
                          text-align: right; white-space: nowrap;
                          font-variant-numeric: tabular-nums; font-size: 12px;
@@ -95,11 +97,10 @@
   #mv-epfiles .ep-dl .bar { position: absolute; top: 0; bottom: 0; left: 0;
                             background: #3ddc97; }
   #mv-epfiles[hidden] { display: none; }
-  #mv-torrents .row { min-height: 68px; }
-  .row:hover { background: var(--panel2); border-color: var(--line-hi); }
-  .row.sel { background: var(--panel2); border-color: var(--line-hi); box-shadow: inset 0 0 0 1px var(--line-hi); }
-  .row .nm { flex: 1; min-width: 0; }
-  .row .nm .t { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #mv-dl-fold > summary { font-size: 14px; text-transform: uppercase; letter-spacing: .6px;
+                         color: var(--muted); margin: 0 0 12px; cursor: pointer; }
+  #mv-dl-fold > summary.kbd-sel { box-shadow: 0 0 0 2px var(--line-hi); }
+  .row .nm .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .row .nm .s { color: var(--muted); font-size: 12px; }
   .row .nm .s .se { color: var(--ok); font-weight: 600; }
   .row .nm .s .le { color: var(--danger); font-weight: 600; }
@@ -130,16 +131,8 @@
          border: 1px solid var(--line); padding: 9px 12px; font: inherit; outline: none; }
   input:focus { border-color: var(--line-hi); }
   #am-search { width: 100%; display: block; flex: none; }
-  .minibtn { font-size: 11px; padding: 3px 10px; margin-left: 8px; vertical-align: 2px;
-             background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
-             text-transform: none; letter-spacing: 0; }
-  .minibtn:hover { border-color: var(--line-hi); color: var(--text); }
-  .minibtn.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
+  .minibtn { margin-left: 8px; }
   #am-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-  #am-tabs .s-chip { font-size: 12px; padding: 6px 12px; cursor: pointer;
-                     background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
-  #am-tabs .s-chip:hover { border-color: var(--line-hi); }
-  #am-tabs .s-chip.sel { background: var(--accent); border-color: var(--line-hi); color: var(--accent-ink); }
   label.k { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; white-space: nowrap; }
   .panel.confirm { max-width: 380px; }
   .cf-msg { color: var(--text); margin: 0 0 20px; line-height: 1.5; white-space: pre-line; }
@@ -221,6 +214,7 @@
   .buf .spin { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2);
                border-top-color: #fff; animation: spin .8s linear infinite; }
   .buf span { color: #fff; font-size: 14px; letter-spacing: .4px; }
+  .buf .buf-note { color: var(--muted); font-size: 12px; text-align: center; }
   .suboverlay { position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
                 display: flex; justify-content: center; padding: 0 2%; pointer-events: none; }
   .suboverlay span { max-width: 100%; text-align: center; white-space: pre-line; color: #fff;
@@ -441,7 +435,7 @@
   <div class="pwrap" id="videowrap">
     <canvas id="player"></canvas>
     <div class="suboverlay" id="suboverlay" hidden><span></span></div>
-    <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span></div>
+    <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span><small class="buf-note" hidden></small><button class="btn buf-retry" style="pointer-events:auto" hidden>Retry playback</button></div>
     <div class="subsync" id="subsync" hidden>
       <div class="ss-head">
         <span class="ss-title">Sync subtitles</span>
@@ -684,6 +678,7 @@ var fileListsBusy = new Map();    // String(id) -> in-flight fetch promise (dedu
 var fileStatsAt = new Map();      // String(id) -> last per-file progress refresh (ts)
 var tvSeason = null;              // selected TMDB season number ('1', '2', ...)
 var tvEpisode = null;             // selected episode number within that season
+var tvContentsOpen = new Map();   // show key -> downloaded-content disclosure state
 var currentFile = null;           // rel path of the file currently playing (null = default)
 var searchResults = [], curRep = null, searchPending = new Map(), pendingRows = new Map();
 let fullDur = 0; // declared here; player session state lives with the player below
@@ -947,6 +942,8 @@ const IC_BIN = '<svg viewBox="0 0 24 24"><use href="#ic-bin"/></svg>';
 function renderMovie() {
   const rows = currentMovie.rows;
   const rep = movieRep(rows);
+  const oldFold = $('mv-dl-fold');
+  if (oldFold) tvContentsOpen.set(oldFold.dataset.movieKey, oldFold.open);
   const activeFilter = document.activeElement?.id === 'mv-torrent-filter' ? document.activeElement : null;
   const filterSelection = activeFilter ? [activeFilter.selectionStart, activeFilter.selectionEnd] : null;
   // The whole content area is destroyed and regenerated from scratch on every
@@ -974,8 +971,11 @@ function renderMovie() {
       '<div class="rows" id="mv-epfiles" hidden></div>' +
     '</section>' +
     '<section id="mv-dl-sec">' +
-      '<h3>Downloaded contents</h3>' +
+      (rep.media_type === 'tv'
+        ? '<details id="mv-dl-fold"' + (tvContentsOpen.get(currentMovie.key) !== false ? ' open' : '') + '><summary>Downloaded contents</summary>'
+        : '<h3>Downloaded contents</h3>') +
       '<div class="rows" id="mv-torrents"></div>' +
+      (rep.media_type === 'tv' ? '</details>' : '') +
     '</section>' +
     '<section id="mv-searchsec" hidden>' +
       '<h3>Find torrents</h3>' +
@@ -989,6 +989,14 @@ function renderMovie() {
     torrentNameFilter = e.target.value;
     renderSearch();
   };
+  const fold = $('mv-dl-fold');
+  if (fold) {
+    fold.dataset.movieKey = currentMovie.key;
+    fold.ontoggle = () => { tvContentsOpen.set(fold.dataset.movieKey, fold.open); mvSyncSel(); };
+    fold.querySelector('summary').onkeydown = e => {
+      if (e.code === 'Enter' || e.code === 'Space') e.stopPropagation();
+    };
+  }
   $('mv-poster').innerHTML = rep.poster_path
     ? posterTag(posterURL(rep.poster_path, POSTER_MD))
     : placeholder(isReading(rep) ? '▤' : '▷');
@@ -1050,7 +1058,7 @@ function renderTorrentRow(el, t) {
   const isDown = t.state === 'downloading';
   const isPaused = t.state === 'paused';
   el.innerHTML =
-    '<div class="nm"><div class="t">' + esc(t.title || t.magnet) + '</div>' +
+    '<div class="nm"><div class="t" title="' + esc(t.title || 'Torrent') + '">' + esc(t.title || 'Torrent') + '</div>' +
     '<div class="dl"><div class="bar"></div><div class="txt"></div></div></div>';
   const bar = el.querySelector('.bar');
   const txt = el.querySelector('.txt');
@@ -1540,7 +1548,6 @@ function renderEpFileRow(r, t, f) {
   const done = t.state === 'ready';
   const skipped = !!f.skipped;
   const canPlay = t.state !== '_pending' && t.state !== 'connecting' && t.state !== 'error';
-  const nm = basename(f.path);
   const have = f.have || 0, size = f.size || 0;
   const pct = size ? Math.min(100, (have / size) * 100) : 0;
   // Busy = bytes actually still landing; a file that's fully downloaded shows
@@ -1548,8 +1555,7 @@ function renderEpFileRow(r, t, f) {
   const busy = have > 0 && have < size;
   r.innerHTML =
     '<div class="ep-info">' +
-      '<div class="ep-name">' + esc(t.title || t.magnet) + '</div>' +
-      '<div class="ep-file">' + esc(nm) + '</div>' +
+      '<div class="ep-name" title="' + esc(t.title || 'Torrent') + '">' + esc(t.title || 'Torrent') + '</div>' +
     '</div>' +
     '<div class="ep-side">' +
       (busy ? '<span class="ep-pct">' + Math.round(pct) + '%</span>' : '') +
@@ -1846,7 +1852,7 @@ async function addTorrentFromSearch(t) {
       method: 'POST',
       signal: ctl.signal,
       body: JSON.stringify({
-        magnet: t.magnet,
+        magnet: t.magnet, title: t.name,
         year: rep.year || null, poster_path: rep.poster_path || null,
         tmdb_id: rep.tmdb_id || null, media_type: rep.media_type || null
       })
@@ -2401,7 +2407,10 @@ function waitFeed(ms = 250) {
 const P = {
   id: null, tracks: null, segs: new Map(), segMaxN: 0, done: false,
   generation: null,
-  timing: null, audioSkipUntil: 0, audioDurations: new Map(), audioLengths: new Map(), audioNominalUs: 0, scheduleBase: null,
+  timing: null, audioSkipUntil: 0, audioEnd: null, scheduleBase: null,
+  seekTimer: null, conservativeSeek: false,
+  recoveryAttempts: 0, audioRecoveryAttempts: 0, videoRecoveryAttempts: 0,
+  recoveryFailures: [],
   vdec: null, adec: null,
   vq: [], aq: [],             // decoded, not yet shown/played
   chunksV: [], chunksA: [],   // raw chunks waiting for decoder headroom
@@ -2445,7 +2454,7 @@ function mediaNow() {
   const now = P.noAudio ? P.ctx.currentTime : outputContextTime();
   if (P.anchor) {
     const behind = P.anchor.ctx - now;
-    if (behind > 0) return Math.max(0, P.anchor.media - behind);
+    if (behind > 0) return Math.max(P.seekFloor, 0, P.anchor.media - behind);
     if (audioEnded()) return Math.min(fullDur || Infinity, P.anchor.media + (now - P.anchor.ctx));
     return P.anchor.media;
   }
@@ -2713,8 +2722,54 @@ async function fetchSegBuf(id, name) {
   return await r.arrayBuffer();
 }
 
-function onDecErr(which) {
-  return (e) => segFatal(new Error('Decoder error (' + which + '): ' + (e.message || e)));
+function onDecErr(which) { return e => recoverDecoder(which, e); }
+
+function decoderError(which, error) {
+  const failure = new Error(error.message || String(error));
+  failure.decoder = which;
+  return failure;
+}
+
+function handleFeedError(error, gen, id) {
+  if (gen !== segGen || P.id !== id) return;
+  if (error.decoder) recoverDecoder(error.decoder, error);
+  else segFatal(error);
+}
+
+function holdPlaybackError(error, position = pendSeek ?? mediaNow()) {
+  seekTo(position, false, { recovery: true, hold: true });
+  P.err = error;
+  showBuf('Playback error: ' + (error.message || error), true);
+  const retry = $('buf').querySelector('.buf-retry'), gen = segGen;
+  retry.hidden = false;
+  retry.onclick = () => { if (gen === segGen && P.id) seekTo(P.lastT); };
+  retry.onkeydown = e => { if (e.code === 'Enter' || e.code === 'Space') e.stopPropagation(); };
+}
+
+// Native decoder failures after configuration are not capability verdicts.
+// Retry the same position/config first, with conservative preroll and bounded
+// backoff. A user seek supersedes the pending job; stale decoder callbacks are
+// rejected by decoder identity. Exhaustion keeps the session and offers Retry.
+function recoverDecoder(which, error) {
+  if (!P.id || P.err) return;
+  const position = pendSeek ?? mediaNow();
+  const now = performance.now();
+  P.recoveryFailures = P.recoveryFailures.filter(f => now - f.at < 30000);
+  P.recoveryFailures.push({ at: now, which });
+  const attempt = P.recoveryAttempts = P.recoveryFailures.length;
+  P.audioRecoveryAttempts = P.recoveryFailures.filter(f => f.which === 'audio').length;
+  P.videoRecoveryAttempts = P.recoveryFailures.filter(f => f.which === 'video').length;
+  if (which === 'audio') {
+    if (P.audioRecoveryAttempts > 1 && P.acfgs && P.acfgIdx < P.acfgs.length - 1) P.acfgIdx++;
+  } else if (P.videoRecoveryAttempts > 1 && P.vcfg) {
+    P.vcfg = { ...P.vcfg, hardwareAcceleration: 'no-preference' };
+  }
+  console.warn('[ct] decoder recovery', { which, attempt, position, gen: segGen, error: error.message || String(error) });
+  if (attempt > 3) {
+    holdPlaybackError(decoderError(which, new Error(which + ' decoder could not recover. ' + (error.message || error))), position);
+    return;
+  }
+  seekTo(position, false, { recovery: true, delay: [100, 250, 500][attempt - 1] });
 }
 /* Decoder factories. Every seek closes the old decoders and builds fresh
  * ones; the output callbacks capture their own decoder, so any output from a
@@ -2761,21 +2816,9 @@ function mkAdec(onError = onAudioDecErr) {
       wakeFeed();
       if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
-      const expected = P.audioDurations.get(ad.timestamp);
-      P.audioDurations.delete(ad.timestamp);
-      const actual = ad.numberOfFrames / ad.sampleRate * 1e6;
-      // The last packet can signal fewer playable samples than the codec's
-      // fixed output frame. Trim that padding, rather than rejecting a valid
-      // decoder or stretching the media clock to the untrimmed frame length.
-      const paddedTail = expected && expected < P.audioNominalUs - 2000
-        && Math.abs(actual - P.audioNominalUs) <= 2000;
-      if (expected && !paddedTail && Math.abs(actual - expected) > Math.max(2000, expected * 0.03)) {
-        ad.close();
-        onAudioDecErr(new Error('Decoded audio duration ' + Math.round(actual) + 'us does not match packet ' + expected + 'us at ' + ad.timestamp));
-        return;
-      }
+      // AudioData is decoded PCM, not a one-to-one packet-duration assertion.
+      // Container gaps/padding and decoder batching may legitimately differ.
       if (P.seekFloor > 0 && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 <= P.seekFloor) { ad.close(); return; }
-      if (paddedTail) P.audioLengths.set(ad.timestamp, Math.round(expected / 1e6 * ad.sampleRate));
       P.aq.push(ad);
       P.seekAudioReady = true;
       finishSeek();
@@ -2785,22 +2828,14 @@ function mkAdec(onError = onAudioDecErr) {
   dec.addEventListener?.('dequeue', wakeFeed);
   return dec;
 }
-/* Some AAC streams decode for a moment and then hit "encoding not supported"
- * mid-stream (measured: Firefox + a 22kHz HE-AAC stream with implicit SBR
- * dies ~6 packets in under the description-based LC config, while a
- * description-less half-rate config decodes the same stream cleanly). On a
- * runtime audio error, rotate to the next config and resume from the
- * playhead; exhausting every config stops playback with an error — audio-less
- * video is never an acceptable outcome. */
-function onAudioDecErr(e) {
-  if (!P.id) return;
-  if (P.acfgs && P.acfgIdx < P.acfgs.length - 1) {
-    P.acfgIdx++;
-    console.warn('[ct] audio decoder failed (' + (e.message || e) + ') — retrying with audio config ' + (P.acfgIdx + 1) + '/' + P.acfgs.length);
-    seekTo(P.lastT);
-    return;
-  }
-  segFatal(new Error('Audio decode failed: ' + (e.message || e)));
+function onAudioDecErr(e) { recoverDecoder('audio', e); }
+
+function audioFrameLimit(ad) {
+  if (!P.eof || P.audioEnd == null) return ad.numberOfFrames;
+  // Only the known track end limits PCM padding. Do not compare an output
+  // buffer to an individual packet: one output may span several packets.
+  return Math.max(0, Math.min(ad.numberOfFrames,
+    Math.floor((P.audioEnd - ad.timestamp / 1e6) * ad.sampleRate + 0.1)));
 }
 
 function audioBufferOf(ad, frameOffset = 0, frameLimit = ad.numberOfFrames) {
@@ -2842,9 +2877,9 @@ function pumpAudio() {
     const ad = P.aq[0], originalTs = ad.timestamp / 1e6;
     const floor = Math.max(P.seekFloor, P.audioSkipUntil);
     const skip = Math.max(0, Math.ceil((floor - originalTs) * ad.sampleRate - 0.1));
-    const limit = P.audioLengths.get(ad.timestamp) ?? ad.numberOfFrames;
+    const limit = audioFrameLimit(ad);
     if (skip >= limit) {
-      P.aq.shift(); P.audioLengths.delete(ad.timestamp); ad.close(); continue;
+      P.aq.shift(); ad.close(); continue;
     }
     const ts = originalTs + skip / ad.sampleRate;
     let at = P.scheduleBase.ctx + ts - P.scheduleBase.media;
@@ -2857,7 +2892,6 @@ function pumpAudio() {
     if (at > P.nextAt + 0.002) P.anchor = { ctx: at, media: ts };
     if (at > P.ctx.currentTime + 1.5) break;
     P.aq.shift();
-    P.audioLengths.delete(ad.timestamp);
     let buf;
     try { buf = audioBufferOf(ad, skip, limit); }
     catch (e) { onAudioDecErr(e); return; }
@@ -2900,7 +2934,10 @@ function flushTail(which, gen) {
   const video = which === 'V', key = video ? 'flushV' : 'flushA';
   if (P[key]) return P[key];
   const dec = video ? P.vdec : P.adec;
-  P[key] = (dec ? dec.flush() : Promise.resolve()).then(() => {
+  P[key] = Promise.resolve().then(() => {
+    if (gen !== segGen || dec !== (video ? P.vdec : P.adec)) return;
+    return dec ? dec.flush() : undefined;
+  }).then(() => {
     if (gen !== segGen || dec !== (video ? P.vdec : P.adec)) return;
     if (video) {
       P.vDrained = true;
@@ -2909,7 +2946,7 @@ function flushTail(which, gen) {
       }
     } else P.aDrained = true;
     finishSeek();
-  });
+  }).catch(e => { throw decoderError(video ? 'video' : 'audio', e); });
   return P[key];
 }
 
@@ -2944,7 +2981,7 @@ function drawTick() {
 /* State machine: runs on a timer (survives background-tab throttling, like the
  * old <video> timeupdate did — parties and playhead saving rely on it). */
 setInterval(() => {
-  if (!P.id) return;
+  if (!P.id || P.err) return;
   P.lastT = mediaNow();
   if (performance.now() - lastTU > 250) {
     lastTU = performance.now();
@@ -3002,10 +3039,13 @@ async function reloadStream() {
   if (activeSub) applySubTrack();
 }
 
-function seekChunks(ch, target) {
+function seekChunks(ch, target, conservative = false) {
   let key = -1;
   for (let i = 0; i < ch.V.length; i++) {
-    if (ch.V[i].key && ch.V[i].ts <= target * 1e6) key = i;
+    if (ch.V[i].key && ch.V[i].ts <= target * 1e6) {
+      key = i;
+      if (conservative) break;
+    }
   }
   return {
     V: key >= 0 ? ch.V.slice(key) : ch.V,
@@ -3029,16 +3069,17 @@ async function feedLoop(gen, id) {
     if (P.chunksA.length && P.aq.length < 700 && P.adec && P.adec.state === 'configured' && P.adec.decodeQueueSize < 80) {
       for (let i = 0; i < 64 && P.chunksA.length && P.aq.length < 700 && P.adec.decodeQueueSize < 80; i++) {
         const chunk = P.chunksA.shift();
-        P.audioDurations.set(chunk.timestamp, chunk.duration);
-        P.audioNominalUs = Math.max(P.audioNominalUs, chunk.duration);
-        P.adec.decode(chunk);
+        try { P.adec.decode(chunk); } catch (e) { throw decoderError('audio', e); }
+        if (gen !== segGen || P.id !== id) return;
       }
       worked = true;
     }
     if (P.chunksV.length && P.vdec && P.vdec.state === 'configured') {
       for (let i = 0; i < 32 && P.chunksV.length && P.vdec.decodeQueueSize < 32
           && P.vq.length + P.vdec.decodeQueueSize < SEG_MAX_VQ; i++) {
-        P.vdec.decode(P.chunksV.shift()); worked = true;
+        try { P.vdec.decode(P.chunksV.shift()); } catch (e) { throw decoderError('video', e); }
+        if (gen !== segGen || P.id !== id) return;
+        worked = true;
       }
     }
     const t = P.segs.get(P.fetchN);
@@ -3047,8 +3088,8 @@ async function feedLoop(gen, id) {
         P.eof = true;
         // Drain each track independently. Audio may finish before video; its
         // flush must complete before the clock can hand off to the video tail.
-        if (!P.chunksA.length) flushTail('A', gen).catch(e => { if (gen === segGen) segFatal(e); });
-        if (!P.chunksV.length) flushTail('V', gen).catch(e => { if (gen === segGen) segFatal(e); });
+        if (!P.chunksA.length) flushTail('A', gen).catch(e => handleFeedError(decoderError('audio', e), gen, id));
+        if (!P.chunksV.length) flushTail('V', gen).catch(e => handleFeedError(decoderError('video', e), gen, id));
         if (!P.chunksA.length && !P.chunksV.length) {
           await Promise.all([P.flushA, P.flushV]);
           return;
@@ -3076,7 +3117,8 @@ async function feedLoop(gen, id) {
           if (gen !== segGen || P.id !== id) return;
         }
         let ch = segToChunks(buf, parsed);
-        if (P.needKey) ch = seekChunks(ch, P.seekFloor);
+        for (const c of ch.A) P.audioEnd = Math.max(P.audioEnd ?? -Infinity, (c.ts + c.durUs) / 1e6);
+        if (P.needKey) ch = seekChunks(ch, P.seekFloor, P.conservativeSeek);
         for (const c of ch.V) {
           if (P.needKey && !c.key) continue;
           P.needKey = false;
@@ -3121,6 +3163,7 @@ function ensureCtx(resume = true) {
 
 function playerPlay() {
   if (!P.id) return;
+  if (P.err) seekTo(P.lastT);
   ensureCtx();
   if (P.paused) { P.paused = false; v.dispatchEvent(new Event('play')); }
   wakeFeed();
@@ -3296,7 +3339,7 @@ async function startEngine(position = 0) {
   P.canplaySent = false;
   if (!P.tickOn) { P.tickOn = true; P.raf = requestAnimationFrame(drawTick); }
   if (position > 0) seekTo(position);
-  else feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
+  else feedLoop(gen, id).catch(e => handleFeedError(e, gen, id));
   return true;
 }
 
@@ -3327,7 +3370,9 @@ async function playTorrent(item, file) {
     hideBuf();
     showBuf(e.noWC
       ? 'This browser cannot play this file: no ' + (e.codec || 'codec') + ' decoder in WebCodecs.'
-      : 'Playback error: ' + e.message, true);
+      : 'Playback error: ' + e.message, true,
+      e.noWC && /^(hvc1|hev1)/.test(e.codec || '')
+        ? "(If you're on Firefox, enable dom.media.webcodecs.h265.enabled)" : '');
     return;
   }
   if (!P.id) return;
@@ -3341,7 +3386,7 @@ async function playTorrent(item, file) {
     // back to the party we just adopted the position from.
     if (partyAnchor.t > 0.5) seekTo(partyAnchor.t, true);
     resumeAt = 0;
-  } else if (resumeAt > 0.5) { seekTo(resumeAt); resumeAt = 0; }
+  } else if (resumeAt > 0) { seekTo(resumeAt); resumeAt = 0; }
   if (!partyHoldPlay) v.play();
   // restore the subtitle choice for this item (applySubTrack pulls the saved
   // sync offset from storage too); explicit "None" wins.
@@ -3350,13 +3395,21 @@ async function playTorrent(item, file) {
   else activeSub = null;
 }
 
-function seekTo(globalT, partyOrigin) {
+function seekTo(globalT, partyOrigin, options = {}) {
   if (fullDur && globalT > fullDur) globalT = fullDur;
   if (globalT < 0) globalT = 0;
   // A party-originated seek lands in a 'seeked' event we must not echo back
   // to the party (stale credits self-expire in partyConsume).
   if (partyOrigin) partyArm('seek');
   if (!P.id) { P.lastT = globalT; return; }
+  if (!P.vcfg && !options.recovery) { resumeAt = globalT; P.lastT = globalT; return; }
+  if (P.seekTimer != null) clearTimeout(P.seekTimer);
+  P.seekTimer = null;
+  if (!options.recovery) {
+    P.recoveryAttempts = 0; P.audioRecoveryAttempts = 0; P.videoRecoveryAttempts = 0;
+    P.recoveryFailures = [];
+  }
+  P.err = null;
   const gen = ++segGen;
   wakeFeed();
   if (segAbort) { segAbort.abort(); }
@@ -3374,7 +3427,9 @@ function seekTo(globalT, partyOrigin) {
   for (const a of P.aq) { try { a.close(); } catch (e) {} }
   P.aq.length = 0;
   P.anchor = null; P.nextAt = 0; P.sched = []; P.lastT = globalT;
-  P.scheduleBase = null; P.audioDurations.clear(); P.audioLengths.clear();
+  P.scheduleBase = null; P.audioEnd = null;
+  P.conservativeSeek = !!options.recovery;
+  P.canplaySent = false;
   P.wall = { ctx: P.ctx ? P.ctx.currentTime : 0, media: globalT };
   pendSeek = globalT; pendSeekAt = Date.now();
   // orphan buffers already scheduled on the old gain node (they would keep
@@ -3385,22 +3440,32 @@ function seekTo(globalT, partyOrigin) {
     P.gain.gain.value = P.muted ? 0 : P.vol;
     P.gain.connect(P.ctx.destination);
   }
-  // reset() leaves a decoder 'unconfigured' and re-configuring in place is
-  // flaky across browsers — recreate both decoders fresh instead. Cheap
-  // (hardware decode session re-init is ~ms) and deterministic.
+  // Coalesce rapid seek changes before allocating native decoder sessions.
+  // Recovery gives a failed backend time to release its old resources.
   try { if (P.vdec) P.vdec.close(); } catch (e) {}
-  P.vdec = mkVdec();
-  if (P.vcfg) { try { P.vdec.configure(P.vcfg); } catch (e) {} }
+  P.vdec = null;
   try { if (P.adec) P.adec.close(); } catch (e) {}
   P.adec = null;
-  if (P.acfgs) {
-    const a = P.acfgs[Math.min(P.acfgIdx, P.acfgs.length - 1)];
-    P.adec = mkAdec();
-    try { P.adec.configure(a); } catch (e) {}
-  }
   showBufProgress();
+  if (options.hold) return;
   const id = P.id;
-  feedLoop(gen, id).catch(e => { if (gen === segGen && P.id === id) segFatal(e); });
+  P.seekTimer = setTimeout(() => {
+    P.seekTimer = null;
+    if (gen !== segGen || P.id !== id) return;
+    try {
+      P.vdec = mkVdec();
+      P.vdec.configure(P.vcfg);
+    } catch (e) { recoverDecoder('video', e); return; }
+    if (gen !== segGen || P.id !== id) return;
+    if (P.acfgs) {
+      try {
+        P.adec = mkAdec();
+        P.adec.configure(P.acfgs[Math.min(P.acfgIdx, P.acfgs.length - 1)]);
+      } catch (e) { recoverDecoder('audio', e); return; }
+    }
+    if (gen !== segGen || P.id !== id) return;
+    feedLoop(gen, id).catch(e => handleFeedError(e, gen, id));
+  }, options.delay ?? 30);
 }
 
 /* Persist the playback position for the current torrent (per torrent file,
@@ -3423,12 +3488,15 @@ function savePlayhead(t) {
 }
 
 function segFatal(e) {
+  if (P.id && P.vcfg) { holdPlaybackError(e); return; }
   stopPlayback();
   hideBuf();
   showBuf('Playback error: ' + (e.message || e), true);
 }
 
 function teardownWC(keepContext = false) {
+  if (P.seekTimer != null) clearTimeout(P.seekTimer);
+  P.seekTimer = null;
   wakeFeed();
   if (P.raf) cancelAnimationFrame(P.raf);
   P.raf = 0;
@@ -3438,7 +3506,9 @@ function teardownWC(keepContext = false) {
   P.generation = null;
   P.vcfg = null; P.acfgs = null; P.acfgIdx = 0;
   P.eof = false; P.endedFired = false; P.needKey = false; P.seekFloor = 0;
-  P.timing = null; P.audioSkipUntil = 0; P.scheduleBase = null; P.audioDurations.clear(); P.audioLengths.clear(); P.audioNominalUs = 0;
+  P.timing = null; P.audioSkipUntil = 0; P.scheduleBase = null; P.audioEnd = null;
+  P.err = null; P.recoveryAttempts = 0; P.audioRecoveryAttempts = 0; P.videoRecoveryAttempts = 0;
+  P.recoveryFailures = [];
   P.vDrained = false; P.aDrained = false; P.flushV = null; P.flushA = null; P.videoEnd = 0;
   if (P.seekLastFrame) { P.seekLastFrame.close(); P.seekLastFrame = null; }
   P.chunksV.length = 0; P.chunksA.length = 0;
@@ -3475,6 +3545,7 @@ window.__seg = () => ({
   adrift: audibleNow() != null ? +(mediaNow() - audibleNow()).toFixed(3) : null,
   late: window.__late || 0,
   seekFloor: P.seekFloor, audioSkipUntil: P.audioSkipUntil, timing: P.timing, acfg: P.acfgs && P.acfgIdx,
+  recoveryAttempts: P.recoveryAttempts, error: P.err && P.err.message,
   flowAgo: P.flow ? performance.now() - P.flow : null, pendSeek,
 });
 
@@ -3648,11 +3719,15 @@ $('seekbar').addEventListener('mouseleave', () => { sktip.hidden = true; });
  * recovers; seekTo decides the initial spinner itself, synchronously. */
 /* `err` = terminal failure (no codec, decode error): the spinner would imply
  * "wait and it will recover", so drop it and leave only the message. */
-function showBuf(txt, err) {
+function showBuf(txt, err, note = '') {
   const b = $('buf');
   b.querySelector('span').textContent = txt || 'Buffering…';
   const spin = b.querySelector('.spin');
   if (spin) spin.hidden = !!err;
+  const hint = b.querySelector('.buf-note');
+  hint.textContent = note;
+  hint.hidden = !note;
+  b.querySelector('.buf-retry').hidden = true;
   b.hidden = false;
 }
 function hideBuf() { $('buf').hidden = true; }
@@ -4623,7 +4698,11 @@ function mvFlat() {
   for (const el of document.querySelectorAll('#mv-seasonchips:not([hidden]) button.s-chip')) out.push({ kind: 'season', el });
   for (const el of document.querySelectorAll('#mv-epselect:not([hidden]) button.s-chip'))    out.push({ kind: 'epbtn',  el });
   for (const el of document.querySelectorAll('#mv-epfiles > .ep'))            out.push({ kind: 'episode', el });
-  for (const el of document.querySelectorAll('#mv-torrents > .row[data-id]')) out.push({ kind: 'content', el });
+  const fold = $('mv-dl-fold');
+  if (fold) out.push({ kind: 'disclosure', el: fold.querySelector('summary') });
+  if (!fold || fold.open) {
+    for (const el of document.querySelectorAll('#mv-torrents > .row[data-id]')) out.push({ kind: 'content', el });
+  }
   for (const el of document.querySelectorAll('#mv-searchsec:not([hidden]) #mv-providers button.s-chip')) out.push({ kind: 'provider', el });
   for (const el of document.querySelectorAll('#mv-results .row'))             out.push({ kind: 'torrent',  el });
   return out;
@@ -4634,7 +4713,7 @@ function mvHighlight(l) {
     const sel = i === mvSelIdx;
     // Chips already use `.sel` to mean "season/episode selected" — a keyboard
     // highlight must not collide with it.
-    if (x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'provider') x.el.classList.toggle('kbd-sel', sel);
+    if (x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'provider' || x.kind === 'disclosure') x.el.classList.toggle('kbd-sel', sel);
     else x.el.classList.toggle('sel', sel);
   });
 }
@@ -4666,7 +4745,7 @@ function selOpen() {
   }
   const x = mvFlat()[mvSelIdx];
   if (!x) return;
-  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'chapter' || x.kind === 'provider') {
+  if (x.kind === 'episode' || x.kind === 'content' || x.kind === 'season' || x.kind === 'epbtn' || x.kind === 'chapter' || x.kind === 'provider' || x.kind === 'disclosure') {
     x.el.click();
     return;
   }
@@ -4676,6 +4755,7 @@ function selOpen() {
 function selToggleDl() {
   const x = mvFlat()[mvSelIdx];
   if (!x) return;
+  if (x.kind === 'disclosure') { x.el.click(); return; }
   if (x.kind === 'episode') {
     // Space toggles whether this episode is downloaded (skip/unskip).
     const cb = x.el.querySelector('input[type=checkbox]');

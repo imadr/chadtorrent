@@ -302,7 +302,13 @@ impl LibraryManager {
         magnet: &str,
         sequential: bool,
     ) -> Result<i64> {
-        self.add_item_inner(magnet, None, sequential).await
+        self.add_item_inner(magnet, None, sequential, None).await
+    }
+
+    pub async fn add_item_with_title(
+        self: &Arc<Self>, magnet: &str, title: Option<&str>, sequential: bool,
+    ) -> Result<i64> {
+        self.add_item_inner(magnet, None, sequential, title).await
     }
 
     /// Add a metadata-only placeholder entry (a movie awaiting torrents, or a
@@ -332,7 +338,7 @@ impl LibraryManager {
         magnet: &str,
         initial_peers: Vec<SocketAddr>,
     ) -> Result<i64> {
-        self.add_item_inner(magnet, Some(initial_peers), true).await
+        self.add_item_inner(magnet, Some(initial_peers), true, None).await
     }
 
     /// Create the library row immediately and hand torrent registration off
@@ -344,8 +350,9 @@ impl LibraryManager {
         magnet: &str,
         initial_peers: Option<Vec<SocketAddr>>,
         sequential: bool,
+        title: Option<&str>,
     ) -> Result<i64> {
-        let library_id = self.db.insert_item(magnet)?;
+        let library_id = self.db.insert_item_with_title(magnet, title)?;
         let output_dir = self.config.library_dir.join(library_id.to_string());
         std::fs::create_dir_all(&output_dir)?;
         self.db.update_state(library_id, "connecting")?;
@@ -417,7 +424,7 @@ impl LibraryManager {
         };
 
         let name = handle.name().unwrap_or_else(|| "Unknown".to_string());
-        if let Err(e) = self.db.update_title(library_id, &name) {
+        if let Err(e) = self.db.set_torrent_title_if_missing(library_id, &name) {
             warn!("Failed to set title for {}: {}", library_id, e);
         }
 
@@ -437,9 +444,8 @@ impl LibraryManager {
         }
         self.notify_changed();
 
-        // The torrent's real name is the title. The file name is surfaced
-        // per-file (episode rows / movie file view), never appended to the
-        // heading.
+        // Keep the selected release title. Files are used for playback and
+        // size/episode discovery, never to rename a downloaded-content row.
         if let Some((_file_id, _file_name, size)) = self
             .engine
             .find_largest_video_file(library_id)

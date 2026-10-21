@@ -123,6 +123,29 @@ async fn http_error_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn torrent_add_persists_the_selected_release_title() {
+    let tmp = TempDir::new().unwrap();
+    let library = setup_app(&tmp.path().join("app")).await;
+    let (http, _ws, _party, srv) = start_http(library.clone()).await;
+    let title = "[Judas] JoJo's Bizarre Adventure - S06E04 [1080p][HEVC x265 10bit][Dual-Audio]";
+    // Invalid btih fails registration locally; this test never resolves a real
+    // magnet or downloads anything, but still exercises the real add handler.
+    let response = reqwest::Client::new().post(format!("{http}/api/library"))
+        .json(&serde_json::json!({"magnet":"magnet:?xt=invalid&dn=short-file.mkv", "title":title,
+            "tmdb_id":45790,"media_type":"tv"})).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let id = response.json::<serde_json::Value>().await.unwrap()["id"].as_i64().unwrap();
+    let item = library.db.get_item(id).unwrap().unwrap();
+    assert_eq!(item.title.as_deref(), Some(title));
+    assert_eq!(item.tmdb_id, Some(45790));
+    library.db.set_torrent_title_if_missing(id, "short-file.mkv").unwrap();
+    let items: serde_json::Value = reqwest::get(format!("{http}/api/library")).await.unwrap().json().await.unwrap();
+    assert_eq!(items.as_array().unwrap().iter().find(|row| row["id"] == id).unwrap()["title"], title);
+    library.stop().await;
+    srv.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tmdb_meta_serves_seasons_and_episodes_from_cache() {
     use chadtorrent::metadata::{EpisodeInfo, MetaCache, SeasonEpisodes, SeasonInfo, TmdbClient};
     let tmp = TempDir::new().unwrap();

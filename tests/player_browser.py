@@ -5,6 +5,8 @@ Run after cargo build: python tests/player_browser.py
 Set PLAYER_BROWSER=firefox to exercise Playwright's installed Firefox.
 Set PLAYER_HEAAC=1 on macOS to include an AudioToolbox HE-AAC fixture.
 Set PLAYER_HEVC=1 to include a Main10 HEVC capability/rejection latency check.
+Set PLAYER_FIREFOX_HEVC=1 to enable experimental HEVC in the isolated Firefox profile.
+PLAYER_SOURCE=/path/to/episode.mkv adds repeated-seek checks against an existing file (read-only).
 """
 import asyncio
 import json
@@ -43,14 +45,15 @@ def generate(folder, duration, audio_duration=None, audio_delay=0, he_aac=False,
     subprocess.run(args + [str(folder / "clip.mp4")], check=True)
 
 
-async def exercise(url, library, he_aac, hevc, restart_server):
+async def exercise(url, library, he_aac, hevc, restart_server, source=None):
     chrome = os.environ.get("CHROME_BIN") or shutil.which("google-chrome") or shutil.which("chromium")
     if not chrome and Path("/Applications/Google Chrome.app").exists():
         chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     async with async_playwright() as p:
         browser_name = os.environ.get("PLAYER_BROWSER", "chromium")
         if browser_name == "firefox":
-            browser = await p.firefox.launch(headless=True)
+            prefs = {"dom.media.webcodecs.h265.enabled": True, "media.hevc.enabled": True} if os.environ.get("PLAYER_FIREFOX_HEVC") == "1" else {}
+            browser = await p.firefox.launch(headless=True, firefox_user_prefs=prefs)
         else:
             browser = await p.chromium.launch(executable_path=chrome, headless=True,
                                              args=["--autoplay-policy=no-user-gesture-required"])
@@ -61,7 +64,7 @@ async def exercise(url, library, he_aac, hevc, restart_server):
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.on("console", lambda m: messages.append(m.text) if m.type in ("error", "warning") else None)
             await page.goto(url)
-            await page.wait_for_function("n=>items.length === n", arg=5 + int(he_aac) + int(hevc))
+            await page.wait_for_function("n=>items.length === n", arg=5 + int(he_aac) + int(hevc) + int(source is not None))
             await page.evaluate("""() => {
                 window.testRecords=[];window.testEnds=[];
                 window.testProbes=[];
@@ -71,29 +74,130 @@ async def exercise(url, library, he_aac, hevc, restart_server):
                     testProbes.push({at,end:performance.now(),ok});return ok;
                 };
                 const original=paint;
-                paint=f=>{testRecords.push({ts:f.timestamp/1e6,at:performance.now()});original(f)};
+                paint=f=>{testRecords.push({ts:f.timestamp/1e6,at:performance.now(),gen:segGen});original(f)};
                 v.addEventListener('ended',()=>testEnds.push(testRecords.slice()));
                 const b=document.createElement('button');b.id='test-start';b.textContent='Start';
                 b.style='position:fixed;top:0;right:0;z-index:99999';
-                b.onclick=()=>{testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item)};
+                b.onclick=()=>{testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item,window.testFile||null)};
                 document.body.appendChild(b);
             }""")
 
             async def start(item_id):
+                await page.evaluate("window.testFile=null")
                 await page.evaluate("id=>window.testId=id", item_id)
                 await page.click("#test-start")
                 await page.wait_for_function("testRecords.length > 0", timeout=12000)
 
+            async def stress_seeks(targets):
+                for target in targets:
+                    await page.evaluate("t=>{testRecords=[];seekTo(t)}", target)
+                    await page.wait_for_function("(testRecords.length>0 && pendSeek===null) || P.err", timeout=10000)
+                    state = await page.evaluate("__seg()")
+                    assert not state["error"], state
+                    first = await page.evaluate("testRecords[0].ts")
+                    assert abs(first - target) < 0.08, (target, first, state)
+                await page.evaluate("""async()=>{
+                    testRecords=[];
+                    for(let i=0;i<40;i++){seekTo(10+(i%20)/10);await new Promise(r=>setTimeout(r,5));}
+                    seekTo(12.3);
+                }""")
+                await page.wait_for_function("(testRecords.length>0 && pendSeek===null) || P.err", timeout=10000)
+                assert not await page.evaluate("P.err && P.err.message")
+                assert abs(await page.evaluate("testRecords[0].ts") - 12.3) < 0.08
+
+            async def inject_decoder_failure(which, paused, target):
+                if paused:
+                    await page.evaluate("v.pause()")
+                await page.evaluate("""({which,target})=>{
+                    window.recoveryContext=P.ctx;testRecords=[];window.injected=false;
+                    const key=which==='video'?'VideoDecoder':'AudioDecoder',Native=window[key];
+                    window[key]=function(init){
+                        const dec=new Native(init),decode=dec.decode.bind(dec);
+                        dec.decode=chunk=>{
+                            if(!window.injected){
+                                window.injected=true;window[key]=Native;dec.close();
+                                init.error(new DOMException('The given encoding is not supported.','NotSupportedError'));
+                                return;
+                            }decode(chunk);
+                        };return dec;
+                    };seekTo(target);
+                }""", {"which": which, "target": target})
+                await page.wait_for_function("(injected && testRecords.length>0 && pendSeek===null) || P.err", timeout=10000)
+                state = await page.evaluate("__seg()")
+                assert not state["error"], state
+                assert state["paused"] == paused, state
+                assert state["recoveryAttempts"] == 1, state
+                assert await page.evaluate("P.ctx===recoveryContext")
+                assert abs(await page.evaluate("testRecords[0].ts") - target) < 0.08
+
+            await start(1)
+            await stress_seeks([23.3, 61.3, 3.1, 35.7, 12.3] * 4)
+            await inject_decoder_failure("video", False, 20.3)
+            await inject_decoder_failure("audio", True, 8.3)
+            await start(1)
+            await page.evaluate("""()=>{
+                window.flushContext=P.ctx;window.flushInjected=false;testRecords=[];
+                const Native=window.AudioDecoder;
+                window.AudioDecoder=function(init){
+                    const dec=new Native(init),flush=dec.flush.bind(dec);
+                    dec.flush=()=>{
+                        if(!flushInjected){
+                            flushInjected=true;window.failedFlushGen=segGen;
+                            window.failedFlushPosition=pendSeek??mediaNow();window.AudioDecoder=Native;
+                            return Promise.reject(new DOMException('Injected native flush failure','EncodingError'));
+                        }return flush();
+                    };return dec;
+                };seekTo(61.3);
+            }""")
+            await page.wait_for_function("(flushInjected && testRecords.some(f=>f.gen>failedFlushGen) && pendSeek===null) || P.err", timeout=10000)
+            assert await page.evaluate("!P.err && P.ctx===flushContext && P.recoveryAttempts===1")
+            await page.evaluate("v.pause();testRecords=[];window.streamContext=P.ctx")
+            failed_request = False
+
+            async def fail_segment_once(route):
+                nonlocal failed_request
+                if not failed_request:
+                    failed_request = True
+                    await route.fulfill(status=503, body="temporary source failure")
+                else:
+                    await route.continue_()
+
+            await page.route("**/mse/1/seg/**", fail_segment_once)
+            await page.evaluate("seekTo(13.3)")
+            await page.wait_for_function("P.err && !document.querySelector('.buf-retry').hidden", timeout=6000)
+            assert await page.evaluate("P.id===1 && P.ctx===streamContext && P.paused")
+            await page.unroute("**/mse/1/seg/**")
+            await page.locator('.buf-retry').click()
+            await page.wait_for_function("testRecords.length>0 && pendSeek===null && !P.err", timeout=6000)
+            assert await page.evaluate("P.id===1 && P.ctx===streamContext && P.paused")
+            await page.evaluate("""()=>{
+                window.retryContext=P.ctx;testRecords=[];
+                const Native=window.VideoDecoder;window.restoreVideoDecoder=()=>window.VideoDecoder=Native;
+                window.VideoDecoder=function(init){
+                    const dec=new Native(init);
+                    dec.decode=()=>{throw new DOMException('Injected persistent decoder failure','EncodingError')};
+                    return dec;
+                };seekTo(13.3);
+            }""")
+            await page.wait_for_function("P.err && !document.querySelector('.buf-retry').hidden", timeout=6000)
+            assert await page.evaluate("P.id===1 && P.ctx===retryContext && P.paused")
+            assert await page.evaluate("P.recoveryAttempts===4")
+            await page.evaluate("()=>{restoreVideoDecoder();testRecords=[]}")
+            await page.locator('.buf-retry').click()
+            await page.wait_for_function("testRecords.length>0 && pendSeek===null && !P.err", timeout=6000)
+            assert await page.evaluate("P.id===1 && P.ctx===retryContext && P.paused")
+            assert abs(await page.evaluate("mediaNow()") - 13.3) < 0.03
+
             latencies = []
             for item_id in (1, 2):
                 await start(item_id)
-                await asyncio.sleep(0.3)
+                await page.wait_for_function("__seg().clock>0.1 || P.err", timeout=3000)
                 state = await page.evaluate("__seg()")
                 assert state["clock"] > 0.1, state
                 if item_id == 1:
                     # Compare the shipped demuxer's complete normalized timeline
                     # against original source packets, not against its own clock.
-                    source = json.loads(subprocess.check_output([
+                    source_packets = json.loads(subprocess.check_output([
                         "ffprobe", "-v", "error", "-show_packets", "-show_entries",
                         "packet=stream_index,pts_time", "-of", "json",
                         str(library / "1" / "clip.mp4")]))["packets"]
@@ -108,7 +212,7 @@ async def exercise(url, library, he_aac, hevc, restart_server):
                         }return out;
                     }""")
                     for tid, kind in ((0, "video"), (1, "audio")):
-                        expected = [float(p["pts_time"]) for p in source if p["stream_index"] == tid]
+                        expected = [float(p["pts_time"]) for p in source_packets if p["stream_index"] == tid]
                         assert len(parsed[kind]) == len(expected), kind
                         assert max(abs(a - b) for a, b in zip(parsed[kind], expected)) < 0.000002, kind
                 for target in (23.3, 61.3, 3.1):
@@ -175,8 +279,8 @@ async def exercise(url, library, he_aac, hevc, restart_server):
             if he_aac:
                 await page.evaluate("window.testId=6")
                 await page.click("#test-start")
-                await page.wait_for_function("testRecords.length > 0 || (P.id===null && document.getElementById('buf').innerText.includes('Playback error'))", timeout=12000)
-                if await page.evaluate("P.id===null"):
+                await page.wait_for_function("(testRecords.length>0 && mediaNow()>0.15) || ((P.id===null || P.err) && document.getElementById('buf').innerText.includes('Playback error'))", timeout=12000)
+                if await page.evaluate("P.id===null || !!P.err"):
                     error = await page.evaluate("document.getElementById('buf').innerText")
                     assert "encoding is not supported" in error or "No WebCodecs audio decoder" in error, error
                     assert await page.evaluate("document.getElementById('buf').querySelector('.spin').hidden")
@@ -205,12 +309,23 @@ async def exercise(url, library, he_aac, hevc, restart_server):
                                    "click_to_error_ms": await page.evaluate("Math.round(performance.now()-testClickedAt)")}
                 else:
                     hevc_result = {"played_decoder_probe_ms": round(probe_ms, 1)}
+            if source:
+                await page.evaluate("file=>{window.testId=8;window.testFile=file}", source.name)
+                await page.click("#test-start")
+                await page.wait_for_function("testRecords.length>0 || P.err", timeout=20000)
+                assert not await page.evaluate("P.err && P.err.message")
+                await stress_seeks([114.046, 500.3, 25.1, 113.9, 900.3, 114.04] * 4)
+                await inject_decoder_failure("video", False, 114.04)
+                await inject_decoder_failure("audio", True, 114.04)
             assert not errors, errors
             print(json.dumps({"browser": browser_name, "version": browser.version, "seek_ms": latencies,
                               "checks": ["accurate seeks", "video-only", "paused seek", "cache rebuild",
-                                         "server restart", "delayed audio", "short B-frame EOF", "audio EOF video tail", "paused EOF seek"],
+                                         "server restart", "delayed audio", "short B-frame EOF", "audio EOF video tail", "paused EOF seek",
+                                         "repeated/rapid seeks", "video decoder recovery", "paused audio decoder recovery", "flush recovery",
+                                         "stream error retry", "bounded retries and retry button"],
                               "he_aac": he_aac_result,
                               "hevc": hevc_result,
+                              "existing_source": str(source) if source else None,
                               "page_errors": errors}))
         except Exception:
             print("PLAYER STATE", await page.evaluate("()=>({state:__seg(),overlay:document.getElementById('buf').innerText,records:testRecords.slice(0,3)})"))
@@ -235,6 +350,7 @@ async def main():
         hevc = os.environ.get("PLAYER_HEVC") == "1"
         if hevc:
             generate(library / "7", 2, hevc=True)
+        source = Path(os.environ["PLAYER_SOURCE"]).resolve() if os.environ.get("PLAYER_SOURCE") else None
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -271,12 +387,12 @@ async def main():
             try:
                 await wait_ready()
                 with sqlite3.connect(tmp / "test.db") as db:
-                    fixture_ids = list(range(1, 6)) + ([6] if he_aac else []) + ([7] if hevc else [])
+                    fixture_ids = list(range(1, 6)) + ([6] if he_aac else []) + ([7] if hevc else []) + ([8] if source else [])
                     for item_id in fixture_ids:
                         db.execute("INSERT INTO library (id,magnet,title,state,file_path,added_at) "
                                    "VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)",
-                                   (item_id, "audit", f"fixture-{item_id}", "ready", str(library / str(item_id))))
-                await exercise(url, library, he_aac, hevc, restart_server)
+                                   (item_id, "audit", f"fixture-{item_id}", "ready", str(source.parent if item_id == 8 else library / str(item_id))))
+                await exercise(url, library, he_aac, hevc, restart_server, source)
             except Exception:
                 log.flush(); log.seek(0)
                 print(log.read())

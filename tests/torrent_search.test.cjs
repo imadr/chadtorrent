@@ -73,3 +73,39 @@ test('name filtering is local, case-insensitive, and combines multiple terms wit
   assert.equal(rows.length, 3);
   assert.equal(requests.length, 0);
 });
+
+test('adding a search result sends the exact release title used by the optimistic row', async () => {
+  const { c, rep } = search();
+  const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
+  vm.runInContext(html.slice(html.indexOf('async function addTorrentFromSearch'), html.indexOf('/* ---------- add modal')), c);
+  c.curRep = rep; c.items = []; c.searchPending = new Map(); c.pendingRows = new Map();
+  c.infoHash = () => '0123456789abcdef0123456789abcdef01234567';
+  c.syncMovie = () => {}; c.refreshLibrary = () => {};
+  let payload;
+  c.api = async (_url, options) => { payload = JSON.parse(options.body); return { id: 42 }; };
+  const name = "[Judas] JoJo's Bizarre Adventure - S06E04 [1080p][HEVC x265 10bit][Dual-Audio]";
+  await c.addTorrentFromSearch({ name, magnet: 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567' });
+  assert.equal(payload.title, name);
+  assert.equal(c.items[0].title, name);
+  assert.equal(payload.tmdb_id, rep.tmdb_id);
+});
+
+test('episode sources display the saved release title while retaining the file only for playback', () => {
+  const { c } = search();
+  const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
+  vm.runInContext(html.slice(html.indexOf('function renderEpFileRow'), html.indexOf('/* Lowest-numbered playable episode')), c);
+  c.esc = String; c.fmtBytes = n => `${n} B`;
+  const release = "[Judas] JoJo's Bizarre Adventure - S06E04 [1080p][HEVC x265 10bit][Dual-Audio]";
+  const t = { id: 1, title: release, state: 'ready', magnet: 'magnet:?xt=urn:btih:fake' };
+  const f = { path: 'pack/short-file.mkv', have: 100, size: 100 };
+  const row = { classList: { toggle() {} }, appendChild() {} };
+  let played;
+  c.playTorrent = (torrent, file) => played = { torrent, file };
+  c.renderEpFileRow(row, t, f);
+  assert.ok(row.innerHTML.includes(release));
+  assert.ok(!row.innerHTML.includes('short-file.mkv'));
+  assert.ok(!row.innerHTML.includes('magnet:?'));
+  row.onclick({ target: { closest: () => false } });
+  assert.equal(played.file, f.path);
+  assert.equal(played.torrent, t);
+});
