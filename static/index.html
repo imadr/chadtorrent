@@ -276,7 +276,7 @@
             appearance: none; -webkit-appearance: none; height: 0; width: 0; background: transparent; border: none; }
 
   /* subtitle sync overlay: time-scaled subtitle timeline on the right edge */
-  .subsync { position: absolute; top: 0; right: 0; bottom: 48px; width: min(420px, 86vw); z-index: 8;
+  .subsync { position: absolute; top: 0; right: 0; bottom: 0; width: min(420px, 86vw); z-index: 8;
              display: flex; flex-direction: column;
              background: linear-gradient(to left, rgba(10,10,10,.94), rgba(10,10,10,.8));
              border-left: 1px solid rgba(255,255,255,.16); }
@@ -615,7 +615,7 @@ const $ = (id) => document.getElementById(id);
 const v = new EventTarget();
 {
   const def = (name, get, set) => Object.defineProperty(v, name, { get, set: set || undefined, configurable: true });
-  def('currentTime', () => P.lastT, (t) => seekTo(+t || 0));
+  def('currentTime', () => mediaNow(), (t) => seekTo(+t || 0));
   def('duration', () => fullDur);
   def('paused', () => P.paused);
   def('ended', () => P.endedFired);
@@ -4207,7 +4207,11 @@ document.addEventListener('click', (e) => {
   // this handler runs, so closest('.subwrap') alone would miss it
   if (subPanelOpen && !e.target.closest('.subwrap') && !e.target.closest('.subrow')) toggleSubsPanel(false);
 });
-$('volbar').addEventListener('input', () => { v.muted = false; v.volume = $('volbar').value / 100; });
+$('volbar').addEventListener('input', () => {
+  const volume = $('volbar').value / 100;
+  v.muted = false;
+  v.volume = volume;
+});
 $('vicon').addEventListener('click', toggleMute);
 
 /* ---------- subtitle sync ----------
