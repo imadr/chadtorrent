@@ -435,7 +435,7 @@
   <div class="pwrap" id="videowrap">
     <canvas id="player"></canvas>
     <div class="suboverlay" id="suboverlay" hidden><span></span></div>
-    <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span><small class="buf-note" hidden></small><button class="btn buf-retry" style="pointer-events:auto" hidden>Retry playback</button></div>
+    <div class="buf" id="buf" hidden><div class="spin"></div><span>Buffering…</span><small class="buf-note" hidden></small></div>
     <div class="subsync" id="subsync" hidden>
       <div class="ss-head">
         <span class="ss-title">Sync subtitles</span>
@@ -2645,6 +2645,19 @@ function parseSeg(buf, tracks) {
   return out;
 }
 
+function hevcPictureType(data, lengthSize) {
+  for (let off = 0; off + lengthSize < data.length;) {
+    let size = 0;
+    for (let i = 0; i < lengthSize; i++) size = size * 256 + data[off + i];
+    off += lengthSize;
+    if (size < 2 || off + size > data.length) return null;
+    const type = (data[off] >> 1) & 63;
+    if (type <= 31) return type; // skip parameter sets and SEI to find the picture
+    off += size;
+  }
+  return null;
+}
+
 function segToChunks(buf, parsed) {
   const u8 = new Uint8Array(buf);
   const res = { V: [], A: [] };
@@ -2658,7 +2671,10 @@ function segToChunks(buf, parsed) {
       if (tr.kind === 'audio' && offset == null) throw new Error('Audio timeline is not available');
       const ts = Math.round(((tr.kind === 'video' ? s.pts : s.dts) / tr.timescale - (offset || 0)) * 1e6);
       const durUs = Math.max(1, Math.round(s.dur * 1e6 / tr.timescale));
-      dst.push({ data: u8.slice(s.off, s.off + s.size), ts, durUs, key: s.key });
+      const data = u8.slice(s.off, s.off + s.size);
+      const type = /^(hvc1|hev1)$/.test(tr.codec4cc)
+        ? hevcPictureType(data, tr.desc ? (tr.desc[21] & 3) + 1 : 4) : null;
+      dst.push({ data, ts, durUs, key: s.key, rasl: type === 8 || type === 9 });
     }
   }
   return res;   // kept in trun (= decode) order on purpose
@@ -2739,17 +2755,13 @@ function handleFeedError(error, gen, id) {
 function holdPlaybackError(error, position = pendSeek ?? mediaNow()) {
   seekTo(position, false, { recovery: true, hold: true });
   P.err = error;
-  showBuf('Playback error: ' + (error.message || error), true);
-  const retry = $('buf').querySelector('.buf-retry'), gen = segGen;
-  retry.hidden = false;
-  retry.onclick = () => { if (gen === segGen && P.id) seekTo(P.lastT); };
-  retry.onkeydown = e => { if (e.code === 'Enter' || e.code === 'Space') e.stopPropagation(); };
+  showBuf(error.decoder ? 'Playback interrupted' : 'Playback error: ' + (error.message || error), true);
 }
 
 // Native decoder failures after configuration are not capability verdicts.
 // Retry the same position/config first, with conservative preroll and bounded
 // backoff. A user seek supersedes the pending job; stale decoder callbacks are
-// rejected by decoder identity. Exhaustion keeps the session and offers Retry.
+// rejected by decoder identity. Exhaustion keeps normal play/seek controls usable.
 function recoverDecoder(which, error) {
   if (!P.id || P.err) return;
   const position = pendSeek ?? mediaNow();
@@ -2810,12 +2822,13 @@ function mkVdec(onError = onDecErr('video')) {
   dec.addEventListener?.('dequeue', wakeFeed);
   return dec;
 }
-function mkAdec(onError = onAudioDecErr) {
+function mkAdec(onError = onAudioDecErr, probe = null) {
   const dec = new AudioDecoder({
     output: (ad) => {
       wakeFeed();
-      if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       if (P.adec !== dec) { try { ad.close(); } catch (e) {} return; }
+      if (probe && !probe.done) { probe.outputs++; ad.close(); return; }
+      if (!window.__adinfo) window.__adinfo = { sr: ad.sampleRate, ch: ad.numberOfChannels, frames: ad.numberOfFrames, ts: ad.timestamp, dur: ad.duration };
       // AudioData is decoded PCM, not a one-to-one packet-duration assertion.
       // Container gaps/padding and decoder batching may legitimately differ.
       if (P.seekFloor > 0 && ad.timestamp / 1e6 + (ad.duration || 0) / 1e6 <= P.seekFloor) { ad.close(); return; }
@@ -3026,6 +3039,11 @@ async function refreshManifest(gen, id) {
   P.done = !!info.done;
   for (const s of info.segments) if (!P.segs.has(s.n)) P.segs.set(s.n, s.t);
   if (info.segments.length) P.segMaxN = info.segments[info.segments.length - 1].n;
+  // A far seek can precede completion of the segment index. Once the target
+  // is indexed, jump there rather than decoding the entire intervening prefix.
+  if (pendSeek != null && !P.seekVideoReady && segContaining(pendSeek) > P.fetchN) {
+    seekTo(pendSeek, false, { recovery: true });
+  }
 }
 
 async function reloadStream() {
@@ -3048,7 +3066,9 @@ function seekChunks(ch, target, conservative = false) {
     }
   }
   return {
-    V: key >= 0 ? ch.V.slice(key) : ch.V,
+    // A CRA is a random-access point, but its RASL pictures may reference the
+    // preceding GOP. A fresh HEVC decoder must not receive those leading frames.
+    V: key >= 0 ? ch.V.slice(key).filter(c => !c.rasl || c.ts >= ch.V[key].ts) : ch.V,
     // Keep 200ms of audio preroll for decoder warm-up, but do not decode the
     // entire segment prefix for a far seek.
     A: ch.A.filter(c => c.ts + c.durUs > (target - 0.2) * 1e6),
@@ -3182,6 +3202,32 @@ async function configureCandidate(dec, config) {
     await dec.flush();
     return dec.state === 'configured';
   } catch (e) { return false; }
+}
+
+async function audioProbeChunks(gen, id) {
+  for (let n = 1;;) {
+    if (gen !== segGen || P.id !== id) return null;
+    if (P.done && n > P.segMaxN) return [];
+    const buf = await fetchSegBuf(id, 'seg/' + n);
+    if (gen !== segGen || P.id !== id) return null;
+    if (buf) {
+      for (const [tid, samples] of parseSeg(buf, P.tracks)) {
+        const tr = P.tracks.get(tid);
+        if (tr.kind !== 'audio' || !samples.length) continue;
+        // Test the whole first audio segment: a silent opening can decode
+        // under an otherwise incompatible AAC configuration.
+        return samples.map(s => new EncodedAudioChunk({
+          type: 'key', timestamp: Math.round(s.dts * 1e6 / tr.timescale),
+          duration: Math.round(s.dur * 1e6 / tr.timescale),
+          data: new Uint8Array(buf, s.off, s.size),
+        }));
+      }
+      if (P.done && n >= P.segMaxN) return [];
+      n++;
+    }
+    await refreshManifest(gen, id);
+    if (!buf) await segSleep(100);
+  }
 }
 
 async function startEngine(position = 0) {
@@ -3320,15 +3366,29 @@ async function startEngine(position = 0) {
       P.acfgs.push({ codec: acodec, sampleRate: rate / 2, numberOfChannels: ch });
     }
     P.acfgIdx = 0;
+    let probeChunks = null;
     for (let i = 0; i < P.acfgs.length; i++) {
       let failed = false, accepted = false;
-      const dec = mkAdec(e => { if (accepted) onAudioDecErr(e); else failed = true; });
+      const probe = { done: false, outputs: 0 };
+      const dec = mkAdec(e => { if (accepted) onAudioDecErr(e); else failed = true; }, probe);
       P.adec = dec;
-      try {
-        const configured = await configureCandidate(dec, P.acfgs[i]);
+      const configured = await configureCandidate(dec, P.acfgs[i]);
+      if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
+      if (configured && !failed && dec.state === 'configured') {
+        // Some audio backends accept configure/empty flush but reject the
+        // actual AAC bitstream. Validate source packets once at startup so
+        // resuming at a saved position does not enter decoder recovery.
+        if (!probeChunks) probeChunks = await audioProbeChunks(gen, id);
         if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
-        if (configured && !failed && dec.state === 'configured') { P.acfgIdx = i; accepted = true; break; }
-      } catch (e) {}
+        try {
+          for (const chunk of probeChunks) dec.decode(chunk);
+          await dec.flush();
+        } catch (e) { failed = true; }
+        if (gen !== segGen || P.id !== id) { try { dec.close(); } catch (e) {} return false; }
+        if (!failed && dec.state === 'configured' && (probe.outputs || !probeChunks.length)) {
+          probe.done = true; P.acfgIdx = i; accepted = true; break;
+        }
+      }
       try { dec.close(); } catch (_e) {}
       P.adec = null;
     }
@@ -3733,7 +3793,6 @@ function showBuf(txt, err, note = '') {
   const hint = b.querySelector('.buf-note');
   hint.textContent = note;
   hint.hidden = !note;
-  b.querySelector('.buf-retry').hidden = true;
   b.hidden = false;
 }
 function hideBuf() { $('buf').hidden = true; }

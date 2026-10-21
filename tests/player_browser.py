@@ -84,7 +84,7 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                 v.addEventListener('ended',()=>testEnds.push(testRecords.slice()));
                 const b=document.createElement('button');b.id='test-start';b.textContent='Start';
                 b.style='position:fixed;top:0;right:0;z-index:99999';
-                b.onclick=()=>{v.muted=true;testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=0;playTorrent(item,window.testFile||null)};
+                b.onclick=()=>{v.muted=true;testRecords=[];testEnds=[];testProbes=[];window.testClickedAt=performance.now();const item=items.find(i=>i.id===testId);item.playhead=window.testPosition||0;playTorrent(item,window.testFile||null)};
                 document.body.appendChild(b);
             }""")
 
@@ -143,6 +143,7 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                     await page.wait_for_function("(testRecords.length>0 && pendSeek===null) || P.err", timeout=10000)
                     state = await page.evaluate("__seg()")
                     assert not state["error"], state
+                    assert state["recoveryAttempts"] == 0, (target, state)
                     first = await page.evaluate("testRecords[0].ts")
                     assert abs(first - target) < 0.08, (target, first, state)
                 await page.evaluate("""async()=>{
@@ -213,10 +214,10 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
 
             await page.route("**/mse/1/seg/**", fail_segment_once)
             await page.evaluate("seekTo(13.3)")
-            await page.wait_for_function("P.err && !document.querySelector('.buf-retry').hidden", timeout=6000)
+            await page.wait_for_function("P.err", timeout=6000)
             assert await page.evaluate("P.id===1 && P.ctx===streamContext && P.paused")
             await page.unroute("**/mse/1/seg/**")
-            await page.locator('.buf-retry').click()
+            await page.evaluate("seekTo(13.3)")
             await page.wait_for_function("testRecords.length>0 && pendSeek===null && !P.err", timeout=6000)
             assert await page.evaluate("P.id===1 && P.ctx===streamContext && P.paused")
             await page.evaluate("""()=>{
@@ -228,14 +229,14 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                     return dec;
                 };seekTo(13.3);
             }""")
-            await page.wait_for_function("P.err && !document.querySelector('.buf-retry').hidden", timeout=6000)
+            await page.wait_for_function("P.err", timeout=6000)
             assert await page.evaluate("P.id===1 && P.ctx===retryContext && P.paused")
             assert await page.evaluate("P.recoveryAttempts===4")
             await page.evaluate("()=>{restoreVideoDecoder();testRecords=[]}")
-            await page.locator('.buf-retry').click()
+            await page.evaluate("playerPlay()")
             await page.wait_for_function("testRecords.length>0 && pendSeek===null && !P.err", timeout=6000)
-            assert await page.evaluate("P.id===1 && P.ctx===retryContext && P.paused")
-            assert abs(await page.evaluate("mediaNow()") - 13.3) < 0.03
+            assert await page.evaluate("P.id===1 && P.ctx===retryContext && !P.paused")
+            assert abs(await page.evaluate("testRecords[0].ts") - 13.3) < 0.08
 
             latencies = []
             for item_id in (1, 2):
@@ -359,11 +360,16 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                 else:
                     hevc_result = {"played_decoder_probe_ms": round(probe_ms, 1)}
             if source:
-                await page.evaluate("file=>{window.testId=8;window.testFile=file}", source.name)
+                await page.evaluate("file=>{window.testId=8;window.testFile=file;window.testPosition=279.9033785238093}", source.name)
                 await page.click("#test-start")
-                await page.wait_for_function("testRecords.length>0 || P.err", timeout=20000)
+                await page.wait_for_function("(testRecords.length>0 && pendSeek===null) || P.err", timeout=20000)
                 assert not await page.evaluate("P.err && P.err.message")
-                await stress_seeks([114.046, 500.3, 25.1, 113.9, 900.3, 114.04] * 4)
+                assert await page.evaluate("P.recoveryAttempts===0"), await page.evaluate("__seg()")
+                assert abs(await page.evaluate("testRecords[0].ts") - 279.9033785238093) < 0.08
+                await page.evaluate("window.testPosition=0")
+                await stress_seeks([279.9033785238093, 295.07, 1043.41, 1013.2,
+                                    1055.51, 1109.95, 1306.53, 1438.093641]
+                                   + [114.046, 500.3, 25.1, 113.9, 900.3, 114.04] * 4)
                 await inject_decoder_failure("video", False, 114.04)
                 await inject_decoder_failure("audio", True, 114.04)
                 embedded_tracks = await check_subtitles(8, source.name)
@@ -373,7 +379,7 @@ async def exercise(url, library, he_aac, hevc, restart_server, source=None):
                               "checks": ["accurate seeks", "video-only", "paused seek", "cache rebuild",
                                          "server restart", "delayed audio", "short B-frame EOF", "audio EOF video tail", "paused EOF seek",
                                          "repeated/rapid seeks", "video decoder recovery", "paused audio decoder recovery", "flush recovery",
-                                         "stream error retry", "bounded retries and retry button",
+                                         "stream error recovery by seeking", "bounded recovery and normal play control",
                                          "embedded subtitle menu, normalized timing and paused rendering",
                                          "subtitle error retry", "per-episode subtitle persistence"],
                               "he_aac": he_aac_result,

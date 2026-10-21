@@ -56,6 +56,86 @@ async function startVideoOnly(c, beforeStart = () => {}) {
   await c.startEngine();
 }
 
+test('audio startup rejects configurations that accept configure but cannot decode source packets', async () => {
+  const c = engine();
+  let closedOutputs = 0;
+  c.api = async () => ({ done: true, generation: 'one', mime: 'video/mp4; codecs="avc1.64001E,mp4a.40.5"',
+    timing: { video_offset: 0, audio_offset: 0, audio_skip_until: 0 }, segments: [{ n: 1, t: 0 }] });
+  c.segFileQ = () => ''; c.fetchSegBuf = async () => new ArrayBuffer(0);
+  c.parseInit = () => new Map([
+    [1, { kind: 'video', codec4cc: 'avc1' }],
+    [2, { kind: 'audio', rate: 48000, ch: 2, desc: new Uint8Array([0x13, 0x10]) }],
+  ]);
+  c.ensureCtx = () => c.P.ctx = { currentTime: 0, state: 'running' };
+  c.VideoDecoder = class {
+    constructor() { this.state = 'unconfigured'; }
+    configure() { this.state = 'configured'; }
+    async flush() {}
+  };
+  c.AudioDecoder = class {
+    constructor(callbacks) { this.callbacks = callbacks; this.state = 'unconfigured'; this.inputs = 0; }
+    configure(config) { this.config = config; this.state = 'configured'; }
+    decode() {
+      if (++this.inputs > 16 && this.config.description) {
+        this.state = 'closed'; this.callbacks.error(new Error('The given encoding is not supported.'));
+        throw new Error('decoder closed');
+      }
+      this.callbacks.output({ timestamp: 0, duration: 42667, numberOfFrames: 1024,
+        sampleRate: 24000, numberOfChannels: 2, close() { closedOutputs++; } });
+    }
+    async flush() {}
+    close() { this.state = 'closed'; }
+  };
+  c.audioProbeChunks = async () => Array.from({ length: 32 }, () => ({}));
+  c.feedLoop = async () => {};
+  c.P.id = 1;
+  await c.startEngine();
+  assert.equal(c.P.acfgIdx, 2);
+  assert.equal(c.P.recoveryAttempts, 0);
+  assert.equal(c.P.aq.length, 0, 'probe PCM is discarded, never played twice');
+  assert.equal(closedOutputs, 64);
+  c.P.adec.decode({});
+  assert.equal(c.P.aq.length, 1, 'accepted decoder delivers real playback output');
+});
+
+test('audio probing finishes when a completed stream has no audio packets', async () => {
+  const c = engine();
+  Object.assign(c.P, { id: 1, generation: 'same', segMaxN: 1 });
+  c.fetchSegBuf = async () => new ArrayBuffer(0);
+  c.parseSeg = () => new Map(); c.segFileQ = () => '';
+  c.api = async () => ({ generation: 'same', done: true, segments: [{ n: 1, t: 0 }] });
+  const chunks = await c.audioProbeChunks(0, 1);
+  assert.equal(chunks.length, 0);
+});
+
+test('HEVC NAL parsing identifies RASL pictures behind in-band parameter sets', () => {
+  const c = engine();
+  const nal = (type, n) => Buffer.concat([Buffer.alloc(n - 1), Buffer.from([2, type * 2, 1])]);
+  for (const n of [1, 2, 4]) {
+    assert.equal(c.hevcPictureType(Buffer.concat([nal(32, n), nal(33, n), nal(21, n)]), n), 21);
+    assert.equal(c.hevcPictureType(nal(8, n), n), 8);
+    assert.equal(c.hevcPictureType(nal(9, n), n), 9);
+  }
+  assert.equal(c.hevcPictureType(Buffer.from([0, 0, 0, 20, 16, 1]), 4), null);
+});
+test('HEVC seeks discard only leading RASL pictures whose references precede the access point', () => {
+  const c = engine();
+  const V = [
+    { ts: 1000000, key: true },
+    { ts: 800000, rasl: true }, { ts: 900000, rasl: true },
+    { ts: 1100000 }, { ts: 2000000, key: true },
+    { ts: 1900000, rasl: true },
+  ];
+  const selected = c.seekChunks({ V, A: [] }, 1.2);
+  assert.deepEqual(Array.from(selected.V, v => v.ts), [1000000, 1100000, 2000000, 1900000]);
+  // Ordinary sequential decoding must retain leading pictures of later GOPs.
+  const data = Buffer.from([0, 0, 0, 2, 16, 1]);
+  const desc = new Uint8Array(22); desc[21] = 3;
+  c.P.tracks = new Map([[1, { kind: 'video', timescale: 1000, codec4cc: 'hev1', desc }]]);
+  const parsed = new Map([[1, [{ pts: 800, dts: 1000, dur: 40, off: 0, size: 6, key: false }]]]);
+  assert.equal(c.segToChunks(arrayBuffer(data), parsed).V[0].rasl, true);
+});
+
 test('single-fragment tails use tfhd timing without neighboring fragments', () => {
   const c = engine();
   const samples = c.parseSeg(fragment({ tfhdFlags: 0x38, defaults: [40, 4, 0x10000] }), tracks()).get(1);
@@ -203,6 +283,21 @@ test('a new segment generation rebuilds playback instead of retaining stale mani
   c.reloadStream = async () => { rebuilt = true; };
   await c.refreshManifest(0, 1);
   assert.equal(rebuilt, true);
+});
+
+test('a far seek relocates when the growing manifest finally indexes the target', async () => {
+  const c = engine();
+  let selected = null;
+  Object.assign(c.P, { id: 1, generation: 'same', fetchN: 2, segs: new Map([[1, 0], [2, 10]]) });
+  vm.runInContext('pendSeek = 35', c);
+  c.segFileQ = () => '';
+  c.api = async () => ({ generation: 'same', done: true,
+    segments: [{ n: 1, t: 0 }, { n: 2, t: 10 }, { n: 3, t: 30 }, { n: 4, t: 40 }] });
+  c.seekTo = (target, origin, options) => { selected = { target, options }; };
+  await c.refreshManifest(0, 1);
+  assert.equal(selected.target, 35);
+  assert.equal(selected.options.recovery, true);
+  assert.equal(c.segContaining(35), 3);
 });
 
 test('audio trim removes real PCM samples at a seek boundary', () => {
@@ -365,14 +460,13 @@ test('the reported 42667us PCM / 44833us packet difference is not a codec failur
 });
 
 function recoveryEngine(paused = false) {
-  const c = engine(), jobs = new Map(), retry = { hidden: true };
+  const c = engine(), jobs = new Map();
   let next = 0, videoConfigs = 0;
   c.console = { ...console, warn() {} };
   c.setTimeout = (fn, delay) => { const id = ++next; jobs.set(id, { fn, delay }); return id; };
   c.clearTimeout = id => jobs.delete(id);
-  c.showBuf = () => { retry.hidden = true; };
+  c.showBuf = () => {};
   c.showBufProgress = () => c.showBuf();
-  c.$ = () => ({ querySelector: () => retry });
   c.P.ctx = { currentTime: 10, state: paused ? 'suspended' : 'running',
     createGain: () => ({ gain: {}, connect() {}, disconnect() {} }) };
   Object.assign(c.P, { id: 1, paused, lastT: 18.25, vcfg: { codec: 'avc1.64001E', hardwareAcceleration: 'prefer-hardware' },
@@ -388,7 +482,7 @@ function recoveryEngine(paused = false) {
     const [id, job] = jobs.entries().next().value;
     jobs.delete(id); job.fn(); return job;
   }
-  return { c, jobs, retry, run, configurations: () => videoConfigs };
+  return { c, jobs, run, configurations: () => videoConfigs };
 }
 
 test('decoder recovery retains the session, target, paused state and audio context', () => {
@@ -422,8 +516,8 @@ test('rapid seeks coalesce and supersede queued decoder recoveries', () => {
   assert.equal(c.P.recoveryAttempts, 0);
 });
 
-test('persistent decoder failure stops after bounded retries and allows retry without reload', () => {
-  const { c, jobs, retry, run } = recoveryEngine();
+test('persistent decoder failure stops after bounded retries and normal play can resume', () => {
+  const { c, jobs, run } = recoveryEngine();
   const ctx = c.P.ctx;
   for (let i = 0; i < 3; i++) { c.recoverDecoder('video', new Error('persistent failure')); run(); }
   c.recoverDecoder('video', new Error('persistent failure'));
@@ -431,8 +525,7 @@ test('persistent decoder failure stops after bounded retries and allows retry wi
   assert.ok(c.P.err);
   assert.equal(c.P.id, 1);
   assert.equal(c.P.ctx, ctx);
-  assert.equal(retry.hidden, false);
-  retry.onclick();
+  c.playerPlay();
   assert.equal(c.P.err, null);
   assert.equal(c.P.recoveryAttempts, 0);
   run();
@@ -507,8 +600,8 @@ test('a flush scheduled by a cancelled seek cannot flush or drain the new decode
   assert.equal(c.P.vDrained, false);
   assert.equal(c.P.flushV, null);
 });
-test('stream errors after startup preserve the player and offer an in-page retry', () => {
-  const { c, retry, jobs } = recoveryEngine(true);
+test('stream errors after startup preserve the player and normal seeking can resume', () => {
+  const { c, jobs } = recoveryEngine(true);
   const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
   vm.runInContext(html.slice(html.indexOf('function segFatal'), html.indexOf('function teardownWC')), c);
   const ctx = c.P.ctx;
@@ -516,8 +609,7 @@ test('stream errors after startup preserve the player and offer an in-page retry
   assert.equal(c.P.id, 1);
   assert.equal(c.P.ctx, ctx);
   assert.equal(c.P.paused, true);
-  assert.equal(retry.hidden, false);
-  retry.onclick();
+  c.seekTo(20);
   assert.equal(c.P.err, null);
   assert.equal(jobs.size, 1);
 });
